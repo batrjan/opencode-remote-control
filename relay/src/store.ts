@@ -69,9 +69,10 @@ export class Store {
    */
   activate(code: string, ip: string) {
     this.checkIpLimit(ip)
-    const attemptKey = hashAttempt(code)
+    const normalizedCode = normalizeCode(code)
+    const attemptKey = hashAttempt(normalizedCode)
     if (this.blockedCodes.has(attemptKey)) throw new Error('invalid code')
-    const session = this.findSessionByCode(code)
+    const session = this.findSessionByCode(normalizedCode)
     if (!session) {
       const fails = (this.codeFails.get(attemptKey) ?? 0) + 1
       this.codeFails.set(attemptKey, fails)
@@ -149,6 +150,10 @@ export class Store {
     }
     return undefined
   }
+}
+
+function normalizeCode(code: string): string {
+  return code.trim().toUpperCase()
 }
 
 /** Hash used only for rate-limit/counter keys (not a stored secret). */
