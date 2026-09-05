@@ -123,6 +123,24 @@ export class BridgeClient {
     }
   }
 
+  /**
+   * Drop one session's bridge connection (session stopped): close the socket
+   * and fail its pending proxy requests. No-op when no bridge is connected.
+   */
+  disconnect(session_id: string): void {
+    const ws = this.clients.get(session_id)
+    if (!ws) return
+    this.clients.delete(session_id)
+    for (const [request_id, pending] of this.pending.entries()) {
+      if (pending.session_id === session_id) {
+        clearTimeout(pending.timer)
+        this.pending.delete(request_id)
+        pending.reject(new Error('session closed'))
+      }
+    }
+    ws.close(4001, 'session closed')
+  }
+
   /** Close all bridge connections and fail every pending proxy request. */
   close() {
     for (const { timer, reject } of this.pending.values()) {

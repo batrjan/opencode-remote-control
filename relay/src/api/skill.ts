@@ -2,6 +2,7 @@ import express from 'express'
 import type { Request, Response, NextFunction } from 'express'
 import { timingSafeEqual } from 'node:crypto'
 import type { Store } from '../store.js'
+import type { BridgeClient } from '../ws/bridge.js'
 import { relayApiKey } from '../config.js'
 
 /**
@@ -11,8 +12,11 @@ import { relayApiKey } from '../config.js'
  * Every route requires the shared relay secret in the `x-api-key` header
  * (RELAY_API_KEY env). The comparison is constant-time; a missing key fails
  * closed (401 for every request).
+ *
+ * The optional BridgeClient is used to disconnect the session's bridge on
+ * DELETE — per the lifecycle spec, stopping a session disconnects its bridge.
  */
-export function skillRouter(store: Store) {
+export function skillRouter(store: Store, bridge?: BridgeClient) {
   const router = express.Router()
 
   router.use(requireApiKey)
@@ -59,6 +63,10 @@ export function skillRouter(store: Store) {
     if (!store.deleteSession(req.params.id)) {
       return res.status(404).json({ error: 'session not found' })
     }
+    // Disconnect the session's bridge and fail its pending proxy requests;
+    // otherwise the socket would linger (and could serve a future session
+    // that reuses the id).
+    bridge?.disconnect(req.params.id)
     return res.status(204).end()
   })
 

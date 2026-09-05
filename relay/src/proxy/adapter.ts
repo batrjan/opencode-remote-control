@@ -19,7 +19,9 @@ import { config } from '../config.js'
  *   GET  /session/:id/status
  *   GET  /agent
  *   GET  /config
- *   GET  /event  — SSE re-emission of opencode events pushed by the bridge
+ *   GET  /event         — SSE re-emission of opencode events pushed by the bridge
+ *   GET  /global/event  — same fan-out; the v1 UI SDK subscribes at this path
+ *                         (relative to the configured server URL)
  */
 export function proxyAdapter(store: Store, bridge: BridgeClient) {
   const router = express.Router()
@@ -99,9 +101,8 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     void proxy(res, session.id, 'GET', '/config')
   })
 
-  router.get('/event', (req, res) => {
-    const session = requireViewer(req, res)
-    if (!session) return
+  /** SSE fan-out of the session's opencode events to one viewer response. */
+  function sseEvents(req: Request, res: Response, session: Session): void {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -118,6 +119,18 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       )
     })
     req.on('close', unsubscribe)
+  }
+
+  router.get('/event', (req, res) => {
+    const session = requireViewer(req, res)
+    if (!session) return
+    sseEvents(req, res, session)
+  })
+
+  router.get('/global/event', (req, res) => {
+    const session = requireViewer(req, res)
+    if (!session) return
+    sseEvents(req, res, session)
   })
 
   return router
