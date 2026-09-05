@@ -15,7 +15,7 @@
 - Node.js >= 22.
 - No fixed OpenCode port (auto-detect via process inspection).
 - Official OpenCode web UI from `packages/app/dist` (built with bun).
-- Short codes: 6 chars `[a-z0-9]` excluding `0`, `o`, `1`, `l`.
+- Short codes: 6 chars `[A-Z0-9]` excluding `O`, `I` (uppercase per user request; input normalized to uppercase).
 - Rate limits: 5/min, 50/hour per IP; 10 global fails per code -> block.
 - Session TTL: 7 days (insurance only).
 - All secrets hashed with salt (SHA-256).
