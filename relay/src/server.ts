@@ -10,6 +10,7 @@ import { skillRouter } from './api/skill'
  */
 export function createApp(store: Store): Express {
   const app = express()
+  app.set('trust proxy', true)
   app.use(express.json())
   app.get('/health', (_req, res) => {
     res.json({ ok: true, sessions: store.sessionCount() })
