@@ -25,4 +25,6 @@ export const config = {
   tokenBytes: 32,
   /** Salt entropy (bytes) for salted SHA-256 secret hashing. */
   saltBytes: 16,
+  /** How long the proxy adapter waits for a bridge response over WS. */
+  proxyTimeoutMs: 30_000,
 } as const

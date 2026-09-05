@@ -54,6 +54,27 @@ export class OpencodeClient {
     return res.body
   }
 
+  /**
+   * Generic pass-through used by the relay WS proxy: executes an arbitrary
+   * allowlisted request and returns the raw body plus content-type so the
+   * relay can forward them verbatim.
+   */
+  async request(method: string, path: string, body?: unknown) {
+    const res = await fetch(`${this.url}${path}`, {
+      method,
+      headers: {
+        ...this.auth(),
+        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+    return {
+      status: res.status,
+      contentType: res.headers.get('content-type') ?? 'application/json',
+      body: await res.text(),
+    }
+  }
+
   async postPromptAsync(id: string, body: unknown) {
     const res = await fetch(`${this.url}/session/${id}/prompt_async`, {
       method: 'POST',

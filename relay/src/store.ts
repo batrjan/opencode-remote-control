@@ -86,6 +86,30 @@ export class Store {
     return { session_id: session.id, viewer_token }
   }
 
+  /** Check whether a bridge token belongs to a session (constant-time). */
+  verifyBridgeToken(session_id: string, bridge_token: string): boolean {
+    const session = this.sessions.get(session_id)
+    if (!session) return false
+    const candidate = saltedHash(bridge_token, session.bridge_token_salt)
+    return timingSafeEqual(Buffer.from(candidate), Buffer.from(session.bridge_token_hash))
+  }
+
+  /**
+   * Resolve the session a viewer token belongs to. The proxy adapter uses
+   * this for forced session binding: the URL :id is always replaced by the
+   * token's session. O(sessions × viewers) with constant-time compares —
+   * same trade-off as findSessionByCode.
+   */
+  getSessionByViewerToken(viewer_token: string): Session | undefined {
+    for (const session of this.sessions.values()) {
+      for (const [hash, { salt }] of session.viewers) {
+        const candidate = saltedHash(viewer_token, salt)
+        if (timingSafeEqual(Buffer.from(candidate), Buffer.from(hash))) return session
+      }
+    }
+    return undefined
+  }
+
   /** Check whether a viewer token belongs to a session. */
   verifyViewer(session_id: string, viewer_token: string): boolean {
     const session = this.sessions.get(session_id)
