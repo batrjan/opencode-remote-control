@@ -28,6 +28,7 @@ export interface ProxyResponse {
 }
 
 interface PendingRequest {
+  session_id: string
   resolve: (value: ProxyResponse) => void
   reject: (err: Error) => void
   timer: NodeJS.Timeout
@@ -65,7 +66,18 @@ export class BridgeClient {
       this.clients.set(session_id, ws)
       ws.on('message', (raw) => this.onMessage(session_id, raw))
       ws.on('close', () => {
-        if (this.clients.get(session_id) === ws) this.clients.delete(session_id)
+        if (this.clients.get(session_id) === ws) {
+          this.clients.delete(session_id)
+          // Fail all pending requests for this session early, instead of
+          // letting viewers wait the full timeout for a 504.
+          for (const [request_id, pending] of this.pending.entries()) {
+            if (pending.session_id === session_id) {
+              clearTimeout(pending.timer)
+              this.pending.delete(request_id)
+              pending.reject(new Error('bridge closed'))
+            }
+          }
+        }
       })
     })
   }
@@ -89,7 +101,7 @@ export class BridgeClient {
         this.pending.delete(request_id)
         reject(new Error('proxy timeout'))
       }, timeoutMs)
-      this.pending.set(request_id, { resolve, reject, timer })
+      this.pending.set(request_id, { session_id, resolve, reject, timer })
       ws.send(JSON.stringify({ type: 'proxy', request_id, ...req }))
     })
   }

@@ -60,18 +60,25 @@ export class OpencodeClient {
    * relay can forward them verbatim.
    */
   async request(method: string, path: string, body?: unknown) {
-    const res = await fetch(`${this.url}${path}`, {
-      method,
-      headers: {
-        ...this.auth(),
-        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    })
-    return {
-      status: res.status,
-      contentType: res.headers.get('content-type') ?? 'application/json',
-      body: await res.text(),
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 30_000)
+    try {
+      const res = await fetch(`${this.url}${path}`, {
+        method,
+        headers: {
+          ...this.auth(),
+          ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: controller.signal,
+      })
+      return {
+        status: res.status,
+        contentType: res.headers.get('content-type') ?? 'application/json',
+        body: await res.text(),
+      }
+    } finally {
+      clearTimeout(timeout)
     }
   }
 
