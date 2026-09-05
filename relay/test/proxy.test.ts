@@ -98,13 +98,13 @@ afterAll(async () => {
 })
 
 test('proxy GET /api/opencode/session/:id/message', async () => {
-  const res = await request(relay).get(`/api/opencode/session/sess1/message?token=${viewerToken}`)
+  const res = await request(relay).get(`/api/opencode/session/sess1/message`).set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
   expect(res.body).toEqual([{ id: 'm1', limit: null }])
 })
 
 test('proxy forwards the limit query param', async () => {
-  const res = await request(relay).get(`/api/opencode/session/sess1/message?limit=5&token=${viewerToken}`)
+  const res = await request(relay).get(`/api/opencode/session/sess1/message?limit=5`).set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
   expect(res.body).toEqual([{ id: 'm1', limit: '5' }])
 })
@@ -112,7 +112,7 @@ test('proxy forwards the limit query param', async () => {
 test('proxy POST prompt_async forwards the JSON body', async () => {
   const res = await request(relay)
     .post('/api/opencode/session/sess1/prompt_async')
-    .query({ token: viewerToken })
+    .set('x-viewer-token', viewerToken)
     .send({ parts: [{ type: 'text', text: 'hello' }] })
   expect(res.status).toBe(200)
   expect(lastPromptBody).toEqual({ parts: [{ type: 'text', text: 'hello' }] })
@@ -125,7 +125,7 @@ test('proxy allowlisted GET endpoints (todo, status, agent, config)', async () =
     ['/api/opencode/agent', [{ id: 'build' }]],
     ['/api/opencode/config', { model: 'test' }],
   ] as const) {
-    const res = await request(relay).get(`${path}?token=${viewerToken}`)
+    const res = await request(relay).get(path).set('x-viewer-token', viewerToken)
     expect(res.status).toBe(200)
     expect(res.body).toEqual(expected)
   }
@@ -138,20 +138,20 @@ test('proxy rejects requests without a viewer token', async () => {
 })
 
 test('proxy rejects an invalid viewer token', async () => {
-  const res = await request(relay).get('/api/opencode/session/sess1/message?token=wrong')
+  const res = await request(relay).get('/api/opencode/session/sess1/message').set('x-viewer-token', 'wrong')
   expect(res.status).toBe(401)
   expect(res.body.error).toBeTruthy()
 })
 
 test('proxy forcibly substitutes the session id from the viewer token', async () => {
-  const res = await request(relay).get(`/api/opencode/session/evil/message?token=${viewerToken}`)
+  const res = await request(relay).get(`/api/opencode/session/evil/message`).set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
   // The bridge must have been asked for the viewer's own session, not "evil".
   expect(lastPath).toBe('/session/sess1/message')
 })
 
 test('proxy returns 502 when no bridge is connected for the session', async () => {
-  const res = await request(relay).get(`/api/opencode/session/sess2/message?token=${sess2ViewerToken}`)
+  const res = await request(relay).get(`/api/opencode/session/sess2/message`).set('x-viewer-token', sess2ViewerToken)
   expect(res.status).toBe(502)
   expect(res.body.error).toBeTruthy()
 })

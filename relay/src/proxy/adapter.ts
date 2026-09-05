@@ -136,12 +136,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   return router
 }
 
-/** viewer_token from the HttpOnly cookie, ?token=, or x-viewer-token. */
+/** viewer_token from the HttpOnly cookie or x-viewer-token header. */
 function extractViewerToken(req: Request): string | undefined {
   const header = req.get('x-viewer-token')
   if (header) return header
-  const query = req.query.token
-  if (typeof query === 'string' && query.length > 0) return query
   const cookie = req.get('cookie')
   if (cookie) {
     for (const pair of cookie.split(';')) {

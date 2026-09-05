@@ -72,7 +72,9 @@ afterAll(async () => {
 })
 
 test('viewer SSE stream receives opencode events pushed via the bridge', async () => {
-  const res = await fetch(`${relayUrl}/api/opencode/event?session_id=sess1&token=${viewerToken}`)
+  const res = await fetch(`${relayUrl}/api/opencode/event`, {
+    headers: { 'x-viewer-token': viewerToken },
+  })
   expect(res.status).toBe(200)
   expect(res.headers.get('content-type')).toContain('text/event-stream')
 
@@ -90,6 +92,8 @@ test('viewer SSE stream receives opencode events pushed via the bridge', async (
 })
 
 test('SSE endpoint rejects an invalid viewer token', async () => {
-  const res = await fetch(`${relayUrl}/api/opencode/event?session_id=sess1&token=wrong`)
+  const res = await fetch(`${relayUrl}/api/opencode/event`, {
+    headers: { 'x-viewer-token': 'wrong' },
+  })
   expect(res.status).toBe(401)
 })

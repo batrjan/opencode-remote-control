@@ -81,11 +81,11 @@ export class RelayWSClient {
    */
   connect(session_id: string, bridge_token: string): Promise<void> {
     const base = this.relayUrl.replace(/^http/, 'ws')
-    const url =
-      `${base}/bridge?session_id=${encodeURIComponent(session_id)}` +
-      `&token=${encodeURIComponent(bridge_token)}`
+    const url = `${base}/bridge?session_id=${encodeURIComponent(session_id)}`
     return new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(url)
+      const ws = new WebSocket(url, {
+        headers: { 'x-bridge-token': bridge_token },
+      })
       this.ws = ws
       let opened = false
       ws.on('open', () => {

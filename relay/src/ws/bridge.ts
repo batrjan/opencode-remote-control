@@ -49,14 +49,16 @@ export class BridgeClient {
       verifyClient: (info, done) => {
         const url = new URL(info.req.url ?? '', 'http://localhost')
         const session_id = url.searchParams.get('session_id') ?? ''
-        const token = url.searchParams.get('token') ?? ''
+        // Accept token from header (preferred, avoids nginx access logs) or
+        // legacy query param (deprecated, will be removed).
+        const token = info.req.headers['x-bridge-token'] ?? url.searchParams.get('token') ?? ''
         done(this.store.verifyBridgeToken(session_id, token))
       },
     })
     this.wss.on('connection', (ws, req) => {
       const url = new URL(req.url ?? '', 'http://localhost')
       const session_id = url.searchParams.get('session_id') ?? ''
-      const token = url.searchParams.get('token') ?? ''
+      const token = req.headers['x-bridge-token'] ?? url.searchParams.get('token') ?? ''
       if (!this.store.verifyBridgeToken(session_id, token)) {
         ws.close(4003, 'invalid bridge token')
         return
