@@ -23,7 +23,11 @@ const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url))
  */
 export function createApp(store: Store): Express {
   const app = express()
-  app.set('trust proxy', true)
+  // Trust only loopback proxies (nginx on the same host). A permissive
+  // `true` made X-Forwarded-For fully client-spoofable, defeating per-IP
+  // rate limits. nginx must set XFF authoritatively (proxy_set_header
+  // X-Forwarded-For $proxy_add_x_forwarded_for).
+  app.set('trust proxy', 'loopback')
   app.use(express.json())
   app.get('/health', (_req, res) => {
     res.json({ ok: true, sessions: store.sessionCount() })

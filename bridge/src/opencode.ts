@@ -49,8 +49,8 @@ export class OpencodeClient {
   }
 
   /** SSE stream of server events; caller consumes the ReadableStream. */
-  async getEvent() {
-    const res = await fetch(`${this.url}/event`, { headers: this.auth() })
+  async getEvent(signal?: AbortSignal) {
+    const res = await fetch(`${this.url}/event`, { headers: this.auth(), signal })
     return res.body
   }
 

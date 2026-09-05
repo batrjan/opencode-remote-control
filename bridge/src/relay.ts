@@ -67,6 +67,7 @@ export class RelayClient {
  */
 export class RelayWSClient {
   private ws: WebSocket | null = null
+  private eventAbortController: AbortController | null = null
 
   constructor(
     public relayUrl: string,
@@ -109,12 +110,15 @@ export class RelayWSClient {
 
   /** Subscribe to opencode's /event SSE stream and push each event to the relay. */
   async startEventForwarding(): Promise<void> {
-    const stream = await this.opencode.getEvent()
+    this.eventAbortController = new AbortController()
+    const stream = await this.opencode.getEvent(this.eventAbortController.signal)
     if (!stream) throw new Error('opencode /event stream unavailable')
     void readSseStream(stream, (data) => this.send({ type: 'event', data }))
   }
 
   close() {
+    this.eventAbortController?.abort()
+    this.eventAbortController = null
     this.ws?.close()
   }
 
