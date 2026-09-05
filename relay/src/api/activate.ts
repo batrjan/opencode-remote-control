@@ -1,6 +1,6 @@
 import express from 'express'
-import type { Store } from '../store'
-import { activateFailDelayMs } from '../config'
+import type { Store } from '../store.js'
+import { activateFailDelayMs } from '../config.js'
 
 /**
  * POST /api/activate — exchange an access code for a viewer token.

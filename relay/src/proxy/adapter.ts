@@ -1,8 +1,8 @@
 import express from 'express'
 import type { Request, Response } from 'express'
-import type { Store, Session } from '../store'
-import type { BridgeClient } from '../ws/bridge'
-import { config } from '../config'
+import type { Store, Session } from '../store.js'
+import type { BridgeClient } from '../ws/bridge.js'
+import { config } from '../config.js'
 
 /**
  * HTTP → WS → opencode proxy adapter, mounted at /api/opencode.

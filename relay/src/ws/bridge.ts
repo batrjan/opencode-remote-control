@@ -1,7 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws'
 import type { Server } from 'node:http'
 import { randomUUID } from 'node:crypto'
-import type { Store } from '../store'
+import type { Store } from '../store.js'
 
 /**
  * Relay-side hub for bridge WebSocket connections at /bridge.

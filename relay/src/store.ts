@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
-import { config } from './config'
+import { config } from './config.js'
 
 export interface ViewerToken {
   salt: string

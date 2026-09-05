@@ -1,8 +1,8 @@
 import express from 'express'
 import type { Request, Response, NextFunction } from 'express'
 import { timingSafeEqual } from 'node:crypto'
-import type { Store } from '../store'
-import { relayApiKey } from '../config'
+import type { Store } from '../store.js'
+import { relayApiKey } from '../config.js'
 
 /**
  * Session-management API used by the bridge client (spawned by the OpenCode

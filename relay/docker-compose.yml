@@ -1,0 +1,36 @@
+# Relay service for opencode-remote-control.
+#
+# Server layout (nginx runs on the host, not in Docker):
+#   - this file + .env live in /opt/opencode-remote-control on the server
+#   - nginx (host) proxies https://opencode.b4tr.net -> 127.0.0.1:8080
+#   - certbot (host) uses webroot /var/www/certbot for ACME challenges
+#
+# .env (never committed, see .env.example):
+#   RELAY_API_KEY=<shared secret for the bridge session API>   (required)
+#   PORT=8080                                                   (optional)
+#   RELAY_IMAGE=ghcr.io/<owner>/opencode-remote-control/relay:latest (optional)
+services:
+  relay:
+    image: ${RELAY_IMAGE:-ghcr.io/anomalyco/opencode-remote-control/relay:latest}
+    restart: unless-stopped
+    # Localhost-only: all external traffic enters through host nginx.
+    ports:
+      - "127.0.0.1:${PORT:-8080}:${PORT:-8080}"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: "${PORT:-8080}"
+    # Mirrors the Dockerfile HEALTHCHECK (image already has one; kept
+    # explicit so `docker compose ps` health is guaranteed even for images
+    # built without it).
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

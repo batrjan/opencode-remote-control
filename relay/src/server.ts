@@ -3,12 +3,12 @@ import type { Express } from 'express'
 import http from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Store } from './store'
-import { activateRouter } from './api/activate'
-import { skillRouter } from './api/skill'
-import { BridgeClient } from './ws/bridge'
-import { proxyAdapter } from './proxy/adapter'
-import { config } from './config'
+import { Store } from './store.js'
+import { activateRouter } from './api/activate.js'
+import { skillRouter } from './api/skill.js'
+import { BridgeClient } from './ws/bridge.js'
+import { proxyAdapter } from './proxy/adapter.js'
+import { config } from './config.js'
 
 /**
  * Static viewer UI (opencode web dist + join page). Resolved relative to this
