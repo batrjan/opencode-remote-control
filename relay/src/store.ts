@@ -34,10 +34,19 @@ export class Store {
   private ipAttempts: Map<string, IpAttempts> = new Map()
 
   /**
+   * @param maxTrackingEntries cap for codeFails/blockedCodes/ipAttempts
+   * (memory safety under brute force); oldest entry evicted when full.
+   * Tests pass a small value to exercise eviction.
+   */
+  constructor(private maxTrackingEntries: number = config.maxTrackingEntries) {}
+
+  /**
    * Register a new session. Returns the secrets exactly once; only salted
-   * hashes are stored.
+   * hashes are stored. Throws 'session exists' on a duplicate id — a second
+   * registration must never silently overwrite (and hijack) a live session.
    */
   createSession(session_id: string, directory: string, title: string) {
+    if (this.sessions.has(session_id)) throw new Error('session exists')
     const access_code = generateCode()
     const code_salt = newSalt()
     const code_hash = saltedHash(access_code, code_salt)
@@ -75,8 +84,8 @@ export class Store {
     const session = this.findSessionByCode(normalizedCode)
     if (!session) {
       const fails = (this.codeFails.get(attemptKey) ?? 0) + 1
-      this.codeFails.set(attemptKey, fails)
-      if (fails >= config.codeFailBlockThreshold) this.blockedCodes.add(attemptKey)
+      this.setBounded(this.codeFails, attemptKey, fails)
+      if (fails >= config.codeFailBlockThreshold) this.addBounded(this.blockedCodes, attemptKey)
       throw new Error('invalid code')
     }
     const viewer_token = generateToken()
@@ -125,8 +134,9 @@ export class Store {
     return this.sessions.get(session_id)
   }
 
-  deleteSession(session_id: string) {
-    this.sessions.delete(session_id)
+  /** Remove a session; returns false when it did not exist (for 404 mapping). */
+  deleteSession(session_id: string): boolean {
+    return this.sessions.delete(session_id)
   }
 
   /** Accepts a plaintext code (hashed internally before lookup). */
@@ -138,12 +148,34 @@ export class Store {
     return this.sessions.size
   }
 
+  /**
+   * Map insert with FIFO eviction at the cap (JS Maps iterate in insertion
+   * order, so the first key is the oldest). Evicting a counter/window only
+   * resets bookkeeping, never a stored secret.
+   */
+  private setBounded<K, V>(map: Map<K, V>, key: K, value: V): void {
+    if (!map.has(key) && map.size >= this.maxTrackingEntries) {
+      const oldest = map.keys().next()
+      if (!oldest.done) map.delete(oldest.value)
+    }
+    map.set(key, value)
+  }
+
+  /** Set insert with the same FIFO eviction policy as setBounded. */
+  private addBounded(set: Set<string>, value: string): void {
+    if (!set.has(value) && set.size >= this.maxTrackingEntries) {
+      const oldest = set.values().next()
+      if (!oldest.done) set.delete(oldest.value)
+    }
+    set.add(value)
+  }
+
   private checkIpLimit(ip: string): void {
     const now = Date.now()
     let rec = this.ipAttempts.get(ip)
     if (!rec) {
       rec = { minuteCount: 0, minuteStart: now, hourCount: 0, hourStart: now }
-      this.ipAttempts.set(ip, rec)
+      this.setBounded(this.ipAttempts, ip, rec)
     }
     if (now - rec.minuteStart >= config.ipWindowMs.minute) {
       rec.minuteCount = 0

@@ -27,4 +27,28 @@ export const config = {
   saltBytes: 16,
   /** How long the proxy adapter waits for a bridge response over WS. */
   proxyTimeoutMs: 30_000,
+  /**
+   * Max entries in the in-memory tracking maps (codeFails, blockedCodes,
+   * ipAttempts). When a map is full the oldest entry is evicted (FIFO) so
+   * memory stays bounded under brute-force traffic.
+   */
+  maxTrackingEntries: 100_000,
 } as const
+
+/**
+ * Shared secret the bridge sends as `x-api-key` for the session-management
+ * API (POST/GET/DELETE /api/sessions). Read lazily so tests can set it after
+ * module load. Fail-closed: when unset, every session-API request is 401.
+ */
+export function relayApiKey(): string {
+  return process.env.RELAY_API_KEY ?? ''
+}
+
+/**
+ * Artificial delay (ms) before answering a *failed* activation attempt —
+ * a brute-force brake mandated by the design spec (1–2 s in production).
+ * Read lazily from ACTIVATE_FAIL_DELAY_MS; tests set it to 0.
+ */
+export function activateFailDelayMs(): number {
+  return Number(process.env.ACTIVATE_FAIL_DELAY_MS ?? 1000)
+}

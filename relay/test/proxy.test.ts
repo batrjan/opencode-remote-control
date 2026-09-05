@@ -23,6 +23,10 @@ let sess2ViewerToken: string
 let lastPromptBody: unknown
 let lastPath: string
 
+// The session API requires the shared relay key (read lazily from the env).
+const API_KEY = 'test-relay-key'
+process.env.RELAY_API_KEY = API_KEY
+
 function json(res: import('node:http').ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { 'Content-Type': 'application/json' })
   res.end(JSON.stringify(body))
@@ -63,6 +67,7 @@ beforeAll(async () => {
 
   const created = await request(relay)
     .post('/api/sessions')
+    .set('x-api-key', API_KEY)
     .send({ session_id: 'sess1', directory: '/path', title: 'title' })
   expect(created.status).toBe(201)
   const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code })
@@ -72,6 +77,7 @@ beforeAll(async () => {
   // sess2 gets a viewer token but no bridge connection (for the 502 case).
   const created2 = await request(relay)
     .post('/api/sessions')
+    .set('x-api-key', API_KEY)
     .send({ session_id: 'sess2', directory: '/path', title: 'title' })
   const activated2 = await request(relay).post('/api/activate').send({ code: created2.body.access_code })
   sess2ViewerToken = activated2.body.viewer_token

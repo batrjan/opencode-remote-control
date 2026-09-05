@@ -3,6 +3,9 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
+  "bin": {
+    "bridge": "dist/index.js"
+  },
   "engines": {
     "node": ">=22"
   },
@@ -17,6 +20,7 @@
     "vitest": "^2.1.0"
   },
   "dependencies": {
+    "commander": "^15.0.0",
     "ws": "^8.21.3"
   }
 }

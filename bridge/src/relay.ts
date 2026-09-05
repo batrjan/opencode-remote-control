@@ -1,5 +1,5 @@
 import WebSocket from 'ws'
-import type { OpencodeClient } from './opencode'
+import type { OpencodeClient } from './opencode.js'
 
 /**
  * Client for the public relay's bridge-facing session API.
@@ -43,6 +43,14 @@ export class RelayClient {
   async deleteSession(sessionId: string): Promise<number> {
     const res = await fetch(`${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
       method: 'DELETE',
+      headers: this.headers(),
+    })
+    return res.status
+  }
+
+  /** Session status probe for `bridge status`. Returns the relay's HTTP status. */
+  async getSession(sessionId: string): Promise<number> {
+    const res = await fetch(`${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
       headers: this.headers(),
     })
     return res.status

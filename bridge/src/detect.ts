@@ -1,6 +1,6 @@
 import { exec } from 'node:child_process'
 import { promisify } from 'node:util'
-import { config, opencodeAuthHeader } from './config'
+import { config, opencodeAuthHeader } from './config.js'
 
 const execP = promisify(exec)
 

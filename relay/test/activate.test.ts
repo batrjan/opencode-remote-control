@@ -3,6 +3,13 @@ import { createApp } from '../src/server'
 import { Store } from '../src/store'
 import request from 'supertest'
 
+// Session API requires the shared key; the failed-activation delay is a
+// runtime brute-force brake and must not slow the test suite (both are read
+// lazily from the env — see relay/src/config.ts).
+const API_KEY = 'test-relay-key'
+process.env.RELAY_API_KEY = API_KEY
+process.env.ACTIVATE_FAIL_DELAY_MS = '0'
+
 test('POST /api/activate returns viewer_token', async () => {
   const store = new Store()
   const app = createApp(store)
@@ -40,6 +47,7 @@ test('POST /api/sessions creates a session and returns code + tokens', async () 
   const app = createApp(store)
   const res = await request(app)
     .post('/api/sessions')
+    .set('x-api-key', API_KEY)
     .send({ session_id: 'sess1', directory: '/path', title: 'title' })
   expect(res.status).toBe(201)
   expect(res.body.session_id).toBe('sess1')
@@ -47,4 +55,20 @@ test('POST /api/sessions creates a session and returns code + tokens', async () 
   expect(res.body.access_code).not.toMatch(/[OI]/)
   expect(res.body.bridge_token).toBeTruthy()
   expect(res.body.viewer_url).toBe('/join')
+})
+
+test('POST /api/activate delays wrong-code answers by the configured amount', async () => {
+  process.env.ACTIVATE_FAIL_DELAY_MS = '150'
+  try {
+    const store = new Store()
+    const app = createApp(store)
+    const started = Date.now()
+    const res = await request(app).post('/api/activate').send({ code: 'badc0d' })
+    const elapsed = Date.now() - started
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('invalid code')
+    expect(elapsed).toBeGreaterThanOrEqual(140) // 10ms slack for timer jitter
+  } finally {
+    process.env.ACTIVATE_FAIL_DELAY_MS = '0'
+  }
 })

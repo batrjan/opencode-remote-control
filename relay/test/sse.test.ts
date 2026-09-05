@@ -18,6 +18,10 @@ let opencode: Server
 let bridge: RelayWSClient
 let viewerToken: string
 
+// The session API requires the shared relay key (read lazily from the env).
+const API_KEY = 'test-relay-key'
+process.env.RELAY_API_KEY = API_KEY
+
 beforeAll(async () => {
   opencode = createServer((req, res) => {
     const url = new URL(req.url ?? '', 'http://localhost')
@@ -46,6 +50,7 @@ beforeAll(async () => {
 
   const created = await request(relay)
     .post('/api/sessions')
+    .set('x-api-key', API_KEY)
     .send({ session_id: 'sess1', directory: '/path', title: 'title' })
   const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code })
   viewerToken = activated.body.viewer_token

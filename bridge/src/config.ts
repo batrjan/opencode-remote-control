@@ -10,6 +10,8 @@ export const config = {
   healthTimeoutMs: 1500,
   /** Public relay the bridge registers sessions with (overridable via CLI). */
   defaultRelayUrl: 'https://opencode.b4tr.net',
+  /** Watchdog interval for polling the local opencode server while running. */
+  watchdogIntervalMs: 10_000,
 } as const
 
 /** HTTP Basic header value for an explicit credential pair. */

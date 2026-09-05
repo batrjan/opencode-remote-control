@@ -1,4 +1,4 @@
-import { basicAuthHeader } from './config'
+import { basicAuthHeader } from './config.js'
 
 /**
  * Minimal client for the local OpenCode server HTTP API.
