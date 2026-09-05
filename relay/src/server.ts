@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { Store } from './store.js'
 import { activateRouter } from './api/activate.js'
+import { healthRouter } from './api/health.js'
 import { skillRouter } from './api/skill.js'
 import { BridgeClient } from './ws/bridge.js'
 import { proxyAdapter } from './proxy/adapter.js'
@@ -60,9 +61,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // X-Forwarded-For $proxy_add_x_forwarded_for).
   app.set('trust proxy', 'loopback')
   app.use(express.json())
-  app.get('/health', (_req, res) => {
-    res.json({ ok: true, sessions: store.sessionCount() })
-  })
+  app.use('/health', healthRouter(store))
   // The opencode web UI probes /api/health to detect the server API dialect.
   // Answering {healthy:true} selects the v1 client, which prefixes every
   // request with the configured server URL — the viewer bootstrap points that
