@@ -1,12 +1,21 @@
 import express from 'express'
 import type { Express } from 'express'
 import http from 'node:http'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Store } from './store'
 import { activateRouter } from './api/activate'
 import { skillRouter } from './api/skill'
 import { BridgeClient } from './ws/bridge'
 import { proxyAdapter } from './proxy/adapter'
 import { config } from './config'
+
+/**
+ * Static viewer UI (opencode web dist + join page). Resolved relative to this
+ * module so it works both from src/ (vitest) and dist/ (compiled): in both
+ * cases the public dir is a sibling of the module's parent.
+ */
+const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url))
 
 /**
  * App factory: injects the Store so tests and the entrypoint can share one
@@ -21,6 +30,12 @@ export function createApp(store: Store): Express {
   })
   app.use('/api/activate', activateRouter(store))
   app.use('/api/sessions', skillRouter(store))
+  // The root URL is the viewer entry point; the SPA itself lives at /terminal.
+  // Registered before static so express.static does not serve index.html here.
+  app.get('/', (_req, res) => res.redirect('/join'))
+  app.use(express.static(PUBLIC_DIR))
+  app.get('/join', (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'join.html')))
+  app.get('/terminal', (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html')))
   return app
 }
 

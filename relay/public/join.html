@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenCode — Join Session</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100dvh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
+        background: #0a0a0a;
+        color: #ededed;
+      }
+      .card {
+        width: 100%;
+        max-width: 22rem;
+        padding: 2rem;
+      }
+      h1 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        margin: 0 0 0.5rem;
+      }
+      p.hint {
+        margin: 0 0 1.5rem;
+        font-size: 0.875rem;
+        color: #a0a0a0;
+      }
+      form {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+      }
+      input {
+        width: 100%;
+        padding: 0.75rem 1rem;
+        font-size: 1.5rem;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        letter-spacing: 0.35em;
+        text-align: center;
+        text-transform: uppercase;
+        color: inherit;
+        background: #141414;
+        border: 1px solid #2e2e2e;
+        border-radius: 0.5rem;
+        outline: none;
+      }
+      input:focus {
+        border-color: #6b6b6b;
+      }
+      button {
+        padding: 0.75rem 1rem;
+        font-size: 0.9375rem;
+        font-weight: 600;
+        color: #0a0a0a;
+        background: #ededed;
+        border: none;
+        border-radius: 0.5rem;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
+      .error {
+        min-height: 1.25rem;
+        margin: 0;
+        font-size: 0.8125rem;
+        color: #f47067;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1>Join a session</h1>
+      <p class="hint">Enter the 6-character access code from your teammate.</p>
+      <form id="join-form" novalidate>
+        <input
+          id="code"
+          name="code"
+          type="text"
+          inputmode="text"
+          autocomplete="off"
+          autocapitalize="characters"
+          spellcheck="false"
+          maxlength="6"
+          placeholder="ABC123"
+          aria-label="Access code"
+          autofocus
+        />
+        <p class="error" id="error" role="alert"></p>
+        <button id="submit" type="submit">Join</button>
+      </form>
+    </main>
+    <script>
+      const form = document.getElementById('join-form')
+      const input = document.getElementById('code')
+      const button = document.getElementById('submit')
+      const error = document.getElementById('error')
+
+      input.addEventListener('input', () => {
+        input.value = input.value.toUpperCase()
+        error.textContent = ''
+      })
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault()
+        const code = input.value.trim().toUpperCase()
+        if (code.length !== 6) {
+          error.textContent = 'Enter the full 6-character code.'
+          return
+        }
+        button.disabled = true
+        error.textContent = ''
+        try {
+          const res = await fetch('/api/activate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code }),
+          })
+          if (res.ok) {
+            window.location.assign('/terminal')
+            return
+          }
+          const body = await res.json().catch(() => ({}))
+          error.textContent =
+            res.status === 429
+              ? 'Too many attempts. Try again later.'
+              : body.error === 'invalid code'
+                ? 'Invalid or expired code.'
+                : 'Something went wrong. Try again.'
+        } catch {
+          error.textContent = 'Network error. Check your connection.'
+        } finally {
+          button.disabled = false
+        }
+      })
+    </script>
+  </body>
+</html>
