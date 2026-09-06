@@ -1,5 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { config } from './config.js'
+import type { PersistedState } from './persist.js'
+import { STATE_VERSION } from './persist.js'
 
 export interface ViewerToken {
   salt: string
@@ -29,6 +31,9 @@ interface IpAttempts {
   hourStart: number
 }
 
+/** Minimum last_seen advance before it is worth re-persisting. */
+const LAST_SEEN_PERSIST_THROTTLE_MS = 60_000
+
 export class Store {
   private sessions: Map<string, Session> = new Map()
   private codeFails: Map<string, number> = new Map()
@@ -36,6 +41,8 @@ export class Store {
   private ipAttempts: Map<string, IpAttempts> = new Map()
   private sessionFails: Map<string, { count: number; windowStart: number }> = new Map()
   private registrations: Map<string, { count: number; windowStart: number }> = new Map()
+  /** Called after anything that changes the session set (see setChangeListener). */
+  private onChange: (() => void) | null = null
 
   /**
    * @param maxTrackingEntries cap for codeFails/blockedCodes/ipAttempts
@@ -100,6 +107,7 @@ export class Store {
       viewers: new Map(),
     }
     this.sessions.set(session_id, session)
+    this.changed()
     return { session_id, access_code, bridge_token, viewer_url: `/${session_id}` }
   }
 
@@ -153,6 +161,7 @@ export class Store {
     const viewer_token = generateToken()
     const salt = newSalt()
     session.viewers.set(saltedHash(viewer_token, salt), { salt, created_at: Date.now() })
+    this.changed()
     session.last_seen = Date.now()
     return { session_id: session.id, viewer_token }
   }
@@ -198,7 +207,9 @@ export class Store {
 
   /** Remove a session; returns false when it did not exist (for 404 mapping). */
   deleteSession(session_id: string): boolean {
-    return this.sessions.delete(session_id)
+    const existed = this.sessions.delete(session_id)
+    if (existed) this.changed()
+    return existed
   }
 
   /** Accepts a plaintext code + session (hashed internally before lookup). */
@@ -226,13 +237,106 @@ export class Store {
         removed.push(id)
       }
     }
+    if (removed.length) this.changed()
     return removed
   }
 
   /** Refresh last_seen (bridge proxy/event traffic calls this). */
   touchSession(session_id: string): void {
     const s = this.sessions.get(session_id)
-    if (s) s.last_seen = Date.now()
+    if (!s) return
+    const now = Date.now()
+    const prev = s.last_seen
+    s.last_seen = now
+    // last_seen changes on every pong and every proxied request; persisting
+    // each one would rewrite the whole state file several times a minute for a
+    // best-effort timestamp. Only mark dirty when it moved enough to matter for
+    // the idle reaper across a restart.
+    if (now - prev >= LAST_SEEN_PERSIST_THROTTLE_MS) this.changed()
+  }
+
+  /**
+   * Register a listener fired after every change to the session set. The
+   * server uses it to persist a snapshot, so a restart no longer drops live
+   * shares. Rate-limit state is intentionally out of scope.
+   */
+  setChangeListener(listener: (() => void) | null): void {
+    this.onChange = listener
+  }
+
+  private changed(): void {
+    this.onChange?.()
+  }
+
+  /** Serializable view of the session set (salted hashes only, no secrets). */
+  snapshot(): PersistedState {
+    return {
+      version: STATE_VERSION,
+      saved_at: Date.now(),
+      sessions: Array.from(this.sessions.values()).map((s) => ({
+        id: s.id,
+        directory: s.directory,
+        title: s.title,
+        bridge_token_hash: s.bridge_token_hash,
+        bridge_token_salt: s.bridge_token_salt,
+        created_at: s.created_at,
+        last_seen: s.last_seen,
+        status: s.status,
+        viewers: Array.from(s.viewers.entries()).map(([hash, v]) => ({
+          hash,
+          salt: v.salt,
+          created_at: v.created_at,
+        })),
+      })),
+    }
+  }
+
+  /**
+   * Load a snapshot taken by a previous process. Sessions already idle past
+   * `maxIdleMs` are dropped rather than resurrected — the reaper would remove
+   * them on its next sweep anyway. Returns how many were restored.
+   */
+  restore(state: PersistedState | undefined, maxIdleMs: number = config.orphanReapMs): number {
+    if (!state || state.version !== STATE_VERSION || !Array.isArray(state.sessions)) return 0
+    const now = Date.now()
+    let restored = 0
+    for (const s of state.sessions) {
+      if (!s || typeof s.id !== 'string' || !s.id) continue
+      if (this.sessions.has(s.id)) continue
+      if (typeof s.last_seen !== 'number' || now - s.last_seen > maxIdleMs) continue
+      // A restored session must at least carry a usable bridge_token hash —
+      // without it the bridge can never reconnect and the owner can never
+      // delete it. Guards a truncated or hand-edited state file too. The
+      // access code is intentionally NOT persisted, so it cannot be required.
+      if (typeof s.bridge_token_hash !== 'string' || typeof s.bridge_token_salt !== 'string') {
+        continue
+      }
+      const viewers = new Map<string, ViewerToken>()
+      for (const v of Array.isArray(s.viewers) ? s.viewers : []) {
+        if (v && typeof v.hash === 'string' && typeof v.salt === 'string') {
+          viewers.set(v.hash, { salt: v.salt, created_at: v.created_at ?? now })
+        }
+      }
+      this.sessions.set(s.id, {
+        id: s.id,
+        directory: s.directory ?? '',
+        title: s.title ?? '',
+        // The code is not persisted; an empty hash/salt can never match a real
+        // 64-hex saltedHash, so activate() safely fails for a restored session
+        // (its already-joined viewers keep working on their tokens).
+        code_hash: '',
+        code_salt: '',
+        bridge_token_hash: s.bridge_token_hash,
+        bridge_token_salt: s.bridge_token_salt,
+        created_at: s.created_at ?? now,
+        last_seen: s.last_seen,
+        status: s.status === 'closed' ? 'closed' : 'active',
+        created_by_ip: '',
+        viewers,
+      })
+      restored += 1
+    }
+    return restored
   }
 
   /**

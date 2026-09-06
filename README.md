@@ -106,6 +106,10 @@ it is alive:
 | relay → bridge (WS) | Pings every 25 s; a bridge that misses two rounds is terminated, so its session slot is freed for the reconnect and viewer requests fail fast instead of waiting out the proxy timeout. A pong also refreshes `last_seen`, so an idle but healthy share is never reaped. | `RELAY_WS_PING_INTERVAL_MS`, `RELAY_WS_PONG_GRACE_ROUNDS` |
 | relay → viewer (SSE) | A `server.heartbeat` event every 15 s, independent of bridge traffic, so intermediate proxies keep the stream open and the browser can tell a quiet session from a dead one. | `RELAY_SSE_HEARTBEAT_MS` |
 | bridge → OpenCode (SSE) | Re-subscribes to `/event` when the local stream ends (server restart), so a reconnected share is never silently event-less. | `REMOTE_CONTROL_EVENT_RETRY_MS` |
+| relay restart | The session set is persisted (bridge-token and viewer-token hashes only — never the access code or the owner IP), so redeploying the relay no longer ends live shares: the bridge reconnects with the same token and every already-joined viewer's cookie still works. A code that was never used stops working after a restart. | `RELAY_STATE_FILE` |
+
+A share that really is gone (stopped, or aged out) answers with a page saying
+so and how to get a new link, instead of a bare 404.
 
 In the terminal UI the TUI entry (`plugin/remote-control.js`) provides
 `/remote-control` (a picker) plus `/remote-control/start`, `/remote-control/stop`

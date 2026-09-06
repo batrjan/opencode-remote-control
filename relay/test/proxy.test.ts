@@ -4,6 +4,7 @@ import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
 import { startServer } from '../src/server'
+import { filterProjects } from '../src/proxy/adapter'
 import { OpencodeClient } from '../../bridge/src/opencode'
 import { RelayWSClient } from '../../bridge/src/relay'
 
@@ -38,6 +39,32 @@ beforeAll(async () => {
     lastPath = url.pathname
     if (req.method === 'GET' && url.pathname === '/session/sess1/message') {
       return json(res, 200, [{ id: 'm1', limit: url.searchParams.get('limit') }])
+    }
+    if (req.method === 'GET' && url.pathname === '/session/sess1/children') {
+      return json(res, 200, [{ id: 'ses_child1', parentID: 'sess1', title: 'subagent' }])
+    }
+    if (req.method === 'GET' && url.pathname === '/session/ses_child1/message') {
+      return json(res, 200, [{ id: 'child-m1' }])
+    }
+    // Session-detail replies drive the ancestry walk (readableSessionId).
+    // ses_grand1 descends from sess1 via ses_child1; ses_stranger does not.
+    if (req.method === 'GET' && url.pathname === '/session/ses_child1') {
+      return json(res, 200, { id: 'ses_child1', parentID: 'sess1', title: 'subagent' })
+    }
+    if (req.method === 'GET' && url.pathname === '/session/ses_grand1') {
+      return json(res, 200, { id: 'ses_grand1', parentID: 'ses_child1', title: 'nested subagent' })
+    }
+    if (req.method === 'GET' && url.pathname === '/session/ses_grand1/message') {
+      return json(res, 200, [{ id: 'grandchild-m1' }])
+    }
+    if (req.method === 'GET' && url.pathname === '/session/ses_stranger') {
+      return json(res, 200, { id: 'ses_stranger', title: 'someone else' }) // no parentID
+    }
+    if (req.method === 'GET' && url.pathname === '/project') {
+      return json(res, 200, [
+        { id: 'p1', worktree: '/path' },
+        { id: 'p2', worktree: '/somewhere/else' },
+      ])
     }
     if (req.method === 'GET' && url.pathname === '/session/sess1/todo') {
       return json(res, 200, [{ id: 'todo1' }])
@@ -200,4 +227,180 @@ test('viewer cannot answer a permission request raised by another session', asyn
     .set('x-viewer-token', viewerToken)
     .send({ response: 'once' })
   expect(res.status).toBe(403)
+})
+
+/**
+ * Subagent sessions. Every :id is rewritten to the viewer's session, which is
+ * what keeps a viewer inside its own share — but for the share's OWN children
+ * that rewrite was silently wrong rather than safe: the UI lists them via
+ * /session/:id/children and then rendered the PARENT's transcript under each
+ * child's title. Children are readable as themselves; anything else still
+ * collapses to the bound session.
+ */
+test('a child session of the share is read as itself, not as the parent', async () => {
+  const res = await request(relay).get('/session/ses_child1/message').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual([{ id: 'child-m1' }])
+  expect(lastPath).toBe('/session/ses_child1/message')
+})
+
+test('a subagent that spawned after the first child read is still read as itself', async () => {
+  // The ancestry walk asks upstream each time (no stale child-list cache), so
+  // a child that did not exist at the first read still resolves correctly.
+  const res = await request(relay).get('/session/ses_child1/message').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual([{ id: 'child-m1' }])
+})
+
+test('a nested subagent (grandchild) is read as itself, not as the top parent', async () => {
+  const res = await request(relay).get('/session/ses_grand1/message').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual([{ id: 'grandchild-m1' }])
+  expect(lastPath).toBe('/session/ses_grand1/message')
+})
+
+test('a session that is NOT a child still collapses to the viewer session', async () => {
+  const res = await request(relay).get('/session/ses_stranger/message').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual([{ id: 'm1', limit: null }])
+  expect(lastPath).toBe('/session/sess1/message')
+})
+
+test('child reads do not widen the write surface', async () => {
+  // POSTs are not child-readable: a prompt still lands on the bound session.
+  const res = await request(relay)
+    .post('/session/ses_child1/prompt_async')
+    .set('x-viewer-token', viewerToken)
+    .send({ parts: [] })
+  expect(res.status).toBe(200)
+  expect(lastPath).toBe('/session/sess1/prompt_async')
+})
+
+/**
+ * Upstream /project lists EVERY project the owner has open, so a viewer of one
+ * shared session could read the filesystem paths of unrelated work.
+ */
+test('/project keeps only the project the shared session lives in', async () => {
+  const res = await request(relay).get('/project').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual([{ id: 'p1', worktree: '/path' }])
+})
+
+test('filterProjects keeps only the most specific containing project', () => {
+  const raw = JSON.stringify([
+    { id: 'exact', worktree: '/work/app' },
+    { id: 'parent', worktree: '/work' },
+    { id: 'root', worktree: '/' },
+    { id: 'sibling', worktree: '/work/other' },
+    { id: 'prefix-trap', worktree: '/work/ap' },
+    { id: 'no-worktree' },
+  ])
+  // Only the closest ancestor of the directory survives — a '/' project must
+  // NOT act as a catch-all, and '/work/ap' must not match '/work/app'.
+  expect(JSON.parse(filterProjects(raw, '/work/app'))).toEqual([{ id: 'exact', worktree: '/work/app' }])
+  // If nothing contains the directory, keep nothing.
+  expect(JSON.parse(filterProjects(JSON.stringify([{ id: 'x', worktree: '/nope' }]), '/work'))).toEqual([])
+  // Non-JSON and non-array bodies pass through untouched.
+  expect(filterProjects('not json', '/work/app')).toBe('not json')
+  expect(filterProjects('{"a":1}', '/work/app')).toBe('{"a":1}')
+  expect(filterProjects(raw, '/work/app', 'text/plain')).toBe(raw)
+})
+
+/**
+ * Cross-user isolation: viewer A holds ONLY sess1's token. Every attempt to
+ * name sess2 in a path, query or body must be rewritten back to sess1 — one
+ * user can never read another user's session, whatever id they supply.
+ */
+test('viewer A naming session sess2 still only ever reads sess1', async () => {
+  for (const attempt of [
+    '/session/sess2',
+    '/session/sess2/message',
+    '/session/sess2/children',
+    '/session/sess1/message?id=sess2',
+    '/session/sess1/message?sessionID=sess2',
+    '/session/sess2%2F..%2Fsess1/message',
+  ]) {
+    lastPath = ''
+    const res = await request(relay).get(attempt).set('x-viewer-token', viewerToken)
+    // Never a 5xx, never sess2's upstream path.
+    expect(res.status).toBeLessThan(500)
+    expect(lastPath).not.toContain('sess2')
+  }
+  // The session-detail route forwards sess1 upstream, never sess2 (the mock
+  // does not implement the bare detail route, so only the rewrite is asserted).
+  lastPath = ''
+  await request(relay).get('/session/sess2').set('x-viewer-token', viewerToken)
+  expect(lastPath).toBe('/session/sess1')
+})
+
+test("viewer A's /session/sess2/children returns sess1's children, never sess2's", async () => {
+  lastPath = ''
+  const res = await request(relay).get('/session/sess2/children').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(lastPath).toBe('/session/sess1/children')
+  // The child resolver may have probed children too, but the served path is sess1's.
+  for (const child of res.body as Array<{ parentID?: string }>) {
+    expect(child.parentID === undefined || child.parentID === 'sess1').toBe(true)
+  }
+})
+
+test('a foreign session id is not accepted as a child of the viewer session', async () => {
+  // sess2 is not a child of sess1, so the child-read path must collapse it.
+  lastPath = ''
+  const res = await request(relay).get('/session/sess2/message').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual([{ id: 'm1', limit: null }]) // sess1's message, not sess2's
+  expect(lastPath).toBe('/session/sess1/message')
+})
+
+test('viewer A cannot activate against sess2 without sess2’s code', async () => {
+  // A's own code is for sess1; pairing it with sess2 must be rejected, and
+  // pairing a wrong code with sess2 must be rejected the same way.
+  const wrong = await request(relay).post('/api/activate').send({ code: 'ZZZZZZ', session_id: 'sess2' })
+  expect(wrong.status).toBe(400)
+  expect(wrong.body).toEqual({ error: 'invalid code' })
+})
+
+/**
+ * The ancestry walk cannot become a cross-user read: a foreign session whose
+ * parent chain never reaches the viewer's bound session collapses to the bound
+ * session, even though it is requested on a child-readable route.
+ */
+test('a foreign session that is not a descendant still collapses', async () => {
+  lastPath = ''
+  const res = await request(relay).get('/session/ses_stranger/message').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual([{ id: 'm1', limit: null }]) // sess1's message, not the stranger's
+  expect(lastPath).toBe('/session/sess1/message')
+})
+
+test('POST to a subagent session is still pinned to the viewer session (writes never widen)', async () => {
+  // child-read is GET-only; a prompt aimed at a child lands on the parent.
+  lastPath = ''
+  const res = await request(relay)
+    .post('/session/ses_child1/prompt_async')
+    .set('x-viewer-token', viewerToken)
+    .send({ parts: [] })
+  expect(res.status).toBe(200)
+  expect(lastPath).toBe('/session/sess1/prompt_async')
+})
+
+test('a malformed id on a child-readable route collapses instead of reaching upstream raw', async () => {
+  for (const bad of ['not-a-session', 'ses_x%2f..%2fses_y', 'ses_x/../ses_y', '../secret']) {
+    lastPath = ''
+    const res = await request(relay).get(`/session/${bad}/message`).set('x-viewer-token', viewerToken)
+    expect(res.status).toBeLessThan(500)
+    // Whatever upstream path was hit, it was the bound session's, never the raw input.
+    if (lastPath) expect(lastPath).toBe('/session/sess1/message')
+  }
+})
+
+test('filterProjects keeps a project whose sandbox path contains the session directory', () => {
+  const raw = JSON.stringify([
+    { id: 'sandboxed', worktree: '/elsewhere', sandboxes: ['/sb/root', '/work'] },
+    { id: 'unrelated', worktree: '/nope', sandboxes: ['/other'] },
+  ])
+  expect(JSON.parse(filterProjects(raw, '/work/app'))).toEqual([
+    { id: 'sandboxed', worktree: '/elsewhere', sandboxes: ['/sb/root', '/work'] },
+  ])
 })

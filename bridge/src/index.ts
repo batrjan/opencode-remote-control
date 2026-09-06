@@ -316,7 +316,10 @@ program
     }
     const sessionId = resolveSessionId(opts.sessionId)
     if (sessionId) {
-      const { status, body } = await new RelayClient(opts.relay, opts.apiKey).getSession(sessionId)
+      // Pass our own bridge_token so the relay returns the owner-only fields
+      // (directory, title) it withholds from the public presence view.
+      const ownerToken = loadSessionState(sessionId)?.bridge_token
+      const { status, body } = await new RelayClient(opts.relay, opts.apiKey).getSession(sessionId, ownerToken)
       if (status === 404) {
         console.log(`session ${sessionId}: not found`)
         ok = false
@@ -330,8 +333,8 @@ program
         console.log(`  bridge: ${body.bridge_connected ? 'connected' : 'disconnected'}`)
         console.log(`  viewers: ${body.viewer_count}`)
         console.log(`  alive: ${age}`)
-        console.log(`  title: ${body.title || '(untitled)'}`)
-        console.log(`  directory: ${body.directory}`)
+        if (body.title !== undefined) console.log(`  title: ${body.title || '(untitled)'}`)
+        if (body.directory !== undefined) console.log(`  directory: ${body.directory}`)
       }
     }
     if (!ok) process.exitCode = 1

@@ -7346,9 +7346,11 @@ var RelayClient = class {
     return res.status;
   }
   /** Session status probe for `bridge status`. Returns parsed body + HTTP status. */
-  async getSession(sessionId) {
+  async getSession(sessionId, bridgeToken) {
     const res = await fetch(`${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
-      headers: this.headers()
+      // The bridge_token unlocks the owner-only fields (directory, title) that
+      // the public presence view withholds.
+      headers: { ...this.headers(), ...bridgeToken ? { "x-bridge-token": bridgeToken } : {} }
     });
     if (res.status !== 200) return { status: res.status };
     return { status: 200, body: await res.json() };
@@ -7835,7 +7837,8 @@ program2.command("status").description("Probe relay health, local opencode detec
   }
   const sessionId = resolveSessionId(opts.sessionId);
   if (sessionId) {
-    const { status, body } = await new RelayClient(opts.relay, opts.apiKey).getSession(sessionId);
+    const ownerToken = loadSessionState(sessionId)?.bridge_token;
+    const { status, body } = await new RelayClient(opts.relay, opts.apiKey).getSession(sessionId, ownerToken);
     if (status === 404) {
       console.log(`session ${sessionId}: not found`);
       ok = false;
@@ -7849,8 +7852,8 @@ program2.command("status").description("Probe relay health, local opencode detec
       console.log(`  bridge: ${body.bridge_connected ? "connected" : "disconnected"}`);
       console.log(`  viewers: ${body.viewer_count}`);
       console.log(`  alive: ${age}`);
-      console.log(`  title: ${body.title || "(untitled)"}`);
-      console.log(`  directory: ${body.directory}`);
+      if (body.title !== void 0) console.log(`  title: ${body.title || "(untitled)"}`);
+      if (body.directory !== void 0) console.log(`  directory: ${body.directory}`);
     }
   }
   if (!ok) process.exitCode = 1;

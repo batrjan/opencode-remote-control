@@ -8,10 +8,12 @@
 # .env (never committed, see .env.example):
 #   RELAY_API_KEY=<shared secret for the bridge session API>   (required)
 #   PORT=8080                                                   (optional)
-#   RELAY_IMAGE=ghcr.io/<owner>/opencode-remote-control/relay:latest (optional)
+#   RELAY_IMAGE=relay-local:amd64                               (optional)
 services:
   relay:
-    image: ${RELAY_IMAGE:-ghcr.io/batrjan/opencode-remote-control/relay:latest}
+    # The deploy workflow builds this image on the host (see the deploy section of
+    # DEPLOY.md); set RELAY_IMAGE to roll back to a relay-local:rollback-* tag.
+    image: ${RELAY_IMAGE:-relay-local:amd64}
     restart: unless-stopped
     # Localhost-only: all external traffic enters through host nginx.
     ports:
@@ -21,6 +23,12 @@ services:
         required: false
     environment:
       PORT: "${PORT:-8080}"
+      # Persist the session set so a redeploy does not end every live share:
+      # the store is in-memory, and losing it invalidates viewer cookies and
+      # bridge tokens while the bridges are still running.
+      RELAY_STATE_FILE: "${RELAY_STATE_FILE:-/data/state.json}"
+    volumes:
+      - relay-state:/data
     # Mirrors the Dockerfile HEALTHCHECK (image already has one; kept
     # explicit so `docker compose ps` health is guaranteed even for images
     # built without it).
@@ -34,3 +42,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  relay-state:

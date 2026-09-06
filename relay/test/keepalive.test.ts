@@ -143,3 +143,26 @@ test('heartbeats on /global/event use the wrapped envelope', async () => {
   expect(parsed.directory).toBe('/path')
   expect(parsed.payload.type).toBe('server.heartbeat')
 }, 10_000)
+
+test('an empty or garbage keep-alive env var falls back to the default, never 0', async () => {
+  const { sseRetryMs, sseHeartbeatMs, wsPingIntervalMs, wsPongGraceRounds } = await import('../src/config')
+  for (const [key, fn, def] of [
+    ['RELAY_SSE_RETRY_MS', sseRetryMs, 3000],
+    ['RELAY_SSE_HEARTBEAT_MS', sseHeartbeatMs, 15_000],
+    ['RELAY_WS_PING_INTERVAL_MS', wsPingIntervalMs, 25_000],
+    ['RELAY_WS_PONG_GRACE_ROUNDS', wsPongGraceRounds, 2],
+  ] as const) {
+    const saved = process.env[key]
+    try {
+      for (const bad of ['', '   ', 'nope', '0', '-5', 'NaN']) {
+        process.env[key] = bad
+        expect(fn()).toBe(def) // never 0 (a tight-loop retry) or negative
+      }
+      process.env[key] = '1234'
+      expect(fn()).toBe(1234)
+    } finally {
+      if (saved === undefined) delete process.env[key]
+      else process.env[key] = saved
+    }
+  }
+})

@@ -10,7 +10,8 @@ import { healthRouter } from './api/health.js'
 import { skillRouter } from './api/skill.js'
 import { BridgeClient } from './ws/bridge.js'
 import { proxyAdapter } from './proxy/adapter.js'
-import { config } from './config.js'
+import { config, stateFile } from './config.js'
+import { FileStateStore } from './persist.js'
 
 /**
  * Static viewer UI (opencode web dist + join page). Resolved relative to this
@@ -113,7 +114,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // into a garbage directory and break the whole bootstrap.
   app.get('/:id(ses_[A-Za-z0-9_]+)', (req, res) => {
     const session = store.getSession(req.params.id)
-    if (!session) return res.status(404).type('html').send('<h1>Session not found</h1>')
+    if (!session) return res.status(404).type('html').send(endedHtml())
     const token = cookieViewerToken(req)
     if (token && store.verifyViewer(session.id, token)) {
       return res.redirect(sessionUiUrl(session))
@@ -126,7 +127,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // session directory — we validate by decoding and comparing to the session.
   app.get('/:dir/session/:id(ses_[A-Za-z0-9_]+)', (req, res) => {
     const session = store.getSession(req.params.id)
-    if (!session) return res.status(404).type('html').send('<h1>Session not found</h1>')
+    if (!session) return res.status(404).type('html').send(endedHtml())
     const token = cookieViewerToken(req)
     if (token && store.verifyViewer(session.id, token)) {
       return res.type('html').send(terminalHtml())
@@ -139,7 +140,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // 404s ("Cannot GET /server/.../session/...").
   app.get('/server/:key/session/:id(ses_[A-Za-z0-9_]+)', (req, res) => {
     const session = store.getSession(req.params.id)
-    if (!session) return res.status(404).type('html').send('<h1>Session not found</h1>')
+    if (!session) return res.status(404).type('html').send(endedHtml())
     const token = cookieViewerToken(req)
     if (token && store.verifyViewer(session.id, token)) {
       return res.type('html').send(terminalHtml())
@@ -163,6 +164,46 @@ function sessionUiUrl(session: { id: string; directory: string }): string {
 let cachedJoinTemplate: string | undefined
 
 /** join.html with the session id injected for the activate call. */
+/**
+ * Shown when a viewer opens a session the relay does not have: the share was
+ * stopped, it aged out, or (before sessions were persisted) the relay had
+ * restarted under them. A bare "Session not found" left people guessing, so
+ * say what happened and what gets them back in.
+ */
+function endedHtml(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpenCode — Session ended</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100dvh; display: grid; place-items: center;
+         font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+         background: #0d0f12; color: #e6e8eb; padding: 24px; }
+  main { max-width: 32rem; text-align: center; }
+  h1 { font-size: 1.35rem; margin: 0 0 .6rem; font-weight: 600; }
+  p { margin: 0 0 .9rem; color: #a4abb6; }
+  code { background: #1a1e24; border-radius: 5px; padding: .15em .45em;
+         font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: #e6e8eb; }
+  @media (prefers-color-scheme: light) {
+    body { background: #fbfbfc; color: #14161a; }
+    p { color: #5b6472; }
+    code { background: #eef0f3; color: #14161a; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>This session has ended</h1>
+  <p>The share is no longer active — it was stopped, or it sat idle long enough to be closed.</p>
+  <p>Ask whoever shared it to run <code>/remote-control/start</code> again and send you the new link and code.</p>
+</main>
+</body>
+</html>`
+}
+
 function joinHtml(sessionId: string | undefined): string {
   if (cachedJoinTemplate === undefined) {
     cachedJoinTemplate = readFileSync(path.join(PUBLIC_DIR, 'join.html'), 'utf8')
@@ -199,6 +240,16 @@ function cookieViewerToken(req: express.Request): string | undefined {
  */
 export async function startServer(port: number = config.port): Promise<http.Server> {
   const store = new Store()
+  // Survive a restart: without this, redeploying the relay drops every
+  // session and viewer token — viewers get a mid-stream EOF and then 401 on
+  // their cookie, with their bridge still running and nothing to reconnect to.
+  const persistPath = stateFile()
+  const persistence = persistPath ? new FileStateStore(persistPath) : undefined
+  if (persistence) {
+    const restored = store.restore(persistence.load())
+    if (restored) console.log(`[relay] restored ${restored} session(s) from ${persistPath}`)
+    store.setChangeListener(() => persistence.schedule(() => store.snapshot()))
+  }
   // The bare server is created before the app so the WS bridge (which hooks
   // the server's upgrade event) can be passed into the app factory — the
   // session API needs it to disconnect a bridge when its session is deleted.
@@ -216,6 +267,21 @@ export async function startServer(port: number = config.port): Promise<http.Serv
   }, config.orphanSweepIntervalMs)
   reaper.unref()
   server.on('close', () => clearInterval(reaper))
+  server.on('close', () => {
+    if (!persistence) return
+    // Write whatever is still queued before the process goes away.
+    persistence.flush()
+    persistence.close()
+    store.setChangeListener(null)
+  })
+  // Deterministic shutdown flush, independent of the 'close' event: an open
+  // viewer SSE stream keeps server.close() pending, so 'close' can be too late
+  // (or never fire before SIGKILL). Attach the flush to the server so the
+  // signal handler can run it directly and then force connections closed.
+  ;(server as http.Server & { flushState?: () => void }).flushState = () => {
+    if (!persistence) return
+    persistence.flush()
+  }
   await new Promise<void>((resolve) => server.listen(port, resolve))
   return server
 }

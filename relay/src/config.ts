@@ -68,7 +68,7 @@ export const config = {
  * Read lazily from the environment so tests can shrink them.
  */
 export function wsPingIntervalMs(): number {
-  return Number(process.env.RELAY_WS_PING_INTERVAL_MS ?? 25_000)
+  return envInt('RELAY_WS_PING_INTERVAL_MS', 25_000)
 }
 
 /**
@@ -77,7 +77,7 @@ export function wsPingIntervalMs(): number {
  * and failing pending proxy requests instead of hanging viewers.
  */
 export function wsPongGraceRounds(): number {
-  return Number(process.env.RELAY_WS_PONG_GRACE_ROUNDS ?? 2)
+  return envInt('RELAY_WS_PONG_GRACE_ROUNDS', 2)
 }
 
 /**
@@ -87,7 +87,7 @@ export function wsPongGraceRounds(): number {
  * comment lines as events and dies on them.
  */
 export function sseHeartbeatMs(): number {
-  return Number(process.env.RELAY_SSE_HEARTBEAT_MS ?? 15_000)
+  return envInt('RELAY_SSE_HEARTBEAT_MS', 15_000)
 }
 
 /**
@@ -95,8 +95,34 @@ export function sseHeartbeatMs(): number {
  * (registration is public + rate-limited; deletion requires the session's
  * bridge_token). Kept only for backward compatibility with older bridges.
  */
+/** Parse a positive integer env var, falling back to `def` on empty/NaN/<=0. */
+function envInt(name: string, def: number): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return def
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : def
+}
+
 export function relayApiKey(): string {
   return process.env.RELAY_API_KEY ?? ''
+}
+
+/**
+ * Reconnect delay advertised to standards-compliant SSE clients (the `retry:`
+ * field). The web UI runs its own reader with its own policy and ignores it;
+ * a plain EventSource uses it after the stream drops.
+ */
+export function sseRetryMs(): number {
+  return envInt('RELAY_SSE_RETRY_MS', 3000)
+}
+
+/**
+ * Where the session set is persisted so a relay restart does not drop live
+ * shares. Empty (the default) keeps the old in-memory-only behaviour, which
+ * is what tests and local runs want; production sets it to a path on a volume.
+ */
+export function stateFile(): string {
+  return process.env.RELAY_STATE_FILE ?? ''
 }
 
 /**

@@ -119,11 +119,26 @@ test('the viewer stream sends no SSE comment line', async () => {
   const frames = received.split('\n\n').filter((f) => f.trim().length > 0)
   expect(frames.length).toBeGreaterThan(0)
   for (const frame of frames) {
-    for (const line of frame.split('\n')) {
+    const lines = frame.split('\n')
+    for (const line of lines) {
       expect(line.startsWith(':')).toBe(false)
     }
+    // Every frame carries data: a data-less frame is the shape that broke the
+    // UI's reader, so `retry:` rides along with the handshake instead.
+    expect(lines.some((l) => l.startsWith('data: '))).toBe(true)
   }
-  expect(frames[0]!.startsWith('data: ')).toBe(true)
+})
+
+test('the handshake advertises a reconnect delay without a data-less frame', async () => {
+  const res = await fetch(`${relayUrl}/event`, { headers: { 'x-viewer-token': viewerToken } })
+  const reader = res.body!.getReader()
+  const { value } = await reader.read()
+  await reader.cancel()
+  const first = new TextDecoder().decode(value).split('\n\n')[0]!
+  const lines = first.split('\n')
+  expect(lines[0]).toMatch(/^retry: \d+$/)
+  expect(lines[1]).toMatch(/^data: /)
+  expect(JSON.parse(lines[1]!.slice(6)).type).toBe('server.connected')
 })
 
 test('the stream opens with a server.connected frame, like opencode does', async () => {
@@ -132,7 +147,8 @@ test('the stream opens with a server.connected frame, like opencode does', async
   const { value } = await reader.read()
   await reader.cancel()
   const first = new TextDecoder().decode(value).split('\n\n')[0]!
-  const event = JSON.parse(first.replace(/^data: /, ''))
+  const dataLine = first.split('\n').find((l) => l.startsWith('data: '))!
+  const event = JSON.parse(dataLine.slice(6))
   expect(event.type).toBe('server.connected')
   expect(event.properties).toEqual({})
   expect(typeof event.id).toBe('string')

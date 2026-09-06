@@ -18,8 +18,10 @@ export interface RelaySession {
 /** Non-secret session status returned by GET /api/sessions/:id. */
 export interface SessionStatus {
   session_id: string
-  directory: string
-  title: string
+  /** Owner-only (needs the bridge_token); absent from the public presence view. */
+  directory?: string
+  /** Owner-only (needs the bridge_token); absent from the public presence view. */
+  title?: string
   status: 'active' | 'closed'
   created_at: number
   last_seen: number
@@ -65,9 +67,11 @@ export class RelayClient {
   }
 
   /** Session status probe for `bridge status`. Returns parsed body + HTTP status. */
-  async getSession(sessionId: string): Promise<{ status: number; body?: SessionStatus }> {
+  async getSession(sessionId: string, bridgeToken?: string): Promise<{ status: number; body?: SessionStatus }> {
     const res = await fetch(`${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
-      headers: this.headers(),
+      // The bridge_token unlocks the owner-only fields (directory, title) that
+      // the public presence view withholds.
+      headers: { ...this.headers(), ...(bridgeToken ? { 'x-bridge-token': bridgeToken } : {}) },
     })
     if (res.status !== 200) return { status: res.status }
     return { status: 200, body: (await res.json()) as SessionStatus }

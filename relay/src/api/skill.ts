@@ -50,19 +50,26 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
     }
   })
 
-  /** Non-secret status view for `bridge status`. */
+  /**
+   * Presence view. A session id is not a secret (it is in the share URL), so
+   * this endpoint is public — but the session's `directory` (an absolute host
+   * path) and `title` are private, and were disclosed to anyone holding the id.
+   * They are returned ONLY to the bridge that owns the session (its
+   * bridge_token), which is what `bridge status` presents; everyone else gets
+   * pure presence.
+   */
   router.get('/:id', (req, res) => {
     const session = store.getSession(req.params.id)
     if (!session) return res.status(404).json({ error: 'session not found' })
+    const owner = store.verifyBridgeToken(session.id, req.get('x-bridge-token') ?? '')
     return res.json({
       session_id: session.id,
-      directory: session.directory,
-      title: session.title,
       status: session.status,
       created_at: session.created_at,
       last_seen: session.last_seen,
       viewer_count: session.viewers.size,
       bridge_connected: bridge?.isConnected(session.id) ?? false,
+      ...(owner ? { directory: session.directory, title: session.title } : {}),
     })
   })
 

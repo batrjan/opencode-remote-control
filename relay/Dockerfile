@@ -66,6 +66,10 @@ COPY --from=relay-build /app/package.json ./
 COPY --from=relay-build /app/node_modules ./node_modules
 COPY --from=relay-build /app/dist ./dist
 COPY --from=ui /public ./public
+# Session state lives here so a restart does not drop live shares. Created in
+# the image (not by the volume driver) so it belongs to the unprivileged user
+# the process runs as; compose mounts a named volume over it.
+RUN mkdir -p /data && chown node:node /data
 USER node
 EXPOSE 8080
 # node:22-slim has no curl; use Node's global fetch instead.

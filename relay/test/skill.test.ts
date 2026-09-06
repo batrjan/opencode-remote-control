@@ -87,20 +87,40 @@ test('DELETE /api/sessions/:id on an unknown session is 404 even with a token', 
   expect(res.status).toBe(404)
 })
 
-test('GET /api/sessions/:id returns non-secret session info (public)', async () => {
+test('GET /api/sessions/:id is public presence only — no directory, title or secrets', async () => {
   const store = new Store()
-  store.createSession('sess1', '/path', 'title', 'test-ip')
+  store.createSession('sess1', '/private/host/path', 'a private title', 'test-ip')
   const app = createApp(store)
   const res = await request(app).get('/api/sessions/sess1')
   expect(res.status).toBe(200)
   expect(res.body.session_id).toBe('sess1')
-  expect(res.body.directory).toBe('/path')
-  expect(res.body.title).toBe('title')
-  // No secret material may leak through the status endpoint.
+  expect(res.body.status).toBe('active')
+  expect(res.body.viewer_count).toBe(0)
+  // A session id is not a secret (it is in the share URL), so directory and
+  // title — a host path and a private label — must NOT be public.
+  expect(res.body.directory).toBeUndefined()
+  expect(res.body.title).toBeUndefined()
+  // And no credential material, ever.
   expect(res.body.access_code).toBeUndefined()
   expect(res.body.bridge_token).toBeUndefined()
   expect(res.body.code_hash).toBeUndefined()
   expect(res.body.bridge_token_hash).toBeUndefined()
   const missing = await request(app).get('/api/sessions/nope')
   expect(missing.status).toBe(404)
+})
+
+test('GET /api/sessions/:id returns directory and title ONLY to the owning bridge token', async () => {
+  const store = new Store()
+  const { bridge_token } = store.createSession('sess1', '/private/host/path', 'a private title', 'test-ip')
+  const app = createApp(store)
+
+  const owner = await request(app).get('/api/sessions/sess1').set('x-bridge-token', bridge_token)
+  expect(owner.status).toBe(200)
+  expect(owner.body.directory).toBe('/private/host/path')
+  expect(owner.body.title).toBe('a private title')
+
+  // A wrong token gets the same public presence view as no token.
+  const wrong = await request(app).get('/api/sessions/sess1').set('x-bridge-token', 'not-the-token')
+  expect(wrong.body.directory).toBeUndefined()
+  expect(wrong.body.title).toBeUndefined()
 })

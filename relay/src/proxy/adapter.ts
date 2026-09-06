@@ -3,7 +3,7 @@ import express from 'express'
 import type { Request, Response } from 'express'
 import type { Store, Session } from '../store.js'
 import type { BridgeClient } from '../ws/bridge.js'
-import { config, sseHeartbeatMs } from '../config.js'
+import { config, sseHeartbeatMs, sseRetryMs } from '../config.js'
 
 /**
  * HTTP → WS → opencode proxy adapter, mounted at the server ROOT.
@@ -54,7 +54,9 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   ['GET', '/config/providers'],
   ['GET', '/provider'],
   ['GET', '/provider/auth'],
-  ['GET', '/project'],
+  // NOTE: '/project' is NOT here — upstream lists every project the owner has
+  // open, disclosing unrelated worktree paths to the viewer. It gets a
+  // filtered handler below. '/project/current' is directory-pinned already.
   ['GET', '/project/current'],
   ['GET', '/path'],
   ['GET', '/vcs'],
@@ -83,7 +85,10 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   ['GET', '/experimental/resource'],
   ['GET', '/experimental/capabilities'],
   ['GET', '/experimental/workspace'],
-  ['GET', '/experimental/worktree'],
+  // NOTE: '/experimental/worktree' is NOT here — like '/project' it enumerates
+  // the owner's other worktrees, disclosing unrelated project paths. The UI
+  // boots without it.
+
   ['GET', '/api/reference'],
   ['GET', '/api/agent'],
   ['GET', '/api/command'],
@@ -102,6 +107,32 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   // (/session/:id/permissions/:permissionID) and is additionally guarded
   // bridge-side (refuses requestIDs not owned by the bound session).
 ]
+
+/**
+ * Read routes where a SUBAGENT session of the bound one may be read as itself.
+ *
+ * Every ':id' is normally rewritten to the viewer's session, which is what
+ * keeps a viewer inside its own share. For a child session that rewrite was
+ * silently wrong rather than safe: the UI lists the share's 17 subagent
+ * sessions via /session/:id/children and then rendered the PARENT's transcript
+ * under each child's title. Children belong to the shared session, so reading
+ * them is in scope — anything that is not a child still collapses to the bound
+ * session.
+ */
+const CHILD_READABLE_ROUTES = new Set([
+  '/session/:id/message',
+  '/session/:id/message/:messageID',
+  '/session/:id/todo',
+  '/session/:id/diff',
+])
+
+/** Max ancestor hops walked when deciding if a session descends from the
+ * bound one — subagent nesting is shallow; this only bounds a pathological
+ * chain. */
+const MAX_ANCESTRY_DEPTH = 8
+
+/** A real opencode session id — the only shape allowed to reach an upstream path. */
+const SESSION_ID_RE = /^ses_[A-Za-z0-9_]+$/
 
 /** Paths that are long-polls upstream (opencode holds them open until an
  * event arrives). They get a longer proxy timeout than normal requests. */
@@ -186,6 +217,17 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     return qs ? `?${qs}` : ''
   }
 
+  // GET /project — upstream returns EVERY project the owner has open, so a
+  // viewer of one shared session could read the filesystem paths of unrelated
+  // work. Keep only the project the shared session actually lives in.
+  router.get('/project', (req, res) => {
+    const session = requireViewer(req, res)
+    if (!session) return
+    void proxy(res, session.id, 'GET', `/project${queryForSession(req, session)}`, undefined, (raw, contentType) =>
+      filterProjects(raw, session.directory, contentType),
+    )
+  })
+
   // GET /session — the UI's session list, collapsed to the viewer's own
   // session. Registered before '/session/:id'.
   router.get('/session', (req, res) => {
@@ -268,14 +310,67 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     })()
   })
 
+  // A session's parent never changes once created, so a positive ancestry
+  // result is cached forever safely (keyed bound->requested). Negatives are
+  // NOT cached: a subagent may spawn after the first miss, and re-checking is
+  // cheap. This is what makes a freshly-spawned child and a nested grandchild
+  // read correctly instead of showing the parent transcript under their title.
+  const ancestryOk = new Set<string>()
+
+  /**
+   * Which session id this request may actually read: the bound one, unless the
+   * caller asked for a session that DESCENDS from it (a subagent, or a nested
+   * subagent) on a child-readable route. Resolved by walking the requested
+   * session's parent chain up to the bound session — never a list membership,
+   * so timing and nesting cannot make a real descendant look foreign, and a
+   * foreign session can never look like a descendant.
+   */
+  async function readableSessionId(session: Session, requested: string, template: string): Promise<string> {
+    if (requested === session.id) return session.id
+    if (!CHILD_READABLE_ROUTES.has(template)) return session.id
+    // Only a well-formed session id may ever flow into an upstream path. This
+    // is the value the caller controls, so anything that is not exactly a
+    // session id (encoded slashes, query smuggling, traversal) collapses to
+    // the bound session instead of being interpolated raw.
+    if (!SESSION_ID_RE.test(requested)) return session.id
+    if (ancestryOk.has(`${session.id}\u0000${requested}`)) return requested
+    let current = requested
+    for (let hop = 0; hop < MAX_ANCESTRY_DEPTH; hop++) {
+      let parentID: string | undefined
+      if (!SESSION_ID_RE.test(current)) return session.id
+      try {
+        const out = await bridge.request(
+          session.id,
+          { method: 'GET', path: `/session/${encodeURIComponent(current)}` },
+          config.proxyTimeoutMs,
+        )
+        if (out.status !== 200) return session.id
+        const detail = JSON.parse(out.body) as { id?: unknown; parentID?: unknown }
+        // A session whose own id does not echo back is not a real session.
+        if (detail?.id !== current) return session.id
+        parentID = typeof detail?.parentID === 'string' ? detail.parentID : undefined
+      } catch {
+        return session.id // cannot verify -> strict binding
+      }
+      if (parentID === undefined) return session.id // reached a root that is not ours
+      if (parentID === session.id) {
+        ancestryOk.add(`${session.id}\u0000${requested}`)
+        return requested
+      }
+      current = parentID
+    }
+    return session.id // chain too deep -> refuse rather than guess
+  }
+
   for (const [method, template] of ALLOWED_ROUTES) {
     const handler = (req: Request, res: Response) => {
       const session = requireViewer(req, res)
       if (!session) return
       // STRICT isolation: the viewer can only ever reach its OWN session.
       // The URL :id is ALWAYS replaced with the viewer's session, even for
-      // reads. See the parentID sanitization below for why this does not
-      // loop the UI's parent-chain walk.
+      // reads — except a subagent session of that very session on the
+      // child-readable routes (see CHILD_READABLE_ROUTES). See the parentID
+      // sanitization below for why this does not loop the parent-chain walk.
       let path = template.replaceAll(':id', session.id)
       if (typeof req.params.permissionID === 'string') {
         path = path.replaceAll(':permissionID', encodeURIComponent(req.params.permissionID))
@@ -286,7 +381,25 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       // Sanitize session-detail reads: strip parentID so the UI never walks
       // a parent chain (which would loop under forced :id binding).
       const sanitize = template === '/session/:id' && method === 'GET'
-      void proxy(res, session.id, method, path + queryForSession(req, session), method === 'POST' ? req.body : undefined, sanitize ? stripParentId : undefined)
+      void (async () => {
+        // Re-point the path at a child session when the caller asked for one
+        // of this share's own subagents on a child-readable route.
+        if (CHILD_READABLE_ROUTES.has(template) && typeof req.params.id === 'string') {
+          const readable = await readableSessionId(session, req.params.id, template)
+          if (readable !== session.id) path = template.replaceAll(':id', readable)
+          if (typeof req.params.messageID === 'string') {
+            path = path.replaceAll(':messageID', encodeURIComponent(req.params.messageID))
+          }
+        }
+        await proxy(
+          res,
+          session.id,
+          method,
+          path + queryForSession(req, session),
+          method === 'POST' ? req.body : undefined,
+          sanitize ? stripParentId : undefined,
+        )
+      })()
     }
     if (method === 'GET') router.get(template, handler)
     else router.post(template, handler)
@@ -318,8 +431,13 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     const envelope = (payload: string) =>
       global ? `{"directory":${JSON.stringify(session.directory)},"payload":${payload}}` : payload
     // opencode omits the directory on its own handshake frame; match it.
+    // The `retry:` field rides ALONG WITH the handshake rather than in a frame
+    // of its own: a data-less frame is the same shape that broke the web UI's
+    // reader before (it parsed a bare `: connected` comment as an event), so
+    // every frame this stream emits still carries a data line.
     res.write(
-      `data: ${global ? `{"payload":${JSON.stringify(serverConnectedEvent())}}` : JSON.stringify(serverConnectedEvent())}\n\n`,
+      `retry: ${sseRetryMs()}\n` +
+        `data: ${global ? `{"payload":${JSON.stringify(serverConnectedEvent())}}` : JSON.stringify(serverConnectedEvent())}\n\n`,
     )
     // Keep-alive: opencode's own heartbeats only arrive while the bridge is
     // reachable, so on a flaky link the viewer's stream would sit silent —
@@ -363,6 +481,45 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   })
 
   return router
+}
+
+/**
+ * Keep only the project that contains the shared session's directory.
+ *
+ * opencode's /project lists every project the owner has open; the viewer is
+ * bound to one session, so the rest are unrelated worktree paths it has no
+ * business seeing. A project matches when the session directory IS its
+ * worktree or sits inside it (monorepo packages open a subdirectory).
+ * Non-JSON or unexpected shapes pass through untouched.
+ */
+export function filterProjects(raw: string, directory: string, contentType?: string): string {
+  if (contentType && !contentType.includes('application/json')) return raw
+  try {
+    const data = JSON.parse(raw)
+    if (!Array.isArray(data)) return raw
+    // How deeply `base` contains `directory` (-1 = not a container). Used to
+    // pick the MOST SPECIFIC project: a project at worktree '/' technically
+    // contains every path, so "keep all containers" would leak it — keep only
+    // the closest ancestor instead, which is the viewer's actual project.
+    const containment = (base: unknown): number => {
+      if (typeof base !== 'string' || !base) return -1
+      const b = base.replace(/\/+$/, '') || '/'
+      if (directory === b) return b.length
+      const prefix = b === '/' ? '/' : b + '/'
+      return directory.startsWith(prefix) ? b.length : -1
+    }
+    const score = (p: unknown): number => {
+      const proj = p as { worktree?: unknown; sandboxes?: unknown }
+      let best = containment(proj.worktree)
+      if (Array.isArray(proj.sandboxes)) for (const sb of proj.sandboxes) best = Math.max(best, containment(sb))
+      return best
+    }
+    const best = Math.max(-1, ...data.map(score))
+    const kept = best < 0 ? [] : data.filter((p) => score(p) === best)
+    return JSON.stringify(kept)
+  } catch {
+    return raw
+  }
 }
 
 /**

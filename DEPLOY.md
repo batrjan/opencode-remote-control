@@ -74,6 +74,38 @@ is faster with `UI_SOURCE=prebuilt`.
 > fix the package's Actions access first (repository → role Write) and point
 > `RELAY_IMAGE` in the host's `.env` at the registry tag.
 
+## Session state (volume)
+
+The relay keeps its sessions in memory, so a plain restart would end every live
+share: viewer cookies and bridge tokens become invalid while the bridges are
+still running. `docker-compose.yml` therefore mounts a named volume and points
+`RELAY_STATE_FILE` at it:
+
+```yaml
+environment:
+  RELAY_STATE_FILE: "${RELAY_STATE_FILE:-/data/state.json}"
+volumes:
+  - relay-state:/data
+```
+
+What is persisted: the bridge-token hash (so the bridge reconnects and the
+owner can still delete) and each already-issued viewer-token hash (256-bit
+secrets). What is deliberately NOT persisted: the **access code** (only ~30
+bits — a fast hash of it beside its salt is effectively the code itself to
+anyone who reads the file), the owner IP, and the rate-limit counters. So a
+redeploy keeps every already-joined viewer connected, but a code that was never
+used stops working — a late joiner just needs a fresh share. Leaving
+`RELAY_STATE_FILE` empty restores the old in-memory-only behaviour.
+
+To wipe every share (e.g. after a security incident):
+
+```bash
+cd /opt/opencode-remote-control
+docker compose down
+docker volume rm opencode-remote-control_relay-state
+docker compose up -d
+```
+
 ## Rollback
 
 Each deploy tags the outgoing image before replacing it, and the three newest
