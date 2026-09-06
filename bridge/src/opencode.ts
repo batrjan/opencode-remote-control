@@ -62,7 +62,7 @@ export class OpencodeClient {
   async request(method: string, path: string, body?: unknown) {
     // Long-poll endpoints (opencode holds them open until an event arrives)
     // must not be cut off by the default 30s guard.
-    const isLongPoll = path.startsWith('/permission/request')
+    const isLongPoll = path.startsWith('/permission/request') || path.startsWith('/question')
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), isLongPoll ? 130_000 : 30_000)
     try {

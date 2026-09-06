@@ -70,6 +70,27 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   ['GET', '/find'],
   ['GET', '/find/file'],
   ['GET', '/find/symbol'],
+  // Global v2 surface the UI probes at boot. NOTE: /global/event is NOT here
+  // — it is the SSE stream and is fanned out locally from the bridge's
+  // /event subscription (see the sseEvents handlers below).
+  ['GET', '/global/health'],
+  ['GET', '/global/config'],
+  // Question/resource/reference APIs the UI bootstrap resolves
+  ['GET', '/question'],
+  ['POST', '/question'],
+  ['GET', '/experimental/resource'],
+  ['GET', '/experimental/session'],
+  ['GET', '/experimental/capabilities'],
+  ['GET', '/experimental/workspace'],
+  ['GET', '/experimental/worktree'],
+  ['GET', '/api/reference'],
+  ['GET', '/api/session'],
+  ['GET', '/api/agent'],
+  ['GET', '/api/command'],
+  ['GET', '/api/skill'],
+  ['GET', '/skill'],
+  ['GET', '/pty'],
+  ['GET', '/pty/shells'],
   // UI telemetry
   ['POST', '/log'],
   // Permission API (opencode's tool-approval surface). The viewer drives the
@@ -87,7 +108,7 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
 
 /** Paths that are long-polls upstream (opencode holds them open until an
  * event arrives). They get a longer proxy timeout than normal requests. */
-const LONG_POLL_PREFIXES = ['/permission/request']
+const LONG_POLL_PREFIXES = ['/permission/request', '/question']
 const LONG_POLL_TIMEOUT_MS = 120_000
 
 export function proxyAdapter(store: Store, bridge: BridgeClient) {
