@@ -39,24 +39,21 @@ let cachedTerminalHtml: string | undefined
 const SERVER_URL_RESET = `<script id="oc-relay-server-url">
 ;(() => {
   try {
-    const origin = location.origin
-    localStorage.setItem('opencode.settings.dat:defaultServerUrl', origin)
-    // Purge any persisted server entry pointing at the retired /api/opencode
-    // mount so it cannot be selected as the active server.
+    // The viewer is bound to exactly one session and one project. Any
+    // persisted opencode state from earlier origins/sessions (server URLs,
+    // workspace/directory state, drafts) poisons the bootstrap — observed as
+    // a phantom /api/opencode server and corrupted binary `directory` params
+    // that 500 /api/reference and force /new-session. Wipe ALL opencode.*
+    // keys, then point the default server at this origin (root-mounted
+    // proxy). The viewer_token lives in an HttpOnly cookie, not localStorage,
+    // so this does not log the user out.
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const k = localStorage.key(i)
-      if (!k || !k.startsWith('opencode.')) continue
-      const v = localStorage.getItem(k)
-      if (v && v.includes('/api/opencode')) {
-        try {
-          const parsed = JSON.parse(v)
-          const cleaned = JSON.stringify(parsed).split('/api/opencode').join('')
-          localStorage.setItem(k, cleaned)
-        } catch {
-          localStorage.removeItem(k)
-        }
+      if (k && (k.startsWith('opencode.') || k.startsWith('oc-') || k.startsWith('prefix:'))) {
+        localStorage.removeItem(k)
       }
     }
+    localStorage.setItem('opencode.settings.dat:defaultServerUrl', location.origin)
   } catch {}
 })()
 </script>`
