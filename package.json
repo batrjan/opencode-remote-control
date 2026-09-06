@@ -5,7 +5,7 @@
   "type": "module",
   "exports": {
     "./tui": "./plugin/remote-control.js",
-    "./server": "./plugin/remote-control.js"
+    "./server": "./plugin/server.js"
   },
   "engines": {
     "node": ">=22",
