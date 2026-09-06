@@ -25,7 +25,7 @@ Certbot auto-renew is handled by the host certbot package (systemd timer on Ubun
 
 ```bash
 cd /opt/opencode-remote-control
-git clone https://github.com/anomalyco/opencode-remote-control.git .
+git clone https://github.com/batrjan/opencode-remote-control.git .
 # or rsync the repo
 # Create .env:
 echo "RELAY_API_KEY=$(openssl rand -hex 32)" > .env
@@ -57,5 +57,5 @@ cd /opt/opencode-remote-control
 docker compose pull
 docker compose up -d --force-recreate relay
 # or set RELAY_IMAGE to a specific sha:
-# RELAY_IMAGE=ghcr.io/anomalyco/opencode-remote-control/relay:<sha> docker compose up -d
+# RELAY_IMAGE=ghcr.io/batrjan/opencode-remote-control/relay:<sha> docker compose up -d
 ```

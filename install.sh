@@ -13,7 +13,7 @@
 #   - ~/.config/opencode/commands/remote-control/  (/remote-control start|stop|status)
 set -euo pipefail
 
-REPO="${REMOTE_CONTROL_REPO:-https://github.com/anomalyco/opencode-remote-control.git}"
+REPO="${REMOTE_CONTROL_REPO:-https://github.com/batrjan/opencode-remote-control.git}"
 REF="${REMOTE_CONTROL_REF:-main}"
 SKILL_DIR="${HOME}/.agents/skills/remote-control"
 COMMANDS_DIR="${HOME}/.config/opencode/commands/remote-control"

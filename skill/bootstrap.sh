@@ -5,7 +5,7 @@ set -euo pipefail
 
 SKILL_DIR="${REMOTE_CONTROL_HOME:-${HOME}}/.agents/skills/remote-control"
 BIN_DIR="${SKILL_DIR}/bin"
-REPO="${REMOTE_CONTROL_REPO:-https://github.com/anomalyco/opencode-remote-control.git}"
+REPO="${REMOTE_CONTROL_REPO:-https://github.com/batrjan/opencode-remote-control.git}"
 REF="${REMOTE_CONTROL_REF:-main}"
 
 mkdir -p "$BIN_DIR"
