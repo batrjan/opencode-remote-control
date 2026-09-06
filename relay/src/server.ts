@@ -133,6 +133,19 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
     }
     return res.redirect(`/${session.id}`)
   })
+  // The UI's SPA route when the viewer navigates/relods inside the app:
+  // /server/<base64(serverUrl)>/session/<id>. Same auth rule as above — the
+  // server-side must answer the SPA shell for this deep link, otherwise F5
+  // 404s ("Cannot GET /server/.../session/...").
+  app.get('/server/:key/session/:id(ses_[A-Za-z0-9]+)', (req, res) => {
+    const session = store.getSession(req.params.id)
+    if (!session) return res.status(404).type('html').send('<h1>Session not found</h1>')
+    const token = cookieViewerToken(req)
+    if (token && store.verifyViewer(session.id, token)) {
+      return res.type('html').send(terminalHtml())
+    }
+    return res.redirect(`/${session.id}`)
+  })
   // The proxy adapter mounts at the root LAST. It only routes its own
   // allowlisted opencode paths (/session/..., /agent, /provider, /file, ...);
   // everything else falls through to this 404. Because it is registered after
