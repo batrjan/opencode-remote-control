@@ -33,23 +33,32 @@ to the session that issued the viewer token (allowlisted OpenCode endpoints only
 
 ## Quick start
 
-Prerequisites: Node.js ≥ 22 and OpenCode (TUI or CLI). No API keys needed.
+Prerequisites: Node.js ≥ 22 and OpenCode (TUI or CLI). No API keys, no build step.
 
-```bash
-# One-time: build the bridge
-cd bridge && npm install && npm run build
+### Install the plugin from GitHub
 
-# Share the current session (auto-detects opencode port and newest session)
-node dist/index.js start --relay https://opencode.b4tr.net
-# → prints the session URL and CODE: XXXXXX
+Add to your `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugin": ["opencode-remote-control@git+https://github.com/batrjan/opencode-remote-control.git"]
+}
 ```
 
-Share the code + URL with your viewer. They open `/join`, enter the code, and land in the
-OpenCode web UI proxied to your session. Stop sharing with:
+Restart OpenCode. The plugin ships a prebuilt bridge, so no build is needed.
 
-```bash
-node dist/index.js stop --relay https://opencode.b4tr.net
+### Share the current session
+
+In the TUI run:
+
 ```
+/remote-control start
+```
+
+It prints the session URL and `CODE: XXXXXX`. Share both with your viewer — they open
+the link, enter the code, and land in the OpenCode web UI proxied to your session.
+
+Stop sharing with `/remote-control stop`; check with `/remote-control status`.
 
 The bridge also stops on its own when OpenCode quits (watchdog) or on SIGINT/SIGTERM;
 every stop path deletes the relay session and revokes the code.
@@ -64,7 +73,7 @@ commands run the bridge directly (no LLM prompt, instant).
 | --------- | ------------------------------------------------------------------------------------------- |
 | `relay/`  | Public server: Express API, in-memory session store, WS bridge endpoint, proxy adapter, static viewer UI. Ships as a Docker image. |
 | `bridge/` | Local CLI (`start` / `stop` / `status`) that registers the session, holds the WS to the relay, executes proxied requests against local OpenCode, and forwards SSE events. |
-| `plugin/` | Native TUI plugin: slash commands run the bridge directly (no LLM). `skill/bootstrap.sh` rebuilds the bridge binary. |
+| `plugin/` | Native TUI plugin: slash commands run the bridge directly (no LLM). The prebuilt bridge (`plugin/bridge/remote-control-bridge.cjs`) ships in the package — no build step. |
 | `nginx/`  | Host nginx vhost (TLS termination → `127.0.0.1:8080`, authoritative `X-Forwarded-For`).      |
 | `.github/workflows/deploy.yml` | Push to `main`: build relay image → GHCR → SSH deploy. See DEPLOY.md.          |
 
