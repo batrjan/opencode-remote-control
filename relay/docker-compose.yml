@@ -5,10 +5,13 @@
 #   - nginx (host) proxies https://opencode.b4tr.net -> 127.0.0.1:8080
 #   - certbot (host) uses webroot /var/www/certbot for ACME challenges
 #
-# .env (never committed, see .env.example):
-#   RELAY_API_KEY=<shared secret for the bridge session API>   (required)
+# .env (never committed, see .env.example; the deploy workflow ships this
+# file and generates RELAY_STATE_KEY on first run):
+#   RELAY_STATE_KEY=<64 hex chars, `openssl rand -hex 32`>      (generated)
+#   RELAY_API_KEY=<legacy; the public session API ignores it>   (optional)
 #   PORT=8080                                                   (optional)
 #   RELAY_IMAGE=relay-local:amd64                               (optional)
+#   RELAY_TRUST_PROXY=loopback, uniquelocal                     (optional)
 services:
   relay:
     # The deploy workflow builds this image on the host (see the deploy section of
@@ -33,6 +36,13 @@ services:
       # plaintext and codes are not persisted (install.sh / the deploy generate
       # the key automatically).
       RELAY_STATE_KEY: "${RELAY_STATE_KEY:-}"
+      # Which proxy hop to believe for X-Forwarded-For. The per-IP limits key on
+      # the CLIENT address; inside Docker the peer is the bridge gateway
+      # (172.x), not loopback, so a bare 'loopback' collapsed every client into
+      # one address and made the brute-force/registration limits global. The
+      # port is published on 127.0.0.1 only, so the private-range peer can only
+      # be the host's own nginx.
+      RELAY_TRUST_PROXY: "${RELAY_TRUST_PROXY:-loopback, uniquelocal}"
     volumes:
       - relay-state:/data
     # Mirrors the Dockerfile HEALTHCHECK (image already has one; kept

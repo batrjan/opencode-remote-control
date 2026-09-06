@@ -7,13 +7,32 @@
 // `tui()` / `server()` — hence two entries over one shared implementation.
 
 import { spawn, execFile } from "node:child_process"
-import { openSync, existsSync, readFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const RELAY = "https://opencode.b4tr.net"
-const LOG = "/tmp/remote-control.log"
+
+/**
+ * Where the bridge logs while starting — the share URL and the ACCESS CODE
+ * land in this file. It used to be a fixed name in /tmp: world-readable, so
+ * any other local account could read the code, and open to a symlink swap on
+ * a shared machine. It now lives beside the bridge's own state, in a dir the
+ * user alone can enter, and the file is opened 0600.
+ */
+export function logPath(env = process.env) {
+  return path.join(env.HOME || homedir(), ".agents", "skills", "remote-control", "state", "bridge.log")
+}
+
+/** Create the private log dir/file and return a write fd for the bridge. */
+export function openLog(file = logPath()) {
+  mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  const fd = openSync(file, "w", 0o600)
+  // openSync's mode only applies to a NEW file; tighten an existing one too.
+  chmodSync(file, 0o600)
+  return fd
+}
 
 // The bridge CLI ships prebuilt INSIDE this package (bridge/remote-control-bridge.cjs)
 // so the plugin works straight from a git/npm install — no local build step.
@@ -65,7 +84,13 @@ function startBridge(sessionID) {
     if (!bin) return reject(new Error("bridge not found — install the plugin from git (see package README)"))
     const args = [bin, "start", "--relay", RELAY]
     if (sessionID) args.push("--session-id", sessionID)
-    const out = openSync(LOG, "w")
+    const LOG = logPath()
+    let out
+    try {
+      out = openLog(LOG)
+    } catch (err) {
+      return reject(new Error(`cannot open the bridge log ${LOG}: ${String(err?.message ?? err)}`))
+    }
     const child = spawn("node", args, {
       detached: true,
       stdio: ["ignore", out, out],
@@ -156,4 +181,4 @@ export function resolveAction(command, args) {
 
 const ACTIONS = new Set(["start", "stop", "status"])
 
-export { RELAY, LOG, bridgeBin, startBridge, runBridge }
+export { RELAY, bridgeBin, startBridge, runBridge }

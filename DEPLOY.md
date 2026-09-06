@@ -74,6 +74,31 @@ is faster with `UI_SOURCE=prebuilt`.
 > fix the package's Actions access first (repository → role Write) and point
 > `RELAY_IMAGE` in the host's `.env` at the registry tag.
 
+## Client IP behind nginx (`RELAY_TRUST_PROXY`)
+
+Every per-IP limit (the activation brute-force brake, the registration caps)
+keys on the client address express derives from `X-Forwarded-For`, so the
+relay must trust exactly the hop nginx uses. In Docker that hop is the bridge
+gateway (`172.18.0.1`), **not** loopback — with the old hard-coded `loopback`
+the header was ignored and every client collapsed into one address: five
+wrong codes from anyone locked activation for everyone, and the whole service
+shared a single IP's five-session cap. Compose therefore sets
+`RELAY_TRUST_PROXY=loopback, uniquelocal`. The port is published on
+`127.0.0.1` only, so a private-range peer can only be the host's nginx, and
+nginx must append the real address (`proxy_set_header X-Forwarded-For
+$proxy_add_x_forwarded_for`, as in `nginx/opencode.b4tr.net.conf`) — express
+takes the right-most untrusted hop, so a client-supplied prefix is ignored.
+Verify after a deploy: a wrong code from your machine must log your public
+address, not `172.x`:
+
+```bash
+docker compose logs --tail 20 relay | grep '\[activate\]'
+```
+
+The deploy workflow also copies `relay/docker-compose.yml` to
+`/opt/opencode-remote-control/` on every run, so the host compose file can
+no longer drift from the repository.
+
 ## Session state (volume)
 
 The relay keeps its sessions in memory, so a plain restart would end every live

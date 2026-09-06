@@ -10,7 +10,7 @@ import { healthRouter } from './api/health.js'
 import { skillRouter } from './api/skill.js'
 import { BridgeClient } from './ws/bridge.js'
 import { proxyAdapter } from './proxy/adapter.js'
-import { config, stateFile } from './config.js'
+import { config, stateFile, trustProxy } from './config.js'
 import { FileStateStore } from './persist.js'
 
 /**
@@ -76,11 +76,24 @@ function terminalHtml(): string {
  */
 export function createApp(store: Store, bridge?: BridgeClient): Express {
   const app = express()
-  // Trust only loopback proxies (nginx on the same host). A permissive
-  // `true` made X-Forwarded-For fully client-spoofable, defeating per-IP
-  // rate limits. nginx must set XFF authoritatively (proxy_set_header
-  // X-Forwarded-For $proxy_add_x_forwarded_for).
-  app.set('trust proxy', 'loopback')
+  // Which proxy hop to believe for X-Forwarded-For — see trustProxy(). A
+  // permissive `true` made XFF fully client-spoofable, defeating per-IP rate
+  // limits; a bare 'loopback' inside Docker trusted nothing and collapsed
+  // every client into the bridge gateway's address, making the limits global.
+  // nginx must set XFF authoritatively (proxy_set_header X-Forwarded-For
+  // $proxy_add_x_forwarded_for) — express then takes the right-most address
+  // that is not a trusted proxy, so a client-supplied prefix is ignored.
+  app.set('trust proxy', trustProxy())
+  // No server fingerprint, no MIME sniffing, never framed (the join page takes
+  // a secret code — clickjacking protection), and no referrer: the viewer URL
+  // carries the session id, which must not leak to third-party origins.
+  app.disable('x-powered-by')
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.setHeader('X-Frame-Options', 'DENY')
+    res.setHeader('Referrer-Policy', 'no-referrer')
+    next()
+  })
   app.use(express.json())
   app.use('/health', healthRouter(store))
   // The opencode web UI probes /api/health to detect the server API dialect.

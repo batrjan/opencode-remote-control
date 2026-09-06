@@ -108,6 +108,31 @@ export function relayApiKey(): string {
 }
 
 /**
+ * Express `trust proxy`: which peers' X-Forwarded-For to believe.
+ *
+ * Every per-IP limit (activation brute-force brake, registration caps) keys
+ * on req.ip, so this must match the deployment exactly. Too narrow and every
+ * client collapses into the proxy's own address: one attacker's five wrong
+ * codes lock activation for EVERYONE, and the whole service shares a single
+ * IP's session cap. Too wide and a client spoofs its way past the limits.
+ *
+ * The default `loopback` fits nginx on the same host in front of a bare
+ * `npm start`. Inside Docker the proxy reaches the container from the bridge
+ * gateway (172.x), which is NOT loopback, so compose sets
+ * `loopback, uniquelocal` (RFC 1918 + loopback): the port is published on
+ * 127.0.0.1 only, so that peer can only be the host's own nginx. `false`
+ * trusts no header at all (a relay exposed directly, with no proxy).
+ */
+export function trustProxy(): boolean | number | string {
+  const raw = (process.env.RELAY_TRUST_PROXY ?? '').trim()
+  if (raw === '') return 'loopback'
+  if (raw === 'false' || raw === '0') return false
+  if (raw === 'true') return true
+  if (/^\d+$/.test(raw)) return Number(raw)
+  return raw
+}
+
+/**
  * Reconnect delay advertised to standards-compliant SSE clients (the `retry:`
  * field). The web UI runs its own reader with its own policy and ignores it;
  * a plain EventSource uses it after the stream drops.

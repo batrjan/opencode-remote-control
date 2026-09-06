@@ -16,6 +16,11 @@ import type { BridgeClient } from '../ws/bridge.js'
  *
  * The optional BridgeClient disconnects the session's bridge on DELETE.
  */
+/** Upper bounds for public registration fields (bytes of UTF-16 units). */
+const MAX_SESSION_ID = 128
+const MAX_DIRECTORY = 4096
+const MAX_TITLE = 1024
+
 export function skillRouter(store: Store, bridge?: BridgeClient) {
   const router = express.Router()
 
@@ -27,6 +32,14 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
     }
     if (typeof directory !== 'string' || directory.length === 0) {
       return res.status(400).json({ error: 'directory is required' })
+    }
+    // Registration is public: bound what one request may lodge in memory and
+    // in the persisted state file. Real ids/paths/titles are far shorter.
+    if (session_id.length > MAX_SESSION_ID || directory.length > MAX_DIRECTORY) {
+      return res.status(400).json({ error: 'field too long' })
+    }
+    if (typeof title === 'string' && title.length > MAX_TITLE) {
+      return res.status(400).json({ error: 'field too long' })
     }
     const ip = req.ip ?? 'unknown'
     try {

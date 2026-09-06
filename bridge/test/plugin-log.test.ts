@@ -56,3 +56,28 @@ test('still waiting while the log is empty or has no code yet', () => {
 test('a code with no URL line still resolves', () => {
   expect(parseBridgeLog('CODE: ABC123').ready).toBe('CODE: ABC123')
 })
+
+test('the bridge log (share URL + access code) is private to the user, never /tmp', async () => {
+  const { closeSync, mkdtempSync, rmSync, statSync, writeFileSync, chmodSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const path = await import('node:path')
+  const { logPath, openLog } = await import('../../plugin/bridge-runner.js')
+  const home = mkdtempSync(path.join(tmpdir(), 'rc-home-'))
+  try {
+    const file = logPath({ HOME: home })
+    expect(file.startsWith(home)).toBe(true)
+    expect(file.startsWith('/tmp/')).toBe(false)
+    // Fresh: dir 0700, file 0600.
+    closeSync(openLog(file))
+    expect(statSync(path.dirname(file)).mode & 0o777).toBe(0o700)
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+    // A leftover file with loose perms (older version) is tightened, not kept.
+    writeFileSync(file, 'old')
+    chmodSync(file, 0o644)
+    closeSync(openLog(file))
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+    expect(statSync(file).size).toBe(0) // opened for write → truncated
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})

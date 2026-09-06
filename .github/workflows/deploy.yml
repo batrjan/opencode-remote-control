@@ -55,10 +55,16 @@ jobs:
             docker build --build-arg UI_SOURCE=source -t relay-local:amd64 .
 
             cd /opt/opencode-remote-control
+            # The compose file is versioned with the relay code: ship it on every
+            # deploy so the host copy can never drift from what the image expects
+            # (a new env var or volume added in the repo used to need a manual copy).
+            cp "$HOME/rc-build/$SHA/relay/docker-compose.yml" docker-compose.yml
             # Provision the at-rest encryption key once, in .env on the host
             # (NOT in the state volume), so join codes survive a redeploy and a
-            # volume copy stays useless without it.
+            # volume copy stays useless without it. The file holds secrets:
+            # owner-only, always.
             touch .env
+            chmod 600 .env
             if ! grep -q '^RELAY_STATE_KEY=' .env; then
               echo "RELAY_STATE_KEY=$(openssl rand -hex 32)" >> .env
               echo "generated RELAY_STATE_KEY in .env"
