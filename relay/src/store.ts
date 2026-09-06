@@ -277,11 +277,16 @@ export class Store {
         id: s.id,
         directory: s.directory,
         title: s.title,
+        // The code hash is included here; FileStateStore drops it before a
+        // PLAINTEXT write and keeps it (encrypted) when a key is configured.
+        code_hash: s.code_hash,
+        code_salt: s.code_salt,
         bridge_token_hash: s.bridge_token_hash,
         bridge_token_salt: s.bridge_token_salt,
         created_at: s.created_at,
         last_seen: s.last_seen,
         status: s.status,
+        created_by_ip: s.created_by_ip,
         viewers: Array.from(s.viewers.entries()).map(([hash, v]) => ({
           hash,
           salt: v.salt,
@@ -321,17 +326,18 @@ export class Store {
         id: s.id,
         directory: s.directory ?? '',
         title: s.title ?? '',
-        // The code is not persisted; an empty hash/salt can never match a real
-        // 64-hex saltedHash, so activate() safely fails for a restored session
-        // (its already-joined viewers keep working on their tokens).
-        code_hash: '',
-        code_salt: '',
+        // Use the persisted code when it survived (encrypted file); otherwise
+        // an empty hash/salt can never match a real 64-hex saltedHash, so
+        // activate() safely fails and only already-joined viewers (on their
+        // tokens) keep working. Either way this is never a crackable secret.
+        code_hash: typeof s.code_hash === 'string' ? s.code_hash : '',
+        code_salt: typeof s.code_salt === 'string' ? s.code_salt : '',
         bridge_token_hash: s.bridge_token_hash,
         bridge_token_salt: s.bridge_token_salt,
         created_at: s.created_at ?? now,
         last_seen: s.last_seen,
         status: s.status === 'closed' ? 'closed' : 'active',
-        created_by_ip: '',
+        created_by_ip: typeof s.created_by_ip === 'string' ? s.created_by_ip : '',
         viewers,
       })
       restored += 1

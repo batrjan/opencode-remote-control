@@ -55,6 +55,14 @@ jobs:
             docker build --build-arg UI_SOURCE=source -t relay-local:amd64 .
 
             cd /opt/opencode-remote-control
+            # Provision the at-rest encryption key once, in .env on the host
+            # (NOT in the state volume), so join codes survive a redeploy and a
+            # volume copy stays useless without it.
+            touch .env
+            if ! grep -q '^RELAY_STATE_KEY=' .env; then
+              echo "RELAY_STATE_KEY=$(openssl rand -hex 32)" >> .env
+              echo "generated RELAY_STATE_KEY in .env"
+            fi
             docker compose up -d --force-recreate relay
 
             # Fail the deploy if the new container never becomes healthy.

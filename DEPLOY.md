@@ -88,14 +88,25 @@ volumes:
   - relay-state:/data
 ```
 
-What is persisted: the bridge-token hash (so the bridge reconnects and the
-owner can still delete) and each already-issued viewer-token hash (256-bit
-secrets). What is deliberately NOT persisted: the **access code** (only ~30
-bits — a fast hash of it beside its salt is effectively the code itself to
-anyone who reads the file), the owner IP, and the rate-limit counters. So a
-redeploy keeps every already-joined viewer connected, but a code that was never
-used stops working — a late joiner just needs a fresh share. Leaving
-`RELAY_STATE_FILE` empty restores the old in-memory-only behaviour.
+The plaintext access code, bridge token and viewer tokens are never stored —
+the store only ever holds salted hashes. The file itself is **encrypted at
+rest** (AES-256-GCM) with `RELAY_STATE_KEY`, a key kept in `.env` on the host
+(NOT in the state volume), so a copy of the volume — a backup, a `docker cp`, a
+snapshot — is useless without the key. The deploy workflow generates the key on
+first run:
+
+```bash
+grep -q '^RELAY_STATE_KEY=' .env || echo "RELAY_STATE_KEY=$(openssl rand -hex 32)" >> .env
+```
+
+With a key, a redeploy keeps every live share AND its unused join code working.
+Without a key the file is plaintext and the code hash / owner IP are stripped
+before writing (the safe fallback: a redeploy then invalidates an unused code).
+The rate-limit counters are never persisted. Leaving `RELAY_STATE_FILE` empty
+restores the old in-memory-only behaviour.
+
+Rotating the key (e.g. after exposure) is safe: an old encrypted file simply
+fails to decrypt and the relay starts empty — every share re-registers.
 
 To wipe every share (e.g. after a security incident):
 

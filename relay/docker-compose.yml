@@ -27,6 +27,12 @@ services:
       # the store is in-memory, and losing it invalidates viewer cookies and
       # bridge tokens while the bridges are still running.
       RELAY_STATE_FILE: "${RELAY_STATE_FILE:-/data/state.json}"
+      # Encrypts the state file at rest. The key lives in .env on the HOST, not
+      # in the state volume, so a volume copy/backup is useless without it. With
+      # a key, join codes survive a restart too; without one the file is
+      # plaintext and codes are not persisted (install.sh / the deploy generate
+      # the key automatically).
+      RELAY_STATE_KEY: "${RELAY_STATE_KEY:-}"
     volumes:
       - relay-state:/data
     # Mirrors the Dockerfile HEALTHCHECK (image already has one; kept

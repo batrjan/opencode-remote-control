@@ -247,7 +247,9 @@ export async function startServer(port: number = config.port): Promise<http.Serv
   const persistence = persistPath ? new FileStateStore(persistPath) : undefined
   if (persistence) {
     const restored = store.restore(persistence.load())
-    if (restored) console.log(`[relay] restored ${restored} session(s) from ${persistPath}`)
+    const mode = persistence.encrypted ? 'encrypted' : 'PLAINTEXT (no RELAY_STATE_KEY — codes not persisted)'
+    console.log(`[relay] session state: ${persistPath} (${mode})`)
+    if (restored) console.log(`[relay] restored ${restored} session(s)`)
     store.setChangeListener(() => persistence.schedule(() => store.snapshot()))
   }
   // The bare server is created before the app so the WS bridge (which hooks
