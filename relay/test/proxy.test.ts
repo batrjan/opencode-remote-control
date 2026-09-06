@@ -45,6 +45,15 @@ beforeAll(async () => {
     if (req.method === 'GET' && url.pathname === '/session/status') {
       return json(res, 200, { sess1: 'idle-status', other: 'hidden' })
     }
+    if (req.method === 'GET' && url.pathname === '/permission') {
+      return json(res, 200, [
+        { id: 'perm1', sessionID: 'sess1', permission: 'bash' },
+        { id: 'perm-other', sessionID: 'sess-other', permission: 'bash' },
+      ])
+    }
+    if (req.method === 'POST' && /^\/session\/sess1\/permissions\//.test(url.pathname)) {
+      return json(res, 200, { ok: true, permissionID: url.pathname.split('/').pop() })
+    }
     if (req.method === 'GET' && url.pathname === '/agent') return json(res, 200, [{ id: 'build' }])
     if (req.method === 'GET' && url.pathname === '/config') return json(res, 200, { model: 'test' })
     if (req.method === 'POST' && url.pathname === '/session/sess1/prompt_async') {
@@ -167,4 +176,28 @@ test('bridge WS connection with a bad bridge token is rejected', async () => {
     new OpencodeClient('http://127.0.0.1:1', 'opencode', 'password'),
   )
   await expect(bad.connect('sess1', 'wrong-token')).rejects.toThrow()
+})
+
+
+/**
+ * Permission replies from the viewer. The relay always appends its own
+ * ?directory=… query to the forwarded path, so the bridge-side cross-session
+ * guard must match on the pathname only — matching the raw path swallowed the
+ * query into the captured permission id and rejected every reply with 403.
+ */
+test('viewer can answer a permission request of its own session', async () => {
+  const res = await request(relay)
+    .post('/session/sess1/permissions/perm1')
+    .set('x-viewer-token', viewerToken)
+    .send({ response: 'once' })
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual({ ok: true, permissionID: 'perm1' })
+})
+
+test('viewer cannot answer a permission request raised by another session', async () => {
+  const res = await request(relay)
+    .post('/session/sess1/permissions/perm-other')
+    .set('x-viewer-token', viewerToken)
+    .send({ response: 'once' })
+  expect(res.status).toBe(403)
 })

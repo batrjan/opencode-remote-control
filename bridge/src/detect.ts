@@ -5,18 +5,33 @@ import { config, opencodeAuthHeader } from './config.js'
 const execP = promisify(exec)
 
 /**
- * Find the local OpenCode server port: list TCP listeners owned by
- * node/opencode processes (case-insensitive — the desktop app reports its
- * command as "OpenCode") and return the first port whose /global/health
- * answers { healthy: true } for the env credentials.
+ * TCP ports listened on by node/opencode processes (case-insensitive — the
+ * desktop app reports its command as "OpenCode"). lsof prints the address as
+ * `127.0.0.1:4096`, `*:4096` or `[::1]:4096`, so the port is read after the
+ * LAST colon — splitting on the first one dropped every IPv6 listener.
  */
-export async function detectOpenCodePort(): Promise<number> {
+export async function listCandidatePorts(): Promise<number[]> {
   const { stdout } = await execP(
     "lsof -iTCP -sTCP:LISTEN -P 2>/dev/null | awk 'tolower($1) ~ /opencode|node/ {print $9}'",
   )
+  const ports: number[] = []
   for (const line of stdout.split('\n')) {
-    const port = Number(line.split(':')[1])
-    if (port && (await isHealthy(port))) return port
+    const address = line.trim()
+    if (!address) continue
+    const port = Number(address.slice(address.lastIndexOf(':') + 1))
+    if (Number.isInteger(port) && port > 0 && !ports.includes(port)) ports.push(port)
+  }
+  return ports
+}
+
+/**
+ * Find the local OpenCode server port: the first candidate whose
+ * /global/health answers { healthy: true } for the env credentials.
+ * `candidates` is a test hook — production callers scan the machine.
+ */
+export async function detectOpenCodePort(candidates?: number[]): Promise<number> {
+  for (const port of candidates ?? (await listCandidatePorts())) {
+    if (await isHealthy(port)) return port
   }
   throw new Error('opencode not found')
 }
@@ -35,16 +50,28 @@ export async function ensureOpenCodeServer(): Promise<{ port: number; spawned?: 
     // No running server — start a headless one bound to the current project.
   }
   const { spawn } = await import('node:child_process')
+  // Capture the server's own logs instead of inheriting our stderr: the TUI
+  // plugin reads the bridge's output to show the share URL + code, and the
+  // opencode server writes a screenful of INFO/WARN lines that used to bury
+  // it (and made every line matching /error/ look like a bridge failure).
+  // The tail is kept only to explain a startup failure.
   const child = spawn('opencode', ['serve', '--hostname', '127.0.0.1'], {
     env: process.env,
-    stdio: ['ignore', 'pipe', 'inherit'],
+    stdio: ['ignore', 'pipe', 'pipe'],
   })
+  let serverLogTail = ''
+  const keepTail = (chunk: Buffer) => {
+    serverLogTail = (serverLogTail + chunk.toString()).slice(-SERVER_LOG_TAIL_CHARS)
+  }
+  child.stderr?.on('data', keepTail)
+  const failure = (message: string) => new Error(serverLogTail ? `${message}\n${serverLogTail.trim()}` : message)
   const port = await new Promise<number>((resolve, reject) => {
     let settled = false
     const timer = setTimeout(() => {
-      if (!settled) { settled = true; child.kill(); reject(new Error('opencode serve did not report a port in time')) }
+      if (!settled) { settled = true; child.kill(); reject(failure('opencode serve did not report a port in time')) }
     }, 20_000)
     child.stdout?.on('data', (chunk: Buffer) => {
+      keepTail(chunk)
       const m = /http:\/\/[^:\s]+:(\d+)/.exec(chunk.toString())
       if (m && !settled) {
         settled = true
@@ -53,7 +80,7 @@ export async function ensureOpenCodeServer(): Promise<{ port: number; spawned?: 
       }
     })
     child.on('error', (err) => { if (!settled) { settled = true; clearTimeout(timer); reject(err) } })
-    child.on('exit', (code) => { if (!settled) { settled = true; clearTimeout(timer); reject(new Error(`opencode serve exited early (${code})`)) } })
+    child.on('exit', (code) => { if (!settled) { settled = true; clearTimeout(timer); reject(failure(`opencode serve exited early (${code})`)) } })
   })
   // Wait until it actually answers before returning.
   for (let i = 0; i < 20; i++) {
@@ -63,6 +90,9 @@ export async function ensureOpenCodeServer(): Promise<{ port: number; spawned?: 
   child.kill()
   throw new Error('opencode serve started but never became healthy')
 }
+
+/** How much of the spawned server's log to keep for failure messages. */
+const SERVER_LOG_TAIL_CHARS = 4000
 
 async function isHealthy(port: number): Promise<boolean> {
   try {

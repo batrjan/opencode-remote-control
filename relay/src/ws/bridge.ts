@@ -2,6 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import type { Server } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import type { Store } from '../store.js'
+import { wsPingIntervalMs, wsPongGraceRounds } from '../config.js'
 
 /**
  * Relay-side hub for bridge WebSocket connections at /bridge.
@@ -39,6 +40,9 @@ export class BridgeClient {
   private clients: Map<string, WebSocket> = new Map()
   private pending: Map<string, PendingRequest> = new Map()
   private eventListeners: Map<string, Set<(data: string) => void>> = new Map()
+  /** Ping rounds a socket has gone without answering (reset by every pong). */
+  private missedPongs: WeakMap<WebSocket, number> = new WeakMap()
+  private keepAlive: NodeJS.Timeout
 
   constructor(server: Server, private store: Store) {
     this.wss = new WebSocketServer({
@@ -68,22 +72,61 @@ export class BridgeClient {
       // One bridge per session: a reconnect replaces the old socket.
       this.clients.get(session_id)?.terminate()
       this.clients.set(session_id, ws)
+      this.missedPongs.set(ws, 0)
+      // A pong is proof the bridge is reachable — and proof the share is in
+      // use, so it also keeps the orphan reaper away from an idle session.
+      ws.on('pong', () => {
+        this.missedPongs.set(ws, 0)
+        this.store.touchSession(session_id)
+      })
       ws.on('message', (raw) => this.onMessage(session_id, raw))
       ws.on('close', () => {
         if (this.clients.get(session_id) === ws) {
           this.clients.delete(session_id)
           // Fail all pending requests for this session early, instead of
           // letting viewers wait the full timeout for a 504.
-          for (const [request_id, pending] of this.pending.entries()) {
-            if (pending.session_id === session_id) {
-              clearTimeout(pending.timer)
-              this.pending.delete(request_id)
-              pending.reject(new Error('bridge closed'))
-            }
-          }
+          this.failPending(session_id, 'bridge closed')
         }
       })
     })
+    // Half-open sockets look OPEN forever: without this sweep a bridge that
+    // dropped off the network keeps its session slot and every viewer request
+    // waits out the full proxy timeout.
+    this.keepAlive = setInterval(() => this.pingClients(), wsPingIntervalMs())
+    this.keepAlive.unref?.()
+  }
+
+  /** One keep-alive round: drop silent sockets, ping the rest. */
+  private pingClients(): void {
+    const grace = wsPongGraceRounds()
+    for (const [session_id, ws] of this.clients.entries()) {
+      if (ws.readyState !== WebSocket.OPEN) continue
+      const missed = (this.missedPongs.get(ws) ?? 0) + 1
+      if (missed > grace) {
+        // Terminate, never close(): a half-open socket never answers the
+        // closing handshake. 'close' fires and fails its pending requests.
+        this.clients.delete(session_id)
+        this.failPending(session_id, 'bridge unreachable')
+        ws.terminate()
+        continue
+      }
+      this.missedPongs.set(ws, missed)
+      try {
+        ws.ping()
+      } catch {
+        // Socket died between the readyState check and the ping.
+      }
+    }
+  }
+
+  /** Reject every in-flight proxy request of one session. */
+  private failPending(session_id: string, reason: string): void {
+    for (const [request_id, pending] of this.pending.entries()) {
+      if (pending.session_id !== session_id) continue
+      clearTimeout(pending.timer)
+      this.pending.delete(request_id)
+      pending.reject(new Error(reason))
+    }
   }
 
   isConnected(session_id: string): boolean {
@@ -149,6 +192,7 @@ export class BridgeClient {
 
   /** Close all bridge connections and fail every pending proxy request. */
   close() {
+    clearInterval(this.keepAlive)
     for (const { timer, reject } of this.pending.values()) {
       clearTimeout(timer)
       reject(new Error('bridge closed'))

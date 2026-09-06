@@ -171,7 +171,11 @@ test(
     expect(res.headers.get('content-type')).toContain('text/event-stream')
     pushOpencodeEvent(JSON.stringify({ type: 'session.updated', n: 1 }))
     const received = await readSseUntil(res, 'session.updated')
-    expect(received).toContain(': connected')
+    // Opens with a real handshake event, never an SSE comment: the web UI's
+    // reader parses comment lines as events and dies on their missing body.
+    expect(received).not.toContain(': connected')
+    expect(received).toContain('"type":"server.connected"')
+    // /event carries the bare opencode event, exactly as upstream sends it.
     expect(received).toContain('data: {"type":"session.updated","n":1}')
   },
   15_000,
@@ -187,7 +191,11 @@ test(
     expect(res.headers.get('content-type')).toContain('text/event-stream')
     pushOpencodeEvent(JSON.stringify({ type: 'message.part.updated', n: 2 }))
     const received = await readSseUntil(res, 'message.part.updated')
-    expect(received).toContain('data: {"type":"message.part.updated","n":2}')
+    // The global stream uses opencode's `{ directory, payload }` envelope —
+    // the web UI reads `payload` there and breaks on a bare event.
+    expect(received).toContain('data: {"payload":{"id":')
+    expect(received).toContain('"type":"server.connected"')
+    expect(received).toContain('data: {"directory":"/path","payload":{"type":"message.part.updated","n":2}}')
   },
   15_000,
 )

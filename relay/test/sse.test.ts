@@ -97,3 +97,123 @@ test('SSE endpoint rejects an invalid viewer token', async () => {
   })
   expect(res.status).toBe(401)
 })
+
+/**
+ * Regression: the stream must open exactly like opencode's own /event — with
+ * a `data:` frame and no SSE comment. The web UI's reader does not skip
+ * comment lines; a leading `: connected` was parsed as an event and killed
+ * the viewer's live stream immediately after connecting.
+ */
+test('the viewer stream sends no SSE comment line', async () => {
+  const res = await fetch(`${relayUrl}/event`, { headers: { 'x-viewer-token': viewerToken } })
+  const reader = res.body!.getReader()
+  const decoder = new TextDecoder()
+  let received = ''
+  const deadline = Date.now() + 4000
+  while (!received.includes('\n\n') && Date.now() < deadline) {
+    const { value, done } = await reader.read()
+    if (done) break
+    received += decoder.decode(value, { stream: true })
+  }
+  await reader.cancel()
+  const frames = received.split('\n\n').filter((f) => f.trim().length > 0)
+  expect(frames.length).toBeGreaterThan(0)
+  for (const frame of frames) {
+    for (const line of frame.split('\n')) {
+      expect(line.startsWith(':')).toBe(false)
+    }
+  }
+  expect(frames[0]!.startsWith('data: ')).toBe(true)
+})
+
+test('the stream opens with a server.connected frame, like opencode does', async () => {
+  const res = await fetch(`${relayUrl}/event`, { headers: { 'x-viewer-token': viewerToken } })
+  const reader = res.body!.getReader()
+  const { value } = await reader.read()
+  await reader.cancel()
+  const first = new TextDecoder().decode(value).split('\n\n')[0]!
+  const event = JSON.parse(first.replace(/^data: /, ''))
+  expect(event.type).toBe('server.connected')
+  expect(event.properties).toEqual({})
+  expect(typeof event.id).toBe('string')
+})
+
+test('every forwarded frame is a parseable event object with properties', async () => {
+  const res = await fetch(`${relayUrl}/event`, { headers: { 'x-viewer-token': viewerToken } })
+  const reader = res.body!.getReader()
+  const decoder = new TextDecoder()
+  let received = ''
+  const deadline = Date.now() + 4000
+  while (received.split('\n\n').length < 3 && Date.now() < deadline) {
+    const { value, done } = await reader.read()
+    if (done) break
+    received += decoder.decode(value, { stream: true })
+  }
+  await reader.cancel()
+  const payloads = received
+    .split('\n\n')
+    .filter((f) => f.trim().length > 0)
+    .map((f) =>
+      f
+        .split('\n')
+        .filter((l) => l.startsWith('data: '))
+        .map((l) => l.slice(6))
+        .join('\n'),
+    )
+  expect(payloads.length).toBeGreaterThan(0)
+  for (const payload of payloads) {
+    expect(() => JSON.parse(payload)).not.toThrow()
+    expect(typeof JSON.parse(payload)).toBe('object')
+  }
+})
+
+/**
+ * Envelope contract. opencode's `/event` emits the bare event while
+ * `/global/event` wraps it as `{ directory, project, payload }`. The web UI
+ * subscribes to the global stream and reads `e.payload.…`, so forwarding the
+ * bare event there killed the viewer's live stream on the first event.
+ */
+async function firstFrames(path: string, count: number): Promise<unknown[]> {
+  const res = await fetch(`${relayUrl}${path}`, { headers: { 'x-viewer-token': viewerToken } })
+  const reader = res.body!.getReader()
+  const decoder = new TextDecoder()
+  let received = ''
+  const deadline = Date.now() + 5000
+  while (received.split('\n\n').filter((f) => f.trim()).length < count && Date.now() < deadline) {
+    const { value, done } = await reader.read()
+    if (done) break
+    received += decoder.decode(value, { stream: true })
+  }
+  await reader.cancel()
+  return received
+    .split('\n\n')
+    .filter((f) => f.trim().length > 0)
+    .slice(0, count)
+    .map((f) =>
+      JSON.parse(
+        f
+          .split('\n')
+          .filter((l) => l.startsWith('data: '))
+          .map((l) => l.slice(6))
+          .join('\n'),
+      ),
+    )
+}
+
+test('/event forwards the bare event envelope', async () => {
+  const frames = (await firstFrames('/event', 2)) as Array<Record<string, unknown>>
+  expect(frames[0]).toMatchObject({ type: 'server.connected' })
+  const forwarded = frames[1] as { type?: string; payload?: unknown }
+  expect(forwarded.payload).toBeUndefined()
+  expect(forwarded.type).toBe('heartbeat')
+})
+
+test('/global/event wraps every frame in { directory, payload }', async () => {
+  const frames = (await firstFrames('/global/event', 2)) as Array<Record<string, any>>
+  // Handshake: payload only, no directory — exactly like opencode.
+  expect(frames[0]!.payload).toMatchObject({ type: 'server.connected', properties: {} })
+  expect(frames[0]!.directory).toBeUndefined()
+  // Forwarded events carry the session's directory and the untouched payload.
+  expect(frames[1]!.directory).toBe('/path')
+  expect(frames[1]!.payload).toMatchObject({ type: 'heartbeat' })
+})

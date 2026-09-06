@@ -60,6 +60,37 @@ export const config = {
 } as const
 
 /**
+ * Keep-alive tuning. On a flaky network a TCP connection can go half-open:
+ * both ends still believe the socket is up while nothing gets through. These
+ * intervals make every hop prove it is alive, so the share recovers instead
+ * of silently doing nothing.
+ *
+ * Read lazily from the environment so tests can shrink them.
+ */
+export function wsPingIntervalMs(): number {
+  return Number(process.env.RELAY_WS_PING_INTERVAL_MS ?? 25_000)
+}
+
+/**
+ * Missed-pong grace: a bridge socket that has not answered within this many
+ * ping rounds is terminated, freeing the session for the bridge's reconnect
+ * and failing pending proxy requests instead of hanging viewers.
+ */
+export function wsPongGraceRounds(): number {
+  return Number(process.env.RELAY_WS_PONG_GRACE_ROUNDS ?? 2)
+}
+
+/**
+ * How often the viewer's SSE stream gets a heartbeat event. Also keeps
+ * intermediate proxies (nginx, corporate middleboxes) from closing an idle
+ * stream. Must be a real `server.heartbeat` event: the web UI's reader parses
+ * comment lines as events and dies on them.
+ */
+export function sseHeartbeatMs(): number {
+  return Number(process.env.RELAY_SSE_HEARTBEAT_MS ?? 15_000)
+}
+
+/**
  * Optional admin key. No longer required for the public session API
  * (registration is public + rate-limited; deletion requires the session's
  * bridge_token). Kept only for backward compatibility with older bridges.

@@ -3702,12 +3702,12 @@ var require_websocket_server = __commonJS({
 });
 
 // src/index.ts
-var src_exports = {};
-__export(src_exports, {
+var index_exports = {};
+__export(index_exports, {
   startBridge: () => startBridge,
   stopBridge: () => stopBridge
 });
-module.exports = __toCommonJS(src_exports);
+module.exports = __toCommonJS(index_exports);
 var import_node_fs3 = require("node:fs");
 var import_node_url = require("node:url");
 
@@ -7090,6 +7090,23 @@ var config = {
   /** Watchdog interval for polling the local opencode server while running. */
   watchdogIntervalMs: 1e4
 };
+function wsPingIntervalMs() {
+  return Number(process.env.REMOTE_CONTROL_WS_PING_INTERVAL_MS ?? 2e4);
+}
+function reconnectBaseMs() {
+  return Number(process.env.REMOTE_CONTROL_RECONNECT_BASE_MS ?? 1e3);
+}
+function reconnectMaxMs() {
+  return Number(process.env.REMOTE_CONTROL_RECONNECT_MAX_MS ?? 3e4);
+}
+function eventRetryMs() {
+  return Number(process.env.REMOTE_CONTROL_EVENT_RETRY_MS ?? 1e3);
+}
+function backoffDelay(attempt, base = reconnectBaseMs(), max = reconnectMaxMs()) {
+  const exponential = Math.min(max, base * 2 ** Math.max(0, attempt - 1));
+  const jitter = exponential * 0.2 * (Math.random() * 2 - 1);
+  return Math.max(0, Math.min(max, Math.round(exponential + jitter)));
+}
 function basicAuthHeader(username, password) {
   return `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
 }
@@ -7104,13 +7121,22 @@ function opencodeAuthHeader() {
 var import_node_child_process2 = require("node:child_process");
 var import_node_util3 = require("node:util");
 var execP = (0, import_node_util3.promisify)(import_node_child_process2.exec);
-async function detectOpenCodePort() {
+async function listCandidatePorts() {
   const { stdout } = await execP(
     "lsof -iTCP -sTCP:LISTEN -P 2>/dev/null | awk 'tolower($1) ~ /opencode|node/ {print $9}'"
   );
+  const ports = [];
   for (const line of stdout.split("\n")) {
-    const port = Number(line.split(":")[1]);
-    if (port && await isHealthy(port)) return port;
+    const address = line.trim();
+    if (!address) continue;
+    const port = Number(address.slice(address.lastIndexOf(":") + 1));
+    if (Number.isInteger(port) && port > 0 && !ports.includes(port)) ports.push(port);
+  }
+  return ports;
+}
+async function detectOpenCodePort(candidates) {
+  for (const port of candidates ?? await listCandidatePorts()) {
+    if (await isHealthy(port)) return port;
   }
   throw new Error("opencode not found");
 }
@@ -7122,18 +7148,26 @@ async function ensureOpenCodeServer() {
   const { spawn } = await import("node:child_process");
   const child = spawn("opencode", ["serve", "--hostname", "127.0.0.1"], {
     env: process.env,
-    stdio: ["ignore", "pipe", "inherit"]
+    stdio: ["ignore", "pipe", "pipe"]
   });
+  let serverLogTail = "";
+  const keepTail = (chunk) => {
+    serverLogTail = (serverLogTail + chunk.toString()).slice(-SERVER_LOG_TAIL_CHARS);
+  };
+  child.stderr?.on("data", keepTail);
+  const failure = (message) => new Error(serverLogTail ? `${message}
+${serverLogTail.trim()}` : message);
   const port = await new Promise((resolve, reject) => {
     let settled = false;
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
         child.kill();
-        reject(new Error("opencode serve did not report a port in time"));
+        reject(failure("opencode serve did not report a port in time"));
       }
     }, 2e4);
     child.stdout?.on("data", (chunk) => {
+      keepTail(chunk);
       const m = /http:\/\/[^:\s]+:(\d+)/.exec(chunk.toString());
       if (m && !settled) {
         settled = true;
@@ -7152,7 +7186,7 @@ async function ensureOpenCodeServer() {
       if (!settled) {
         settled = true;
         clearTimeout(timer);
-        reject(new Error(`opencode serve exited early (${code})`));
+        reject(failure(`opencode serve exited early (${code})`));
       }
     });
   });
@@ -7163,6 +7197,7 @@ async function ensureOpenCodeServer() {
   child.kill();
   throw new Error("opencode serve started but never became healthy");
 }
+var SERVER_LOG_TAIL_CHARS = 4e3;
 async function isHealthy(port) {
   try {
     const res = await fetch(`http://127.0.0.1:${port}${config.healthPath}`, {
@@ -7327,6 +7362,18 @@ var RelayWSClient = class {
   ws = null;
   eventAbortController = null;
   boundSessionId = null;
+  bridgeToken = null;
+  /** Set by close(): stops the keep-alive and every retry loop for good. */
+  stopped = false;
+  keepAlive = null;
+  awaitingPong = false;
+  reconnectTimer = null;
+  reconnectAttempt = 0;
+  forwardingEvents = false;
+  /** Called when the relay rejects our credentials — the share is gone. */
+  onFatal = null;
+  /** Test/diagnostic hook: fired after every successful (re)connection. */
+  onReconnect = null;
   /**
    * Connect to the relay's /bridge endpoint. Resolves once the socket is
    * open; rejects if the relay refuses the credentials (close 4003) or the
@@ -7334,17 +7381,28 @@ var RelayWSClient = class {
    */
   connect(session_id, bridge_token) {
     this.boundSessionId = session_id;
+    this.bridgeToken = bridge_token;
+    return this.dial();
+  }
+  /** Open one socket and wire keep-alive + reconnect onto it. */
+  dial() {
+    const session_id = this.boundSessionId;
     const base = this.relayUrl.replace(/^http/, "ws");
     const url = `${base}/bridge?session_id=${encodeURIComponent(session_id)}`;
     return new Promise((resolve, reject) => {
       const ws = new wrapper_default(url, {
-        headers: { "x-bridge-token": bridge_token }
+        headers: { "x-bridge-token": this.bridgeToken }
       });
       this.ws = ws;
       let opened = false;
       ws.on("open", () => {
         opened = true;
+        this.reconnectAttempt = 0;
+        this.startKeepAlive(ws);
         resolve();
+      });
+      ws.on("pong", () => {
+        this.awaitingPong = false;
       });
       ws.on("error", (err) => {
         if (!opened) reject(err);
@@ -7354,21 +7412,93 @@ var RelayWSClient = class {
           reject(new Error(`relay refused bridge connection (close code ${code})`));
           return;
         }
-        if (this.ws === ws) this.ws = null;
+        if (this.ws !== ws) return;
+        this.ws = null;
+        this.stopKeepAlive();
+        if (code === 4001 || code === 4003) {
+          this.onFatal?.(new Error(`relay closed the bridge (code ${code})`));
+          return;
+        }
+        this.scheduleReconnect();
       });
       ws.on("message", (raw) => {
         void this.onMessage(raw);
       });
     });
   }
-  /** Subscribe to opencode's /event SSE stream and push each event to the relay. */
+  /**
+   * Prove the link in both directions. A half-open socket still reports OPEN,
+   * so an unanswered ping is the only way to notice the network went away:
+   * terminate() then fires 'close' and starts the reconnect.
+   */
+  startKeepAlive(ws) {
+    this.stopKeepAlive();
+    this.awaitingPong = false;
+    const timer = setInterval(() => {
+      if (this.ws !== ws || ws.readyState !== wrapper_default.OPEN) return;
+      if (this.awaitingPong) {
+        ws.terminate();
+        return;
+      }
+      this.awaitingPong = true;
+      try {
+        ws.ping();
+      } catch {
+        ws.terminate();
+      }
+    }, wsPingIntervalMs());
+    timer.unref?.();
+    this.keepAlive = timer;
+  }
+  stopKeepAlive() {
+    if (this.keepAlive) clearInterval(this.keepAlive);
+    this.keepAlive = null;
+    this.awaitingPong = false;
+  }
+  /** Re-dial with exponential backoff until it works or close() is called. */
+  scheduleReconnect() {
+    if (this.stopped || this.reconnectTimer) return;
+    this.reconnectAttempt += 1;
+    const timer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.stopped) return;
+      this.dial().then(() => {
+        if (!this.forwardingEvents) void this.startEventForwarding();
+        this.onReconnect?.();
+      }).catch(() => this.scheduleReconnect());
+    }, backoffDelay(this.reconnectAttempt));
+    timer.unref?.();
+    this.reconnectTimer = timer;
+  }
+  /**
+   * Subscribe to opencode's /event SSE stream and push each event to the
+   * relay. The stream ends whenever the local server restarts or the read
+   * fails, so it re-subscribes until close() — otherwise the share would stay
+   * connected but silent, with no events reaching any viewer.
+   */
   async startEventForwarding() {
     this.eventAbortController = new AbortController();
     const stream = await this.opencode.getEvent(this.eventAbortController.signal);
     if (!stream) throw new Error("opencode /event stream unavailable");
-    void readSseStream(stream, (data) => this.send({ type: "event", data }));
+    this.forwardingEvents = true;
+    void readSseStream(stream, (data) => this.send({ type: "event", data })).finally(() => {
+      this.forwardingEvents = false;
+      this.scheduleEventRestart();
+    });
+  }
+  scheduleEventRestart() {
+    if (this.stopped) return;
+    const timer = setTimeout(() => {
+      if (this.stopped || this.forwardingEvents) return;
+      this.startEventForwarding().catch(() => this.scheduleEventRestart());
+    }, eventRetryMs());
+    timer.unref?.();
   }
   close() {
+    this.stopped = true;
+    this.stopKeepAlive();
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
     this.eventAbortController?.abort();
     this.eventAbortController = null;
     this.ws?.close();
@@ -7416,7 +7546,8 @@ var RelayWSClient = class {
    * the permission request belongs to the bound session before forwarding.
    */
   async guardRequest(method, path3) {
-    const m = /^\/session\/[^/]+\/permissions\/([^/]+)$/.exec(path3);
+    const pathname = path3.split(/[?#]/)[0];
+    const m = /^\/session\/[^/]+\/permissions\/([^/]+)$/.exec(pathname);
     if (method !== "POST" || !m) return null;
     const permissionID = decodeURIComponent(m[1]);
     if (!this.boundSessionId) return null;
@@ -7512,7 +7643,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
   } else if (opts.port !== void 0) {
     resolvedPort = opts.port;
   } else {
-    const ensured = await ensureOpenCodeServer();
+    const ensured = await (opts.serverSpawner ?? ensureOpenCodeServer)();
     resolvedPort = ensured.port;
     spawnedServer = ensured.spawned;
   }
@@ -7535,7 +7666,8 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     access_code,
     bridge_token,
     relay: relayUrl,
-    started_at: Date.now()
+    started_at: Date.now(),
+    pid: process.pid
   });
   const ws = new RelayWSClient(relayUrl, opencode);
   try {
@@ -7548,6 +7680,10 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     clearSessionState(session_id);
     throw err;
   }
+  const killSpawnedServer = () => {
+    if (spawnedServer && spawnedServer.exitCode === null && !spawnedServer.killed) spawnedServer.kill();
+  };
+  process.on("exit", killSpawnedServer);
   let resolveClosed;
   const closed = new Promise((resolve) => {
     resolveClosed = resolve;
@@ -7557,8 +7693,9 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     if (stopped) return;
     stopped = true;
     clearInterval(watchdog);
+    process.off("exit", killSpawnedServer);
     ws.close();
-    if (spawnedServer && !spawnedServer.killed) spawnedServer.kill();
+    killSpawnedServer();
     try {
       await relay.deleteSession(session_id, bridge_token);
     } catch {
@@ -7566,6 +7703,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     clearSessionState(session_id);
     resolveClosed();
   };
+  ws.onFatal = () => void stop();
   const watchdog = setInterval(() => {
     void (async () => {
       if (!await opencodeHealthy(opencodeUrl)) await stop();
@@ -7584,6 +7722,14 @@ async function stopBridge(relayUrl, sessionId, apiKey) {
     throw new Error(`relay deleteSession failed: ${status}`);
   }
   clearSessionState(sessionId);
+  terminateBridgeProcess(state.pid);
+}
+function terminateBridgeProcess(pid) {
+  if (!pid || pid === process.pid) return;
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+  }
 }
 async function pickSession(opencode) {
   const cwd = process.cwd();
@@ -7635,6 +7781,7 @@ program2.command("start").description("Register this session with the relay and 
   const onSignal = () => void handle.stop();
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
+  process.on("SIGHUP", onSignal);
   await handle.closed;
   console.log("Remote control stopped.");
 });

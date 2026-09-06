@@ -4,7 +4,8 @@
   "description": "Share the current OpenCode session on the web with a short access code (remote control).",
   "type": "module",
   "exports": {
-    "./tui": "./plugin/remote-control.js"
+    "./tui": "./plugin/remote-control.js",
+    "./server": "./plugin/server.js"
   },
   "engines": {
     "node": ">=22",

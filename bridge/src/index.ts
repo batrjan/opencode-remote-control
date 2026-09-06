@@ -27,6 +27,8 @@ export interface StartBridgeOptions {
   opencodeUrl?: string
   /** Watchdog poll interval — test hook; defaults to config.watchdogIntervalMs. */
   healthIntervalMs?: number
+  /** Server spawner — test hook; defaults to ensureOpenCodeServer(). */
+  serverSpawner?: () => Promise<{ port: number; spawned?: import('node:child_process').ChildProcess }>
 }
 
 export interface BridgeHandle {
@@ -63,7 +65,7 @@ export async function startBridge(
   } else if (opts.port !== undefined) {
     resolvedPort = opts.port
   } else {
-    const ensured = await ensureOpenCodeServer()
+    const ensured = await (opts.serverSpawner ?? ensureOpenCodeServer)()
     resolvedPort = ensured.port
     spawnedServer = ensured.spawned
   }
@@ -83,12 +85,16 @@ export async function startBridge(
   )
   // Persist the owner token so `stop` (even from another shell) can delete
   // the session later. 0600 perms; cleared on stop.
+  // The pid lets `stop` (run from the TUI plugin or another shell) terminate
+  // this long-running process — deleting the relay session alone left the
+  // bridge and the `opencode serve` it spawned running forever.
   saveSessionState({
     session_id,
     access_code,
     bridge_token,
     relay: relayUrl,
     started_at: Date.now(),
+    pid: process.pid,
   })
   const ws = new RelayWSClient(relayUrl, opencode)
   try {
@@ -102,6 +108,13 @@ export async function startBridge(
     throw err
   }
 
+  const killSpawnedServer = () => {
+    if (spawnedServer && spawnedServer.exitCode === null && !spawnedServer.killed) spawnedServer.kill()
+  }
+  // Last resort: never leave the spawned server behind if this process dies
+  // for a reason that does not go through stop().
+  process.on('exit', killSpawnedServer)
+
   let resolveClosed!: () => void
   const closed = new Promise<void>((resolve) => {
     resolveClosed = resolve
@@ -111,10 +124,12 @@ export async function startBridge(
     if (stopped) return
     stopped = true
     clearInterval(watchdog)
+    process.off('exit', killSpawnedServer)
     ws.close()
-    // If we spawned the opencode server ourselves (no TUI was running), stop
-    // it too — the share's lifetime owns the server it created.
-    if (spawnedServer && !spawnedServer.killed) spawnedServer.kill()
+    // If we spawned the opencode server ourselves (the TUI has no HTTP port,
+    // so this is the normal path), stop it too — the share's lifetime owns
+    // the server it created.
+    killSpawnedServer()
     try {
       await relay.deleteSession(session_id, bridge_token)
     } catch {
@@ -123,6 +138,10 @@ export async function startBridge(
     clearSessionState(session_id)
     resolveClosed()
   }
+  // The relay only closes us on purpose when the session is gone (stopped
+  // elsewhere, or credentials revoked) — there is nothing left to reconnect
+  // to, so shut down instead of retrying forever.
+  ws.onFatal = () => void stop()
   // Watchdog: opencode gone (process exited / port closed) → notify the
   // relay (revokes code + tokens) and shut down.
   const watchdog = setInterval(() => {
@@ -154,6 +173,23 @@ export async function stopBridge(
     throw new Error(`relay deleteSession failed: ${status}`)
   }
   clearSessionState(sessionId)
+  terminateBridgeProcess(state.pid)
+}
+
+/**
+ * Signal the long-running `start` process so it shuts down (its SIGTERM
+ * handler closes the WS and kills the `opencode serve` it spawned). Without
+ * this, `stop` only removed the relay session and left both processes — and
+ * the spawned server's port — behind. Never signals the caller itself (the
+ * library path runs stop inside the bridge process) and tolerates a stale pid.
+ */
+function terminateBridgeProcess(pid: number | undefined): void {
+  if (!pid || pid === process.pid) return
+  try {
+    process.kill(pid, 'SIGTERM')
+  } catch {
+    // Already gone (ESRCH) or not ours (EPERM) — nothing to clean up.
+  }
 }
 
 /** Newest ROOT session in the CURRENT working directory. Subagent sessions
@@ -228,6 +264,7 @@ program
     const onSignal = () => void handle.stop()
     process.on('SIGINT', onSignal)
     process.on('SIGTERM', onSignal)
+    process.on('SIGHUP', onSignal)
     await handle.closed
     console.log('Remote control stopped.')
   })

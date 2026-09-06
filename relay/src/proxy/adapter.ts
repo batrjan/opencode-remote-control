@@ -1,8 +1,9 @@
+import { randomUUID } from 'node:crypto'
 import express from 'express'
 import type { Request, Response } from 'express'
 import type { Store, Session } from '../store.js'
 import type { BridgeClient } from '../ws/bridge.js'
-import { config } from '../config.js'
+import { config, sseHeartbeatMs } from '../config.js'
 
 /**
  * HTTP → WS → opencode proxy adapter, mounted at the server ROOT.
@@ -291,14 +292,46 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     else router.post(template, handler)
   }
 
-  /** SSE fan-out of the session's opencode events to one viewer response. */
-  function sseEvents(req: Request, res: Response, session: Session): void {
+  /**
+   * SSE fan-out of the session's opencode events to one viewer response.
+   *
+   * `global` selects the envelope: opencode's `/event` emits the bare event,
+   * while `/global/event` wraps it as `{ directory, project, payload }`. The
+   * web UI subscribes to the global stream and reads `e.payload.properties` —
+   * forwarding the bare event there left `payload` undefined, threw inside the
+   * UI's event reducer and killed the viewer's live stream on the first event.
+   */
+  function sseEvents(req: Request, res: Response, session: Session, global: boolean): void {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
     })
-    res.write(': connected\n\n')
+    // Open exactly like opencode's own /event stream: a `server.connected`
+    // frame, never an SSE comment. The web UI's fetch-based reader does not
+    // skip comment lines — a leading `: connected` was parsed as an event,
+    // threw on its missing `properties` and killed the viewer's stream on
+    // connect, so nothing updated live until a page reload. The real
+    // `server.connected` is emitted by opencode when the BRIDGE connects,
+    // long before any viewer, so each viewer needs its own.
+    res.flushHeaders()
+    const envelope = (payload: string) =>
+      global ? `{"directory":${JSON.stringify(session.directory)},"payload":${payload}}` : payload
+    // opencode omits the directory on its own handshake frame; match it.
+    res.write(
+      `data: ${global ? `{"payload":${JSON.stringify(serverConnectedEvent())}}` : JSON.stringify(serverConnectedEvent())}\n\n`,
+    )
+    // Keep-alive: opencode's own heartbeats only arrive while the bridge is
+    // reachable, so on a flaky link the viewer's stream would sit silent —
+    // long enough for proxies to close it and with no way to tell a quiet
+    // session from a dead one. Emit our own on the same envelope.
+    const heartbeat = setInterval(() => {
+      if (res.writableEnded) return
+      res.write(`data: ${envelope(JSON.stringify(heartbeatEvent()))}\n\n`)
+    }, sseHeartbeatMs())
+    heartbeat.unref?.()
+    res.on('close', () => clearInterval(heartbeat))
+
     const unsubscribe = bridge.subscribeEvents(session.id, (data) => {
       // The bridge forwards the instance-wide /event stream (filtered by
       // directory upstream, NOT by session). Forward only events that belong
@@ -308,7 +341,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       if (!eventBelongsToSession(data, session.id)) return
       // SSE-safe: prefix every line of a (possibly multi-line) payload.
       res.write(
-        data
+        envelope(data)
           .split('\n')
           .map((line) => `data: ${line}`)
           .join('\n') + '\n\n',
@@ -320,13 +353,13 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   router.get('/event', (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
-    sseEvents(req, res, session)
+    sseEvents(req, res, session, false)
   })
 
   router.get('/global/event', (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
-    sseEvents(req, res, session)
+    sseEvents(req, res, session, true)
   })
 
   return router
@@ -370,20 +403,59 @@ export function eventBelongsToSession(data: string, sessionId: string): boolean 
   if (!ev || typeof ev !== 'object') return true
   const e = ev as Record<string, unknown>
   const props = (e.properties ?? e) as Record<string, unknown>
-  const candidates = [
-    e.sessionID,
-    e.session_id,
-    props?.sessionID,
-    props?.session_id,
-    (props?.info as Record<string, unknown> | undefined)?.sessionID,
-    (props?.info as Record<string, unknown> | undefined)?.id,
-    (e.info as Record<string, unknown> | undefined)?.sessionID,
-    (e.info as Record<string, unknown> | undefined)?.id,
-  ]
-  const mentioned = candidates.filter((c): c is string => typeof c === 'string' && c.length > 0)
+  const mentioned = collectSessionIds(e)
+  // `session.*` events identify their session by `info.id` / `id` rather than
+  // by a sessionID field. Only those types may treat an `id` as a session id:
+  // for `message.updated`, `info.id` is a MESSAGE id and reading it as a
+  // session id dropped every message event (the viewer saw no live updates).
+  if (typeof e.type === 'string' && e.type.startsWith('session.')) {
+    for (const candidate of [(props?.info as Record<string, unknown> | undefined)?.id, props?.id, e.id]) {
+      if (typeof candidate === 'string' && candidate.startsWith('ses')) mentioned.add(candidate)
+    }
+  }
   // No session mentioned anywhere → global event, safe to forward.
-  if (mentioned.length === 0) return true
-  return mentioned.every((id) => id === sessionId)
+  if (mentioned.size === 0) return true
+  for (const id of mentioned) if (id !== sessionId) return false
+  return true
+}
+
+/**
+ * Every `sessionID` / `session_id` value anywhere in the payload. A deep scan
+ * (rather than a fixed list of paths) so nested shapes are covered too —
+ * `message.part.updated` carries the id under `properties.part.sessionID`,
+ * which a path list missed, making other sessions' parts look "global" and
+ * broadcasting them to the viewer.
+ */
+function collectSessionIds(root: unknown): Set<string> {
+  const found = new Set<string>()
+  const stack: Array<{ node: unknown; depth: number }> = [{ node: root, depth: 0 }]
+  let visited = 0
+  while (stack.length > 0) {
+    const { node, depth } = stack.pop()!
+    if (!node || typeof node !== 'object' || depth > EVENT_SCAN_MAX_DEPTH) continue
+    if (++visited > EVENT_SCAN_MAX_NODES) break
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if ((key === 'sessionID' || key === 'session_id') && typeof value === 'string' && value.length > 0) {
+        found.add(value)
+      } else if (value && typeof value === 'object') {
+        stack.push({ node: value, depth: depth + 1 })
+      }
+    }
+  }
+  return found
+}
+
+const EVENT_SCAN_MAX_DEPTH = 8
+const EVENT_SCAN_MAX_NODES = 500
+
+/** Relay-generated keep-alive, shaped like opencode's own heartbeat. */
+function heartbeatEvent(): { id: string; type: string; properties: Record<string, never> } {
+  return { id: `evt_relay_${randomUUID().replace(/-/g, '').slice(0, 20)}`, type: 'server.heartbeat', properties: {} }
+}
+
+/** The handshake frame opencode sends first on /event, per viewer. */
+function serverConnectedEvent(): { id: string; type: string; properties: Record<string, never> } {
+  return { id: `evt_relay_${randomUUID().replace(/-/g, '').slice(0, 20)}`, type: 'server.connected', properties: {} }
 }
 
 /** viewer_token from the HttpOnly cookie or x-viewer-token header. */

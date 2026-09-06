@@ -1,5 +1,6 @@
 import WebSocket from 'ws'
 import type { OpencodeClient } from './opencode.js'
+import { backoffDelay, eventRetryMs, wsPingIntervalMs } from './config.js'
 
 /**
  * Client for the public relay's bridge-facing session API.
@@ -85,6 +86,18 @@ export class RelayWSClient {
   private ws: WebSocket | null = null
   private eventAbortController: AbortController | null = null
   private boundSessionId: string | null = null
+  private bridgeToken: string | null = null
+  /** Set by close(): stops the keep-alive and every retry loop for good. */
+  private stopped = false
+  private keepAlive: NodeJS.Timeout | null = null
+  private awaitingPong = false
+  private reconnectTimer: NodeJS.Timeout | null = null
+  private reconnectAttempt = 0
+  private forwardingEvents = false
+  /** Called when the relay rejects our credentials — the share is gone. */
+  onFatal: ((err: Error) => void) | null = null
+  /** Test/diagnostic hook: fired after every successful (re)connection. */
+  onReconnect: (() => void) | null = null
 
   constructor(
     public relayUrl: string,
@@ -98,17 +111,29 @@ export class RelayWSClient {
    */
   connect(session_id: string, bridge_token: string): Promise<void> {
     this.boundSessionId = session_id
+    this.bridgeToken = bridge_token
+    return this.dial()
+  }
+
+  /** Open one socket and wire keep-alive + reconnect onto it. */
+  private dial(): Promise<void> {
+    const session_id = this.boundSessionId!
     const base = this.relayUrl.replace(/^http/, 'ws')
     const url = `${base}/bridge?session_id=${encodeURIComponent(session_id)}`
     return new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(url, {
-        headers: { 'x-bridge-token': bridge_token },
+        headers: { 'x-bridge-token': this.bridgeToken! },
       })
       this.ws = ws
       let opened = false
       ws.on('open', () => {
         opened = true
+        this.reconnectAttempt = 0
+        this.startKeepAlive(ws)
         resolve()
+      })
+      ws.on('pong', () => {
+        this.awaitingPong = false
       })
       ws.on('error', (err) => {
         if (!opened) reject(err)
@@ -118,7 +143,16 @@ export class RelayWSClient {
           reject(new Error(`relay refused bridge connection (close code ${code})`))
           return
         }
-        if (this.ws === ws) this.ws = null
+        if (this.ws !== ws) return
+        this.ws = null
+        this.stopKeepAlive()
+        // 4001/4003 mean the relay dropped us on purpose (session closed or
+        // credentials rejected): re-dialling would loop forever.
+        if (code === 4001 || code === 4003) {
+          this.onFatal?.(new Error(`relay closed the bridge (code ${code})`))
+          return
+        }
+        this.scheduleReconnect()
       })
       ws.on('message', (raw) => {
         void this.onMessage(raw)
@@ -126,15 +160,89 @@ export class RelayWSClient {
     })
   }
 
-  /** Subscribe to opencode's /event SSE stream and push each event to the relay. */
+  /**
+   * Prove the link in both directions. A half-open socket still reports OPEN,
+   * so an unanswered ping is the only way to notice the network went away:
+   * terminate() then fires 'close' and starts the reconnect.
+   */
+  private startKeepAlive(ws: WebSocket): void {
+    this.stopKeepAlive()
+    this.awaitingPong = false
+    const timer = setInterval(() => {
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return
+      if (this.awaitingPong) {
+        ws.terminate()
+        return
+      }
+      this.awaitingPong = true
+      try {
+        ws.ping()
+      } catch {
+        ws.terminate()
+      }
+    }, wsPingIntervalMs())
+    timer.unref?.()
+    this.keepAlive = timer
+  }
+
+  private stopKeepAlive(): void {
+    if (this.keepAlive) clearInterval(this.keepAlive)
+    this.keepAlive = null
+    this.awaitingPong = false
+  }
+
+  /** Re-dial with exponential backoff until it works or close() is called. */
+  private scheduleReconnect(): void {
+    if (this.stopped || this.reconnectTimer) return
+    this.reconnectAttempt += 1
+    const timer = setTimeout(() => {
+      this.reconnectTimer = null
+      if (this.stopped) return
+      this.dial()
+        .then(() => {
+          // The event stream is per-connection state on the relay side: a new
+          // socket has no subscribers until we push again, and the local SSE
+          // reader may have ended while we were offline.
+          if (!this.forwardingEvents) void this.startEventForwarding()
+          this.onReconnect?.()
+        })
+        .catch(() => this.scheduleReconnect())
+    }, backoffDelay(this.reconnectAttempt))
+    timer.unref?.()
+    this.reconnectTimer = timer
+  }
+
+  /**
+   * Subscribe to opencode's /event SSE stream and push each event to the
+   * relay. The stream ends whenever the local server restarts or the read
+   * fails, so it re-subscribes until close() — otherwise the share would stay
+   * connected but silent, with no events reaching any viewer.
+   */
   async startEventForwarding(): Promise<void> {
     this.eventAbortController = new AbortController()
     const stream = await this.opencode.getEvent(this.eventAbortController.signal)
     if (!stream) throw new Error('opencode /event stream unavailable')
-    void readSseStream(stream, (data) => this.send({ type: 'event', data }))
+    this.forwardingEvents = true
+    void readSseStream(stream, (data) => this.send({ type: 'event', data })).finally(() => {
+      this.forwardingEvents = false
+      this.scheduleEventRestart()
+    })
+  }
+
+  private scheduleEventRestart(): void {
+    if (this.stopped) return
+    const timer = setTimeout(() => {
+      if (this.stopped || this.forwardingEvents) return
+      this.startEventForwarding().catch(() => this.scheduleEventRestart())
+    }, eventRetryMs())
+    timer.unref?.()
   }
 
   close() {
+    this.stopped = true
+    this.stopKeepAlive()
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
     this.eventAbortController?.abort()
     this.eventAbortController = null
     this.ws?.close()
@@ -185,7 +293,11 @@ export class RelayWSClient {
    * the permission request belongs to the bound session before forwarding.
    */
   private async guardRequest(method: string, path: string): Promise<string | null> {
-    const m = /^\/session\/[^/]+\/permissions\/([^/]+)$/.exec(path)
+    // The relay always appends its own ?directory=… query to the forwarded
+    // path, so match the pathname only — otherwise the query lands inside the
+    // captured permission id and every viewer reply is rejected as foreign.
+    const pathname = path.split(/[?#]/)[0]!
+    const m = /^\/session\/[^/]+\/permissions\/([^/]+)$/.exec(pathname)
     if (method !== 'POST' || !m) return null
     const permissionID = decodeURIComponent(m[1]!)
     if (!this.boundSessionId) return null

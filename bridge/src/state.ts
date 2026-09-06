@@ -16,6 +16,9 @@ export interface SessionState {
   bridge_token: string
   relay: string
   started_at: number
+  /** PID of the long-running `start` process, so `stop` can terminate it.
+   * Absent in state written by older versions. */
+  pid?: number
 }
 
 function stateDir(): string {
