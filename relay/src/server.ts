@@ -42,7 +42,7 @@ const SERVER_URL_RESET = `<script id="oc-relay-server-url">
     // The viewer is bound to exactly one session and one project. Any
     // persisted opencode state from earlier origins/sessions (server URLs,
     // workspace/directory state, drafts) poisons the bootstrap — observed as
-    // a phantom /api/opencode server and corrupted binary `directory` params
+    // a phantom /api/opencode server and corrupted binary directory params
     // that 500 /api/reference and force /new-session. Wipe ALL opencode.*
     // keys, then point the default server at this origin (root-mounted
     // proxy). The viewer_token lives in an HttpOnly cookie, not localStorage,
