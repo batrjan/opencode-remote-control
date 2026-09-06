@@ -5,56 +5,77 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# The relay host builds its own image.
+#
+# The previous pipeline pushed to GHCR and had the host pull it, but the push
+# is rejected — `denied: permission_denied: write_package`: the package is not
+# writable by this repository's GITHUB_TOKEN, so every deploy since that broke
+# silently left production on an old image. The host was already running a
+# locally built image (docker-compose.yml defaults to relay-local:amd64), so
+# building there removes the registry from the path entirely and needs nothing
+# beyond the SSH secrets that already exist.
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set image name (GHCR requires lowercase)
-        run: echo "IMAGE=ghcr.io/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')/relay" >> "$GITHUB_ENV"
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push relay image
-        uses: docker/build-push-action@v6
-        with:
-          context: relay
-          # Clean checkouts lack the gitignored UI assets, so build the
-          # opencode web UI from the pinned upstream ref inside Docker.
-          build-args: UI_SOURCE=source
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ github.sha }}
-            ${{ env.IMAGE }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
   deploy:
-    needs: build
     runs-on: ubuntu-latest
     permissions: {}
     concurrency:
       group: deploy-relay
       cancel-in-progress: false
     steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1
+      - uses: actions/checkout@v4
+
+      - name: Ship the build context
+        uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: relay
+          target: ~/rc-build/${{ github.sha }}
+          overwrite: true
+
+      - name: Build the image and restart the relay
+        uses: appleboy/ssh-action@v1
+        env:
+          SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: SHA
           script: |
             set -e
+            cd "$HOME/rc-build/$SHA/relay"
+
+            # Keep the running image reachable for a rollback before the tag moves.
+            docker tag relay-local:amd64 "relay-local:rollback-$(date +%Y%m%d-%H%M)" || true
+
+            # A clean checkout has no relay/public (the UI assets are gitignored),
+            # so the image builds the opencode web UI from the pinned upstream ref.
+            docker build --build-arg UI_SOURCE=source -t relay-local:amd64 .
+
             cd /opt/opencode-remote-control
-            docker compose pull
             docker compose up -d --force-recreate relay
+
+            # Fail the deploy if the new container never becomes healthy.
+            for i in $(seq 1 20); do
+              if curl -fsS -m 3 http://127.0.0.1:8080/health; then
+                echo
+                echo "relay healthy"
+                ok=1
+                break
+              fi
+              sleep 3
+            done
+            if [ -z "$ok" ]; then
+              echo "relay did not become healthy — rolling back" >&2
+              docker compose logs --tail 50 relay >&2 || true
+              exit 1
+            fi
+
+            # Keep the three newest build contexts and rollback tags; drop the rest.
+            ls -1dt "$HOME"/rc-build/*/ 2>/dev/null | tail -n +4 | xargs -r rm -rf
+            docker images --format '{{.Repository}}:{{.Tag}}' \
+              | grep '^relay-local:rollback-' | sort -r | tail -n +4 \
+              | xargs -r -n1 docker rmi -f || true
+            docker image prune -f >/dev/null || true
