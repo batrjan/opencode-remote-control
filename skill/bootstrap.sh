@@ -3,7 +3,7 @@
 # Works in any POSIX shell with node + npm available. Idempotent.
 set -euo pipefail
 
-SKILL_DIR="${HOME}/.agents/skills/remote-control"
+SKILL_DIR="${REMOTE_CONTROL_HOME:-${HOME}}/.agents/skills/remote-control"
 BIN_DIR="${SKILL_DIR}/bin"
 REPO="${REMOTE_CONTROL_REPO:-https://github.com/anomalyco/opencode-remote-control.git}"
 REF="${REMOTE_CONTROL_REF:-main}"
