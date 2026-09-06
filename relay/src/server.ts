@@ -111,7 +111,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // /<base64(directory)>/session/<id> — the official UI parses the first
   // segment as base64(directory), so a raw session id here would be decoded
   // into a garbage directory and break the whole bootstrap.
-  app.get('/:id(ses_[A-Za-z0-9]+)', (req, res) => {
+  app.get('/:id(ses_[A-Za-z0-9_]+)', (req, res) => {
     const session = store.getSession(req.params.id)
     if (!session) return res.status(404).type('html').send('<h1>Session not found</h1>')
     const token = cookieViewerToken(req)
@@ -124,7 +124,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // the UI only to an authenticated viewer of THAT session; otherwise bounce
   // to the session's code-entry page. The :dir segment is base64url of the
   // session directory — we validate by decoding and comparing to the session.
-  app.get('/:dir/session/:id(ses_[A-Za-z0-9]+)', (req, res) => {
+  app.get('/:dir/session/:id(ses_[A-Za-z0-9_]+)', (req, res) => {
     const session = store.getSession(req.params.id)
     if (!session) return res.status(404).type('html').send('<h1>Session not found</h1>')
     const token = cookieViewerToken(req)
@@ -137,7 +137,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // /server/<base64(serverUrl)>/session/<id>. Same auth rule as above — the
   // server-side must answer the SPA shell for this deep link, otherwise F5
   // 404s ("Cannot GET /server/.../session/...").
-  app.get('/server/:key/session/:id(ses_[A-Za-z0-9]+)', (req, res) => {
+  app.get('/server/:key/session/:id(ses_[A-Za-z0-9_]+)', (req, res) => {
     const session = store.getSession(req.params.id)
     if (!session) return res.status(404).type('html').send('<h1>Session not found</h1>')
     const token = cookieViewerToken(req)

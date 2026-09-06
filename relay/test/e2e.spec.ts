@@ -156,3 +156,15 @@ test('the same UI data requests are rejected without the viewer cookie', async (
     expect(res.status).toBe(401)
   }
 })
+
+test('GET /<session_id with underscore> serves the join page / UI (route accepts underscores)', async () => {
+  // Session ids contain underscores (ses_sim, ses_browser_e2e). The route
+  // must accept them or real sessions 404.
+  const created = await request(relay)
+    .post('/api/sessions')
+    .set('x-api-key', API_KEY)
+    .send({ session_id: 'ses_with_underscore', directory: '/path', title: 'u' })
+  expect(created.status).toBe(201)
+  const res = await request(relay).get('/ses_with_underscore')
+  expect(res.status).toBe(200)
+})
