@@ -51,14 +51,16 @@ export class BridgeClient {
         const session_id = url.searchParams.get('session_id') ?? ''
         // Accept token from header (preferred, avoids nginx access logs) or
         // legacy query param (deprecated, will be removed).
-        const token = info.req.headers['x-bridge-token'] ?? url.searchParams.get('token') ?? ''
+        const headerToken = info.req.headers['x-bridge-token']
+        const token = (typeof headerToken === 'string' ? headerToken : url.searchParams.get('token')) ?? ''
         done(this.store.verifyBridgeToken(session_id, token))
       },
     })
     this.wss.on('connection', (ws, req) => {
       const url = new URL(req.url ?? '', 'http://localhost')
       const session_id = url.searchParams.get('session_id') ?? ''
-      const token = req.headers['x-bridge-token'] ?? url.searchParams.get('token') ?? ''
+      const headerToken = req.headers['x-bridge-token']
+      const token = (typeof headerToken === 'string' ? headerToken : url.searchParams.get('token')) ?? ''
       if (!this.store.verifyBridgeToken(session_id, token)) {
         ws.close(4003, 'invalid bridge token')
         return
