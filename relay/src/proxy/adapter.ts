@@ -93,15 +93,13 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   // UI telemetry
   ['POST', '/log'],
   // Permission API. SECURITY: instance-wide permission endpoints are NOT
-  // exposed — GET /permission lists pending requests from ALL sessions of
-  // the owner, and permission request IDs are instance-global, so a viewer
-  // could approve a prompt belonging to another session. The only allowed
-  // route is the session-scoped respond, which stays force-bound to the
-  // viewer's own session AND is further restricted bridge-side (the bridge
-  // refuses to reply to a requestID that does not belong to the bound
-  // session — see bridge permission guard).
-  // (No entries here on purpose; see the session-scoped
-  // /session/:id/permissions/:permissionID route in ALLOWED_ROUTES.)
+  // proxied verbatim — GET /permission upstream lists pending requests from
+  // ALL sessions of the owner, and permission request IDs are instance-global,
+  // so a viewer could approve a prompt belonging to another session. We expose
+  // GET /permission but FILTER the response to the viewer's own session (see
+  // the handler below). The reply route stays session-scoped
+  // (/session/:id/permissions/:permissionID) and is additionally guarded
+  // bridge-side (refuses requestIDs not owned by the bound session).
 ]
 
 /** Paths that are long-polls upstream (opencode holds them open until an
@@ -207,6 +205,36 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           .status(out.status)
           .type(out.contentType ?? 'application/json')
           .send(`[${out.body}]`)
+      } catch {
+        res.status(502).json({ error: 'bridge not connected' })
+      }
+    })()
+  })
+
+  // GET /permission — pending permission requests, FILTERED to the viewer's
+  // own session. Upstream returns every pending request on the instance
+  // (all of the owner's sessions); a viewer must only ever see (and thus be
+  // able to reason about) its own. The list endpoint is read-only.
+  router.get('/permission', (req, res) => {
+    const session = requireViewer(req, res)
+    if (!session) return
+    void (async () => {
+      try {
+        const out = await bridge.request(
+          session.id,
+          { method: 'GET', path: '/permission' },
+          config.proxyTimeoutMs,
+        )
+        let body = out.body
+        try {
+          const all = JSON.parse(out.body) as Array<Record<string, unknown>>
+          if (Array.isArray(all)) {
+            body = JSON.stringify(all.filter((p) => p.sessionID === session.id))
+          }
+        } catch {
+          // upstream not a JSON array — pass through verbatim
+        }
+        res.status(out.status).type(out.contentType ?? 'application/json').send(body)
       } catch {
         res.status(502).json({ error: 'bridge not connected' })
       }
