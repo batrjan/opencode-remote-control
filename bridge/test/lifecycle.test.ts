@@ -85,7 +85,7 @@ test('start and stop bridge', async () => {
   try {
     expect(handle.session_id).toBe('sess-lc')
     expect(handle.access_code).toMatch(/^[A-Z0-9]{6}$/)
-    expect(handle.viewer_url).toBe('/join')
+    expect(handle.viewer_url).toBe('/sess-lc')
     // The session is registered on the relay.
     const relayClient = new RelayClient(relayUrl, API_KEY)
     expect((await relayClient.getSession('sess-lc')).status).toBe(200)

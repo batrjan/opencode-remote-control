@@ -42,6 +42,7 @@ interface OpencodeSessionInfo {
   id: string
   directory?: string
   title?: string
+  parentID?: string
   time?: { created?: number }
 }
 
@@ -117,7 +118,10 @@ export async function stopBridge(
   }
 }
 
-/** Newest session, preferring ones whose directory matches the cwd. */
+/** Newest ROOT session, preferring ones whose directory matches the cwd.
+ * Subagent sessions have a parentID and are never what the user is looking
+ * at in their TUI — the remote share must mirror the main (root) session
+ * the command was run from. */
 async function pickSession(opencode: OpencodeClient): Promise<OpencodeSessionInfo> {
   const sessions = (await opencode.getSessions()) as OpencodeSessionInfo[]
   if (!Array.isArray(sessions) || sessions.length === 0) {
@@ -126,7 +130,9 @@ async function pickSession(opencode: OpencodeClient): Promise<OpencodeSessionInf
   const cwd = process.cwd()
   const inCwd = sessions.filter((s) => s.directory === cwd)
   const pool = inCwd.length > 0 ? inCwd : sessions
-  return pool.sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0))[0]!
+  const roots = pool.filter((s) => !s.parentID)
+  const candidates = roots.length > 0 ? roots : pool
+  return candidates.sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0))[0]!
 }
 
 async function opencodeHealthy(opencodeUrl: string): Promise<boolean> {
