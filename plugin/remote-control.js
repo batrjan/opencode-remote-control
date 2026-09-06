@@ -174,4 +174,4 @@ export async function tui(api) {
   })
 }
 
-export default { id, server: tui, tui }
+export default { id, tui }
