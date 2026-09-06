@@ -211,6 +211,31 @@ export class Store {
   }
 
   /**
+   * Reap orphaned sessions: a session whose bridge never connected (or
+   * disconnected long ago) and that has been idle longer than `maxIdleMs`
+   * gets deleted (its code and tokens revoked). Prevents abandoned shares
+   * from living forever (e.g. bridge killed -9, or a registration the owner
+   * never followed through on). Returns the ids it removed.
+   */
+  reapOrphans(maxIdleMs: number): string[] {
+    const now = Date.now()
+    const removed: string[] = []
+    for (const [id, session] of this.sessions) {
+      if (now - session.last_seen > maxIdleMs) {
+        this.sessions.delete(id)
+        removed.push(id)
+      }
+    }
+    return removed
+  }
+
+  /** Refresh last_seen (bridge proxy/event traffic calls this). */
+  touchSession(session_id: string): void {
+    const s = this.sessions.get(session_id)
+    if (s) s.last_seen = Date.now()
+  }
+
+  /**
    * Map insert with FIFO eviction at the cap (JS Maps iterate in insertion
    * order, so the first key is the oldest). Evicting a counter/window only
    * resets bookkeeping, never a stored secret.

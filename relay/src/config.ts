@@ -50,6 +50,13 @@ export const config = {
   registrationsPerWindow: 12,
   registrationWindowMs: 3_600_000, // 1 hour
   maxActiveSessionsPerIp: 5,
+  /**
+   * Orphan reaper: sessions idle (no bridge traffic) longer than this are
+   * deleted. Cleans up abandoned shares (bridge killed -9, or a registration
+   * never followed through). 24 hours.
+   */
+  orphanReapMs: 24 * 3_600_000,
+  orphanSweepIntervalMs: 15 * 60_000, // sweep every 15 minutes
 } as const
 
 /**

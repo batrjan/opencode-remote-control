@@ -207,6 +207,15 @@ export async function startServer(port: number = config.port): Promise<http.Serv
   const app = createApp(store, bridge)
   server.on('request', app)
   server.on('close', () => bridge.close())
+  // Orphan reaper: delete sessions that have been idle too long (bridge died
+  // without notice, or a registration never followed through), revoking their
+  // codes and tokens. Public registration makes this necessary.
+  const reaper = setInterval(() => {
+    const removed = store.reapOrphans(config.orphanReapMs)
+    for (const id of removed) bridge.disconnect(id)
+  }, config.orphanSweepIntervalMs)
+  reaper.unref()
+  server.on('close', () => clearInterval(reaper))
   await new Promise<void>((resolve) => server.listen(port, resolve))
   return server
 }

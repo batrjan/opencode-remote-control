@@ -99,6 +99,8 @@ export class BridgeClient {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('bridge not connected'))
     }
+    // Active traffic keeps the share alive against the orphan reaper.
+    this.store.touchSession(session_id)
     const request_id = randomUUID()
     return new Promise<ProxyResponse>((resolve, reject) => {
       const timer = setTimeout(() => {

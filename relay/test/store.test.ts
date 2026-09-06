@@ -105,3 +105,26 @@ test('per-session brute-force lockout: many failed codes against one session loc
   // The 21st attempt — even with the CORRECT code — is rate limited.
   expect(() => store.activate(access_code, 'sessB', 'ip_legit')).toThrow('rate limited')
 })
+
+test('reapOrphans deletes idle sessions and keeps active ones', () => {
+  const store = new Store()
+  store.createSession('sess_old', '/path', 'title', 'ip1')
+  store.createSession('sess_new', '/path', 'title', 'ip2')
+  // Age the old session manually.
+  const old = store.getSession('sess_old')!
+  old.last_seen = Date.now() - 25 * 3_600_000 // 25h ago
+  const removed = store.reapOrphans(24 * 3_600_000)
+  expect(removed).toEqual(['sess_old'])
+  expect(store.getSession('sess_old')).toBeUndefined()
+  expect(store.getSession('sess_new')).toBeTruthy()
+})
+
+test('touchSession refreshes last_seen', () => {
+  const store = new Store()
+  store.createSession('sess_t', '/path', 'title', 'ip1')
+  const s = store.getSession('sess_t')!
+  s.last_seen = Date.now() - 100_000
+  const before = s.last_seen
+  store.touchSession('sess_t')
+  expect(store.getSession('sess_t')!.last_seen).toBeGreaterThan(before)
+})
