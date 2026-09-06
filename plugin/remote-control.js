@@ -29,13 +29,16 @@ function bridgeBin() {
   return undefined
 }
 
-/** Start the bridge detached, logging to LOG; resolve once it prints URL+CODE. */
-function startBridge() {
+/** Start the bridge detached, logging to LOG; resolve once it prints URL+CODE.
+ * `sessionID` pins the share to the user's current session, never another. */
+function startBridge(sessionID) {
   return new Promise((resolve, reject) => {
     const bin = bridgeBin()
     if (!bin) return reject(new Error("bridge not found — install the plugin from git (see package README)"))
+    const args = [bin, "start", "--relay", RELAY]
+    if (sessionID) args.push("--session-id", sessionID)
     const out = openSync(LOG, "w")
-    const child = spawn("node", [bin, "start", "--relay", RELAY], {
+    const child = spawn("node", args, {
       detached: true,
       stdio: ["ignore", out, out],
     })
@@ -114,11 +117,15 @@ export async function tui(api) {
           }
           api.ui.toast({ variant: "info", title: "remote-control", message: "Starting…", duration: 3000 })
           try {
-            const text = await startBridge()
+            // Bind to the CURRENT session (the route the user is on), not an
+            // arbitrary project, so /remote-control start never shares the
+            // wrong session.
+            const sessionID = api.route.current.name === "session" ? api.route.current.params.sessionID : undefined
+            const out = await startBridge(sessionID)
             api.ui.dialog.replace(() =>
               api.ui.DialogAlert({
                 title: "Remote control",
-                message: text,
+                message: out,
                 onConfirm: () => api.ui.dialog.clear(),
               }),
             )

@@ -3,26 +3,42 @@
 // Registers slash commands /remote-control start|stop|status that run the
 // local bridge DIRECTLY (no LLM prompt, no agent reasoning — instant).
 //
-// Install: copy to ~/.config/opencode/plugins/remote-control.js
+// Install from git: add to opencode.json →
+//   "plugin": ["opencode-remote-control@git+https://github.com/batrjan/opencode-remote-control.git"]
+// or copy plugin/remote-control.js to ~/.config/opencode/plugins/.
 
 import { spawn, execFile } from "node:child_process"
 import { openSync, existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
 
 const RELAY = "https://opencode.b4tr.net"
-const BIN = path.join(homedir(), ".agents", "skills", "remote-control", "bin", "index.js")
 const LOG = "/tmp/remote-control.log"
 
-function bridgeMissing() {
-  return !existsSync(BIN)
+// The bridge CLI ships prebuilt INSIDE this package (bridge/remote-control-bridge.cjs)
+// so the plugin works straight from a git/npm install — no local build step.
+const PKG_ROOT = path.dirname(fileURLToPath(import.meta.url))
+const BUNDLED_BIN = path.join(PKG_ROOT, "bridge", "remote-control-bridge.cjs")
+// Fallback for the classic skill layout (installed by install.sh).
+const SKILL_BIN = path.join(homedir(), ".agents", "skills", "remote-control", "bin", "index.js")
+
+function bridgeBin() {
+  if (existsSync(BUNDLED_BIN)) return BUNDLED_BIN
+  if (existsSync(SKILL_BIN)) return SKILL_BIN
+  return undefined
 }
 
-/** Start the bridge detached, logging to LOG; resolve once it prints URL+CODE. */
-function startBridge() {
+/** Start the bridge detached, logging to LOG; resolve once it prints URL+CODE.
+ * `sessionID` pins the share to the user's current session, never another. */
+function startBridge(sessionID) {
   return new Promise((resolve, reject) => {
+    const bin = bridgeBin()
+    if (!bin) return reject(new Error("bridge not found — install the plugin from git (see package README)"))
+    const args = [bin, "start", "--relay", RELAY]
+    if (sessionID) args.push("--session-id", sessionID)
     const out = openSync(LOG, "w")
-    const child = spawn("node", [BIN, "start", "--relay", RELAY], {
+    const child = spawn("node", args, {
       detached: true,
       stdio: ["ignore", out, out],
     })
@@ -69,7 +85,9 @@ function startBridge() {
 /** Run a short-lived bridge subcommand; resolve with trimmed stdout. */
 function runBridge(args, timeout = 15_000) {
   return new Promise((resolve, reject) => {
-    execFile("node", [BIN, ...args], { timeout }, (err, stdout, stderr) => {
+    const bin = bridgeBin()
+    if (!bin) return reject(new Error("bridge not found — install the plugin from git (see package README)"))
+    execFile("node", [bin, ...args], { timeout }, (err, stdout, stderr) => {
       if (err) return reject(new Error((stderr || err.message).trim()))
       resolve(stdout.trim())
     })
@@ -88,22 +106,26 @@ export async function tui(api) {
         category: "Remote Control",
         namespace: "palette",
         async run() {
-          if (bridgeMissing()) {
+          if (!bridgeBin()) {
             api.ui.toast({
               variant: "error",
               title: "remote-control",
-              message: "bridge not installed — run: bash ~/.agents/skills/remote-control/bootstrap.sh",
+              message: "bridge not installed — reinstall the plugin from git",
               duration: 8000,
             })
             return
           }
           api.ui.toast({ variant: "info", title: "remote-control", message: "Starting…", duration: 3000 })
           try {
-            const text = await startBridge()
+            // Bind to the CURRENT session (the route the user is on), not an
+            // arbitrary project, so /remote-control start never shares the
+            // wrong session.
+            const sessionID = api.route.current.name === "session" ? api.route.current.params.sessionID : undefined
+            const out = await startBridge(sessionID)
             api.ui.dialog.replace(() =>
               api.ui.DialogAlert({
                 title: "Remote control",
-                message: text,
+                message: out,
                 onConfirm: () => api.ui.dialog.clear(),
               }),
             )
