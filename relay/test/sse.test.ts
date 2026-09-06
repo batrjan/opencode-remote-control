@@ -52,7 +52,7 @@ beforeAll(async () => {
     .post('/api/sessions')
     .set('x-api-key', API_KEY)
     .send({ session_id: 'sess1', directory: '/path', title: 'title' })
-  const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code })
+  const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'sess1' })
   viewerToken = activated.body.viewer_token
 
   bridge = new RelayWSClient(

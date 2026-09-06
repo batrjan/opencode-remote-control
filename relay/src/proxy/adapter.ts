@@ -7,22 +7,67 @@ import { config } from '../config.js'
 /**
  * HTTP → WS → opencode proxy adapter, mounted at /api/opencode.
  *
- * Viewer auth: every request must carry a viewer_token (HttpOnly cookie,
- * ?token= query param, or x-viewer-token header). The session is resolved
- * from the token and the URL :id is ALWAYS replaced by it (forced binding
- * per the design spec — a viewer can only ever reach its own session).
+ * Viewer auth: every request must carry a viewer_token (HttpOnly cookie or
+ * x-viewer-token header). The session is resolved from the token and any :id
+ * in the URL is ALWAYS replaced by it (forced binding per the design spec —
+ * a viewer can only ever reach its own session).
  *
- * Allowlist (everything else 404s by not being routed):
- *   GET  /session/:id/message?limit=N
- *   POST /session/:id/prompt_async
- *   GET  /session/:id/todo
- *   GET  /session/:id/status
- *   GET  /agent
- *   GET  /config
- *   GET  /event         — SSE re-emission of opencode events pushed by the bridge
- *   GET  /global/event  — same fan-out; the v1 UI SDK subscribes at this path
- *                         (relative to the configured server URL)
+ * The allowlist below is the interactive surface the official opencode web
+ * UI actually calls. Read-only global endpoints are proxied verbatim;
+ * session-scoped ones are bound to the viewer's session; session-listing
+ * endpoints are collapsed to the single bound session. Mutations outside a
+ * session scope (config PATCH, auth, instance dispose, TUI control, MCP
+ * management, share) are NOT routed — they 404 by construction.
  */
+type Method = 'GET' | 'POST'
+
+/** [method, express-path-template]. ':id' is always replaced with the viewer's session. */
+const ALLOWED_ROUTES: Array<[Method, string]> = [
+  // Session detail + messages
+  ['GET', '/session/:id'],
+  ['GET', '/session/:id/message'],
+  ['POST', '/session/:id/message'],
+  ['POST', '/session/:id/prompt_async'],
+  ['POST', '/session/:id/abort'],
+  ['POST', '/session/:id/command'],
+  ['POST', '/session/:id/shell'],
+  ['POST', '/session/:id/summarize'],
+  ['POST', '/session/:id/revert'],
+  ['POST', '/session/:id/unrevert'],
+  ['POST', '/session/:id/fork'],
+  ['POST', '/session/:id/permissions/:permissionID'],
+  ['GET', '/session/:id/todo'],
+  ['GET', '/session/:id/children'],
+  ['GET', '/session/:id/diff'],
+  // Read-only global metadata the UI needs to boot
+  ['GET', '/agent'],
+  ['GET', '/command'],
+  ['GET', '/config'],
+  ['GET', '/config/providers'],
+  ['GET', '/provider'],
+  ['GET', '/provider/auth'],
+  ['GET', '/project'],
+  ['GET', '/project/current'],
+  ['GET', '/path'],
+  ['GET', '/vcs'],
+  ['GET', '/mcp'],
+  ['GET', '/lsp'],
+  ['GET', '/formatter'],
+  ['GET', '/experimental/tool'],
+  ['GET', '/experimental/tool/ids'],
+  // Read-only project browsing (viewer can already run any prompt, so
+  // denying file reads adds no security; the UI needs these for the tree
+  // and file previews)
+  ['GET', '/file'],
+  ['GET', '/file/content'],
+  ['GET', '/file/status'],
+  ['GET', '/find'],
+  ['GET', '/find/file'],
+  ['GET', '/find/symbol'],
+  // UI telemetry
+  ['POST', '/log'],
+]
+
 export function proxyAdapter(store: Store, bridge: BridgeClient) {
   const router = express.Router()
 
@@ -63,43 +108,77 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     }
   }
 
-  router.get('/session/:id/message', (req, res) => {
+  /** Original query string (the router sees the mounted path only). */
+  function queryOf(req: Request): string {
+    const i = req.originalUrl.indexOf('?')
+    return i === -1 ? '' : req.originalUrl.slice(i)
+  }
+
+  // GET /session — the UI's session list, collapsed to the viewer's own
+  // session. Registered before '/session/:id'.
+  router.get('/session', (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
-    const limit = typeof req.query.limit === 'string' ? req.query.limit : undefined
-    const query = limit === undefined ? '' : `?limit=${encodeURIComponent(limit)}`
-    void proxy(res, session.id, 'GET', `/session/${session.id}/message${query}`)
+    void (async () => {
+      try {
+        const out = await bridge.request(
+          session.id,
+          { method: 'GET', path: `/session/${session.id}` },
+          config.proxyTimeoutMs,
+        )
+        if (out.status === 404) {
+          res.status(200).type('application/json').send('[]')
+          return
+        }
+        res
+          .status(out.status)
+          .type(out.contentType ?? 'application/json')
+          .send(`[${out.body}]`)
+      } catch {
+        res.status(502).json({ error: 'bridge not connected' })
+      }
+    })()
   })
 
-  router.post('/session/:id/prompt_async', (req, res) => {
+  // GET /session/status — global status map, filtered to the viewer's
+  // session only (other sessions' statuses are not the viewer's business).
+  router.get('/session/status', (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
-    void proxy(res, session.id, 'POST', `/session/${session.id}/prompt_async`, req.body)
+    void (async () => {
+      try {
+        const out = await bridge.request(
+          session.id,
+          { method: 'GET', path: '/session/status' },
+          config.proxyTimeoutMs,
+        )
+        let body = out.body
+        try {
+          const all = JSON.parse(out.body) as Record<string, unknown>
+          body = JSON.stringify({ [session.id]: all[session.id] })
+        } catch {
+          // upstream not JSON — pass through verbatim
+        }
+        res.status(out.status).type(out.contentType ?? 'application/json').send(body)
+      } catch {
+        res.status(502).json({ error: 'bridge not connected' })
+      }
+    })()
   })
 
-  router.get('/session/:id/todo', (req, res) => {
-    const session = requireViewer(req, res)
-    if (!session) return
-    void proxy(res, session.id, 'GET', `/session/${session.id}/todo`)
-  })
-
-  router.get('/session/:id/status', (req, res) => {
-    const session = requireViewer(req, res)
-    if (!session) return
-    void proxy(res, session.id, 'GET', `/session/${session.id}/status`)
-  })
-
-  router.get('/agent', (req, res) => {
-    const session = requireViewer(req, res)
-    if (!session) return
-    void proxy(res, session.id, 'GET', '/agent')
-  })
-
-  router.get('/config', (req, res) => {
-    const session = requireViewer(req, res)
-    if (!session) return
-    void proxy(res, session.id, 'GET', '/config')
-  })
+  for (const [method, template] of ALLOWED_ROUTES) {
+    const handler = (req: Request, res: Response) => {
+      const session = requireViewer(req, res)
+      if (!session) return
+      let path = template.replaceAll(':id', session.id)
+      if (typeof req.params.permissionID === 'string') {
+        path = path.replaceAll(':permissionID', encodeURIComponent(req.params.permissionID))
+      }
+      void proxy(res, session.id, method, path + queryOf(req), method === 'POST' ? req.body : undefined)
+    }
+    if (method === 'GET') router.get(template, handler)
+    else router.post(template, handler)
+  }
 
   /** SSE fan-out of the session's opencode events to one viewer response. */
   function sseEvents(req: Request, res: Response, session: Session): void {
@@ -146,7 +225,11 @@ function extractViewerToken(req: Request): string | undefined {
       const eq = pair.indexOf('=')
       if (eq === -1) continue
       if (pair.slice(0, eq).trim() === 'viewer_token') {
-        return decodeURIComponent(pair.slice(eq + 1).trim())
+        try {
+          return decodeURIComponent(pair.slice(eq + 1).trim())
+        } catch {
+          return undefined
+        }
       }
     }
   }

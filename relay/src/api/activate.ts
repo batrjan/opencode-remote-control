@@ -11,15 +11,18 @@ import { activateFailDelayMs } from '../config.js'
 export function activateRouter(store: Store) {
   const router = express.Router()
   router.post('/', async (req, res) => {
-    const code = (req.body ?? {}).code
+    const { code, session_id: sessionId } = req.body ?? {}
     if (typeof code !== 'string' || code.length === 0) {
+      return res.status(400).json({ error: 'invalid code' })
+    }
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
       return res.status(400).json({ error: 'invalid code' })
     }
     // trust proxy is enabled in server.ts, so req.ip is the real client IP
     // (first X-Forwarded-For hop) rather than the nginx peer.
     const ip = req.ip ?? 'unknown'
     try {
-      const { session_id, viewer_token } = store.activate(code, ip)
+      const { session_id, viewer_token } = store.activate(code, sessionId, ip)
       res.cookie('viewer_token', viewer_token, {
         httpOnly: true,
         secure: true,

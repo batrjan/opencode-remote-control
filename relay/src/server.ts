@@ -78,9 +78,54 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // Registered before static so express.static does not serve index.html here.
   app.get('/', (_req, res) => res.redirect('/join'))
   app.use(express.static(PUBLIC_DIR))
-  app.get('/join', (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'join.html')))
+  app.get('/join', (_req, res) => res.type('html').send(joinHtml(undefined)))
   app.get('/terminal', (_req, res) => res.type('html').send(terminalHtml()))
+  // Session-bound viewer entry: /<session_id>. Without a valid viewer cookie
+  // it serves the code-entry page (with the session id embedded); with one it
+  // serves the opencode UI. Registered last so it never shadows the routes
+  // above.
+  app.get('/:id', (req, res) => {
+    const session = store.getSession(req.params.id)
+    if (!session) return res.status(404).type('html').send('<h1>Session not found</h1>')
+    const token = cookieViewerToken(req)
+    if (token && store.verifyViewer(session.id, token)) {
+      return res.type('html').send(terminalHtml())
+    }
+    return res.type('html').send(joinHtml(session.id))
+  })
   return app
+}
+
+let cachedJoinTemplate: string | undefined
+
+/** join.html with the session id injected for the activate call. */
+function joinHtml(sessionId: string | undefined): string {
+  if (cachedJoinTemplate === undefined) {
+    cachedJoinTemplate = readFileSync(path.join(PUBLIC_DIR, 'join.html'), 'utf8')
+  }
+  const inject = `<script>window.__OC_SESSION_ID__=${JSON.stringify(sessionId ?? null)}</script>`
+  const anchor = cachedJoinTemplate.indexOf('</head>')
+  return anchor === -1
+    ? cachedJoinTemplate + inject
+    : cachedJoinTemplate.slice(0, anchor) + inject + cachedJoinTemplate.slice(anchor)
+}
+
+/** viewer_token from the HttpOnly cookie (same parsing as the proxy adapter). */
+function cookieViewerToken(req: express.Request): string | undefined {
+  const cookie = req.get('cookie')
+  if (!cookie) return undefined
+  for (const pair of cookie.split(';')) {
+    const eq = pair.indexOf('=')
+    if (eq === -1) continue
+    if (pair.slice(0, eq).trim() === 'viewer_token') {
+      try {
+        return decodeURIComponent(pair.slice(eq + 1).trim())
+      } catch {
+        return undefined
+      }
+    }
+  }
+  return undefined
 }
 
 /**

@@ -14,10 +14,30 @@ test('POST /api/activate returns viewer_token', async () => {
   const store = new Store()
   const app = createApp(store)
   const { access_code } = store.createSession('sess1', '/path', 'title')
-  const res = await request(app).post('/api/activate').send({ code: access_code })
+  const res = await request(app).post('/api/activate').send({ code: access_code, session_id: 'sess1' })
   expect(res.status).toBe(200)
   expect(res.body.session_id).toBe('sess1')
   expect(res.body.viewer_token).toBeTruthy()
+})
+
+test('POST /api/activate requires a session_id and binds the code to it', async () => {
+  const store = new Store()
+  const app = createApp(store)
+  const { access_code } = store.createSession('sessA', '/path', 'title')
+  store.createSession('sessB', '/path', 'title')
+  // Missing session_id
+  const noSession = await request(app).post('/api/activate').send({ code: access_code })
+  expect(noSession.status).toBe(400)
+  // Correct code, wrong session
+  const wrongSession = await request(app)
+    .post('/api/activate')
+    .send({ code: access_code, session_id: 'sessB' })
+  expect(wrongSession.status).toBe(400)
+  expect(wrongSession.body.error).toBe('invalid code')
+  // Correct pair
+  const ok = await request(app).post('/api/activate').send({ code: access_code, session_id: 'sessA' })
+  expect(ok.status).toBe(200)
+  expect(ok.body.session_id).toBe('sessA')
 })
 
 test('POST /api/activate normalizes code case', async () => {
@@ -25,7 +45,7 @@ test('POST /api/activate normalizes code case', async () => {
   const app = createApp(store)
   const { access_code } = store.createSession('sess4', '/path', 'title')
   const lowercased = access_code.toLowerCase()
-  const res = await request(app).post('/api/activate').send({ code: lowercased })
+  const res = await request(app).post('/api/activate').send({ code: lowercased, session_id: 'sess4' })
   expect(res.status).toBe(200)
   expect(res.body.session_id).toBe('sess4')
 })
@@ -36,7 +56,7 @@ test('POST /api/activate rejects bad codes with a single error shape', async () 
   // Same IP hits IP limit quickly; use distinct IPs to prove uniform shape for
   // unknown codes. Blocked-codes path is exercised in store unit tests.
   for (let i = 0; i < 10; i++) {
-    const res = await request(app).post('/api/activate').send({ code: 'badc0d' })
+    const res = await request(app).post('/api/activate').send({ code: 'BADC0D', session_id: 'sessX' })
     expect(res.status).toBeLessThan(500)
     expect(res.body.error).toBeTruthy()
   }
@@ -54,7 +74,7 @@ test('POST /api/sessions creates a session and returns code + tokens', async () 
   expect(res.body.access_code).toMatch(/^[A-Z0-9]{6}$/)
   expect(res.body.access_code).not.toMatch(/[OI]/)
   expect(res.body.bridge_token).toBeTruthy()
-  expect(res.body.viewer_url).toBe('/join')
+  expect(res.body.viewer_url).toBe('/sess1')
 })
 
 test('POST /api/activate delays wrong-code answers by the configured amount', async () => {
@@ -63,7 +83,7 @@ test('POST /api/activate delays wrong-code answers by the configured amount', as
     const store = new Store()
     const app = createApp(store)
     const started = Date.now()
-    const res = await request(app).post('/api/activate').send({ code: 'badc0d' })
+    const res = await request(app).post('/api/activate').send({ code: 'BADC0D', session_id: 'sessX' })
     const elapsed = Date.now() - started
     expect(res.status).toBe(400)
     expect(res.body.error).toBe('invalid code')

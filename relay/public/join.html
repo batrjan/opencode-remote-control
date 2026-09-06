@@ -118,8 +118,20 @@
         error.textContent = ''
       })
 
+      // Injected by the relay when this page is served at /<session_id>;
+      // null when served at the generic /join (no manual session entry —
+      // activation requires the link you were given).
+      const sessionId = window.__OC_SESSION_ID__ ?? null
+      if (!sessionId) {
+        document.querySelector('p.hint').textContent =
+          'Open the full session link you were given (it contains the session id).'
+        input.disabled = true
+        button.disabled = true
+      }
+
       form.addEventListener('submit', async (event) => {
         event.preventDefault()
+        if (!sessionId) return
         const code = input.value.trim().toUpperCase()
         if (code.length !== 6) {
           error.textContent = 'Enter the full 6-character code.'
@@ -131,10 +143,10 @@
           const res = await fetch('/api/activate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ code }),
+            body: JSON.stringify({ code, session_id: sessionId }),
           })
           if (res.ok) {
-            window.location.assign('/terminal')
+            window.location.assign('/' + sessionId)
             return
           }
           const body = await res.json().catch(() => ({}))

@@ -102,7 +102,7 @@ beforeAll(async () => {
     .send({ session_id: 'sess1', directory: '/path', title: 'integration' })
   expect(created.status).toBe(201)
 
-  const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code })
+  const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'sess1' })
   expect(activated.status).toBe(200)
   viewerToken = activated.body.viewer_token
   const setCookie = activated.headers['set-cookie'] as unknown as string[]

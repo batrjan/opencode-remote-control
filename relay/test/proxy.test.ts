@@ -42,8 +42,8 @@ beforeAll(async () => {
     if (req.method === 'GET' && url.pathname === '/session/sess1/todo') {
       return json(res, 200, [{ id: 'todo1' }])
     }
-    if (req.method === 'GET' && url.pathname === '/session/sess1/status') {
-      return json(res, 200, { status: 'idle' })
+    if (req.method === 'GET' && url.pathname === '/session/status') {
+      return json(res, 200, { sess1: 'idle-status', other: 'hidden' })
     }
     if (req.method === 'GET' && url.pathname === '/agent') return json(res, 200, [{ id: 'build' }])
     if (req.method === 'GET' && url.pathname === '/config') return json(res, 200, { model: 'test' })
@@ -70,7 +70,7 @@ beforeAll(async () => {
     .set('x-api-key', API_KEY)
     .send({ session_id: 'sess1', directory: '/path', title: 'title' })
   expect(created.status).toBe(201)
-  const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code })
+  const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'sess1' })
   expect(activated.status).toBe(200)
   viewerToken = activated.body.viewer_token
 
@@ -79,7 +79,7 @@ beforeAll(async () => {
     .post('/api/sessions')
     .set('x-api-key', API_KEY)
     .send({ session_id: 'sess2', directory: '/path', title: 'title' })
-  const activated2 = await request(relay).post('/api/activate').send({ code: created2.body.access_code })
+  const activated2 = await request(relay).post('/api/activate').send({ code: created2.body.access_code, session_id: 'sess2' })
   sess2ViewerToken = activated2.body.viewer_token
 
   bridge = new RelayWSClient(
@@ -118,10 +118,9 @@ test('proxy POST prompt_async forwards the JSON body', async () => {
   expect(lastPromptBody).toEqual({ parts: [{ type: 'text', text: 'hello' }] })
 })
 
-test('proxy allowlisted GET endpoints (todo, status, agent, config)', async () => {
+test('proxy allowlisted GET endpoints (todo, agent, config)', async () => {
   for (const [path, expected] of [
     ['/api/opencode/session/sess1/todo', [{ id: 'todo1' }]],
-    ['/api/opencode/session/sess1/status', { status: 'idle' }],
     ['/api/opencode/agent', [{ id: 'build' }]],
     ['/api/opencode/config', { model: 'test' }],
   ] as const) {
@@ -129,6 +128,12 @@ test('proxy allowlisted GET endpoints (todo, status, agent, config)', async () =
     expect(res.status).toBe(200)
     expect(res.body).toEqual(expected)
   }
+})
+
+test('proxy GET /session/status is filtered to the viewer session only', async () => {
+  const res = await request(relay).get('/api/opencode/session/status').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual({ sess1: 'idle-status' })
 })
 
 test('proxy rejects requests without a viewer token', async () => {

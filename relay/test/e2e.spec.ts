@@ -65,7 +65,7 @@ beforeAll(async () => {
   // Lowercase on purpose — input is normalized like the join page does.
   const activated = await request(relay)
     .post('/api/activate')
-    .send({ code: created.body.access_code.toLowerCase() })
+    .send({ code: created.body.access_code.toLowerCase(), session_id: 'sess-e2e' })
   expect(activated.status).toBe(200)
   expect(activated.body.session_id).toBe('sess-e2e')
   const setCookie = activated.headers['set-cookie'] as unknown as string[]
@@ -112,6 +112,25 @@ test('GET /terminal serves the official UI wired to the /api/opencode proxy', as
   // request misses the proxy (404).
   expect(res.text).toContain('opencode.settings.dat:defaultServerUrl')
   expect(res.text).toContain('/api/opencode')
+})
+
+test('GET /<session_id> serves the join page unauthenticated, the UI with a viewer cookie', async () => {
+  // Unauthenticated: the session-bound join page with the id embedded.
+  const unauth = await request(relay).get('/sess-e2e')
+  expect(unauth.status).toBe(200)
+  expect(unauth.text).toContain('__OC_SESSION_ID__')
+  expect(unauth.text).toContain('sess-e2e')
+  expect(unauth.text).toContain('/api/activate')
+  // Authenticated: the official UI.
+  const authed = await request(relay).get('/sess-e2e').set('Cookie', viewerCookie)
+  expect(authed.status).toBe(200)
+  expect(authed.text).toContain('<div id="root"')
+  expect(authed.text).toContain('/api/opencode')
+})
+
+test('GET /<unknown_session_id> is 404', async () => {
+  const res = await request(relay).get('/ses_doesnotexist')
+  expect(res.status).toBe(404)
 })
 
 test('GET /api/health answers healthy so the UI selects the base-URL-prefixed API dialect', async () => {

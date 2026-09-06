@@ -68,21 +68,28 @@ export class Store {
       viewers: new Map(),
     }
     this.sessions.set(session_id, session)
-    return { session_id, access_code, bridge_token, viewer_url: '/join' }
+    return { session_id, access_code, bridge_token, viewer_url: `/${session_id}` }
   }
 
   /**
-   * Exchange an access code for a viewer token.
-   * Throws 'rate limited' or 'invalid code' (single error shape for missing
-   * and blocked codes, per design spec).
+   * Exchange an access code for a viewer token, bound to a specific session.
+   * The code alone is NOT enough: callers must name the session (taken from
+   * the viewer URL path). Throws 'rate limited' or 'invalid code' (single
+   * error shape for missing/blocked codes and wrong sessions, per spec).
    */
-  activate(code: string, ip: string) {
+  activate(code: string, session_id: string, ip: string) {
     this.checkIpLimit(ip)
     const normalizedCode = normalizeCode(code)
-    const attemptKey = hashAttempt(normalizedCode)
+    const attemptKey = hashAttempt(`${session_id}:${normalizedCode}`)
     if (this.blockedCodes.has(attemptKey)) throw new Error('invalid code')
-    const session = this.findSessionByCode(normalizedCode)
-    if (!session) {
+    const session = this.sessions.get(session_id)
+    const codeMatches =
+      session !== undefined &&
+      timingSafeEqual(
+        Buffer.from(saltedHash(normalizedCode, session.code_salt)),
+        Buffer.from(session.code_hash),
+      )
+    if (!codeMatches) {
       const fails = (this.codeFails.get(attemptKey) ?? 0) + 1
       this.setBounded(this.codeFails, attemptKey, fails)
       if (fails >= config.codeFailBlockThreshold) this.addBounded(this.blockedCodes, attemptKey)
@@ -139,9 +146,9 @@ export class Store {
     return this.sessions.delete(session_id)
   }
 
-  /** Accepts a plaintext code (hashed internally before lookup). */
-  isCodeBlocked(code: string) {
-    return this.blockedCodes.has(hashAttempt(code))
+  /** Accepts a plaintext code + session (hashed internally before lookup). */
+  isCodeBlocked(session_id: string, code: string) {
+    return this.blockedCodes.has(hashAttempt(`${session_id}:${normalizeCode(code)}`))
   }
 
   sessionCount() {
@@ -192,20 +199,6 @@ export class Store {
     rec.hourCount += 1
   }
 
-  /**
-   * Per-code random salt makes a lookup table key impossible, so activation
-   * verifies against every session with a constant-time compare. Session
-   * count is low enough that O(n) is fine and preferable to unsalted hashes.
-   */
-  private findSessionByCode(code: string): Session | undefined {
-    for (const session of this.sessions.values()) {
-      const candidate = saltedHash(code, session.code_salt)
-      if (timingSafeEqual(Buffer.from(candidate), Buffer.from(session.code_hash))) {
-        return session
-      }
-    }
-    return undefined
-  }
 }
 
 function normalizeCode(code: string): string {

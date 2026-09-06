@@ -87,7 +87,7 @@ test('DELETE /api/sessions/:id with the key removes the session (204) and revoke
   expect(res.status).toBe(204)
   expect(store.getSession('sess1')).toBeUndefined()
   // The access code is revoked with the session.
-  const activated = await request(app).post('/api/activate').send({ code: access_code })
+  const activated = await request(app).post('/api/activate').send({ code: access_code, session_id: 'sess1' })
   expect(activated.status).toBe(400)
 })
 

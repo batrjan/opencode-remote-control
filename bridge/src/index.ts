@@ -182,10 +182,10 @@ program
       process.exitCode = 1
       return
     }
-    console.log('Remote control started.')
-    console.log(`Access code: ${handle.access_code}`)
-    console.log(`Viewer URL: ${opts.relay}${handle.viewer_url}`)
-    console.log(`Session: ${handle.session_id}`)
+    // Output contract: exactly two lines — the session link and the code.
+    const relayBase = opts.relay.replace(/\/+$/, '')
+    console.log(`${relayBase}${handle.viewer_url}`)
+    console.log(`CODE: ${handle.access_code}`)
     const onSignal = () => void handle.stop()
     process.on('SIGINT', onSignal)
     process.on('SIGTERM', onSignal)
