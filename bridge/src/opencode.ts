@@ -38,6 +38,13 @@ export class OpencodeClient {
     return res.json()
   }
 
+  /** Pending permission requests (instance-wide list; callers must filter). */
+  async listPermissions() {
+    const res = await fetch(`${this.url}/permission`, { headers: this.auth() })
+    if (!res.ok) throw new Error(`listPermissions failed: ${res.status}`)
+    return res.json()
+  }
+
   async getAgents() {
     const res = await fetch(`${this.url}/agent`, { headers: this.auth() })
     return res.json()

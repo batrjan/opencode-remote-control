@@ -32,6 +32,7 @@ export class Store {
   private codeFails: Map<string, number> = new Map()
   private blockedCodes: Set<string> = new Set() // attempt-key hashes, never secrets
   private ipAttempts: Map<string, IpAttempts> = new Map()
+  private sessionFails: Map<string, { count: number; windowStart: number }> = new Map()
 
   /**
    * @param maxTrackingEntries cap for codeFails/blockedCodes/ipAttempts
@@ -79,6 +80,20 @@ export class Store {
    */
   activate(code: string, session_id: string, ip: string) {
     this.checkIpLimit(ip)
+    // Per-session failure cap: after N failed activations against one session
+    // (any code), that session is locked out for a window. This is the real
+    // brute-force brake — the per-attempt-key counter below only stops
+    // repeating the SAME wrong guess, which is pointless (one attempt already
+    // proved it wrong). The session id is high-entropy and known to the
+    // viewer (it's in their URL), so the threat is code-grinding per session.
+    const now = Date.now()
+    const sessFails = this.sessionFails.get(session_id)
+    if (sessFails && sessFails.count >= config.sessionFailLockThreshold) {
+      if (now - sessFails.windowStart < config.sessionFailLockMs) {
+        throw new Error('rate limited')
+      }
+      this.sessionFails.delete(session_id)
+    }
     const normalizedCode = normalizeCode(code)
     const attemptKey = hashAttempt(`${session_id}:${normalizedCode}`)
     if (this.blockedCodes.has(attemptKey)) throw new Error('invalid code')
@@ -93,8 +108,17 @@ export class Store {
       const fails = (this.codeFails.get(attemptKey) ?? 0) + 1
       this.setBounded(this.codeFails, attemptKey, fails)
       if (fails >= config.codeFailBlockThreshold) this.addBounded(this.blockedCodes, attemptKey)
+      const rec = this.sessionFails.get(session_id) ?? { count: 0, windowStart: now }
+      if (now - rec.windowStart >= config.sessionFailLockMs) {
+        rec.count = 0
+        rec.windowStart = now
+      }
+      rec.count += 1
+      this.setBounded(this.sessionFails, session_id, rec)
       throw new Error('invalid code')
     }
+    // Successful activation clears the session's failure window.
+    this.sessionFails.delete(session_id)
     const viewer_token = generateToken()
     const salt = newSalt()
     session.viewers.set(saltedHash(viewer_token, salt), { salt, created_at: Date.now() })

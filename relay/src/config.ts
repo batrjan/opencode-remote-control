@@ -21,6 +21,14 @@ export const config = {
   ipWindowMs: { minute: 60_000, hour: 3_600_000 },
   /** Global failed-attempt threshold per code before the code is blocked. */
   codeFailBlockThreshold: 10,
+  /**
+   * Per-session brute-force brake: after this many failed activations against
+   * one session (any code) within sessionFailLockMs, activation for that
+   * session is temporarily locked. This is the effective defense against
+   * grinding a known session's code across many IPs.
+   */
+  sessionFailLockThreshold: 20,
+  sessionFailLockMs: 15 * 60_000, // 15 minutes
   /** Token entropy (bytes) for bridge/viewer tokens. */
   tokenBytes: 32,
   /** Salt entropy (bytes) for salted SHA-256 secret hashing. */

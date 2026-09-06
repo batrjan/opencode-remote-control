@@ -93,3 +93,15 @@ test('ipAttempts evicts the oldest record when the cap is reached', () => {
   // ip1's window is gone, so it is allowed again (and fails the code check).
   expect(() => store.activate('ZZZZZZ', 'sessX', 'ip1')).toThrow('invalid code')
 })
+
+test('per-session brute-force lockout: many failed codes against one session lock it temporarily', () => {
+  const store = new Store()
+  const { access_code } = store.createSession('sessB', '/path', 'title')
+  // Failed attempts against sessB until the per-session counter reaches the
+  // lock threshold (one attempt below may not register depending on ordering).
+  for (let i = 0; i < 21; i++) {
+    expect(() => store.activate(`WRONG${i}`.slice(0, 6).padEnd(6, 'X'), 'sessB', `ip_bf_${i}`)).toThrow()
+  }
+  // The 21st attempt — even with the CORRECT code — is rate limited.
+  expect(() => store.activate(access_code, 'sessB', 'ip_legit')).toThrow('rate limited')
+})

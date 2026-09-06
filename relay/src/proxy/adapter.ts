@@ -80,12 +80,10 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   ['GET', '/question'],
   ['POST', '/question'],
   ['GET', '/experimental/resource'],
-  ['GET', '/experimental/session'],
   ['GET', '/experimental/capabilities'],
   ['GET', '/experimental/workspace'],
   ['GET', '/experimental/worktree'],
   ['GET', '/api/reference'],
-  ['GET', '/api/session'],
   ['GET', '/api/agent'],
   ['GET', '/api/command'],
   ['GET', '/api/skill'],
@@ -94,17 +92,16 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   ['GET', '/pty/shells'],
   // UI telemetry
   ['POST', '/log'],
-  // Permission API (opencode's tool-approval surface). The viewer drives the
-  // same session the bridge is bound to, so these are proxied to the bound
-  // session's opencode. /permission/request is a long-poll and gets the
-  // extended timeout below.
-  ['GET', '/permission'],
-  ['GET', '/permission/request'],
-  ['GET', '/permission/saved'],
-  ['GET', '/permission/:requestID'],
-  ['POST', '/permission/:requestID/reply'],
-  ['POST', '/permission/saved'],
-  ['POST', '/permission/saved/:id'],
+  // Permission API. SECURITY: instance-wide permission endpoints are NOT
+  // exposed — GET /permission lists pending requests from ALL sessions of
+  // the owner, and permission request IDs are instance-global, so a viewer
+  // could approve a prompt belonging to another session. The only allowed
+  // route is the session-scoped respond, which stays force-bound to the
+  // viewer's own session AND is further restricted bridge-side (the bridge
+  // refuses to reply to a requestID that does not belong to the bound
+  // session — see bridge permission guard).
+  // (No entries here on purpose; see the session-scoped
+  // /session/:id/permissions/:permissionID route in ALLOWED_ROUTES.)
 ]
 
 /** Paths that are long-polls upstream (opencode holds them open until an
@@ -179,6 +176,13 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // cannot leak the wrong workspace through.
     params.set('directory', session.directory)
     params.set('location[directory]', session.directory)
+    // Strip params that take routing PRECEDENCE over directory upstream:
+    // `workspace` can re-target the request to another local project (or even
+    // a remote workspace with the owner's credentials), and `scope` widens
+    // list endpoints. The viewer is bound to one session/directory — these
+    // must never come from the client.
+    params.delete('workspace')
+    params.delete('scope')
     const qs = params.toString()
     return qs ? `?${qs}` : ''
   }
@@ -268,6 +272,12 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     })
     res.write(': connected\n\n')
     const unsubscribe = bridge.subscribeEvents(session.id, (data) => {
+      // The bridge forwards the instance-wide /event stream (filtered by
+      // directory upstream, NOT by session). Forward only events that belong
+      // to the viewer's session or carry no session at all (server heartbeats
+      // / status) — otherwise viewers would watch the owner's OTHER sessions
+      // live. Fail closed on unparseable payloads.
+      if (!eventBelongsToSession(data, session.id)) return
       // SSE-safe: prefix every line of a (possibly multi-line) payload.
       res.write(
         data
@@ -314,6 +324,38 @@ function stripParentId(raw: string, contentType?: string): string {
   } catch {
     return raw
   }
+}
+
+/**
+ * Whether an opencode event payload belongs to the given session. Events
+ * with no session reference (server.connected, heartbeats, global status) are
+ * kept; events carrying a DIFFERENT session id are dropped. Fails closed
+ * (drops) when the payload can't be understood.
+ */
+export function eventBelongsToSession(data: string, sessionId: string): boolean {
+  let ev: unknown
+  try {
+    ev = JSON.parse(data)
+  } catch {
+    return false
+  }
+  if (!ev || typeof ev !== 'object') return true
+  const e = ev as Record<string, unknown>
+  const props = (e.properties ?? e) as Record<string, unknown>
+  const candidates = [
+    e.sessionID,
+    e.session_id,
+    props?.sessionID,
+    props?.session_id,
+    (props?.info as Record<string, unknown> | undefined)?.sessionID,
+    (props?.info as Record<string, unknown> | undefined)?.id,
+    (e.info as Record<string, unknown> | undefined)?.sessionID,
+    (e.info as Record<string, unknown> | undefined)?.id,
+  ]
+  const mentioned = candidates.filter((c): c is string => typeof c === 'string' && c.length > 0)
+  // No session mentioned anywhere → global event, safe to forward.
+  if (mentioned.length === 0) return true
+  return mentioned.every((id) => id === sessionId)
 }
 
 /** viewer_token from the HttpOnly cookie or x-viewer-token header. */

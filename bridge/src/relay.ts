@@ -81,6 +81,7 @@ export class RelayClient {
 export class RelayWSClient {
   private ws: WebSocket | null = null
   private eventAbortController: AbortController | null = null
+  private boundSessionId: string | null = null
 
   constructor(
     public relayUrl: string,
@@ -93,6 +94,7 @@ export class RelayWSClient {
    * connection fails before opening.
    */
   connect(session_id: string, bridge_token: string): Promise<void> {
+    this.boundSessionId = session_id
     const base = this.relayUrl.replace(/^http/, 'ws')
     const url = `${base}/bridge?session_id=${encodeURIComponent(session_id)}`
     return new Promise<void>((resolve, reject) => {
@@ -144,6 +146,17 @@ export class RelayWSClient {
     }
     if (msg.type !== 'proxy' || typeof msg.request_id !== 'string') return
     try {
+      const guardError = await this.guardRequest(msg.method ?? 'GET', msg.path ?? '/')
+      if (guardError) {
+        this.send({
+          type: 'proxy_response',
+          request_id: msg.request_id,
+          status: 403,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: guardError }),
+        })
+        return
+      }
       const out = await this.opencode.request(msg.method ?? 'GET', msg.path ?? '/', msg.body)
       this.send({ type: 'proxy_response', request_id: msg.request_id, ...out })
     } catch {
@@ -159,6 +172,32 @@ export class RelayWSClient {
 
   private send(data: unknown) {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(data))
+  }
+
+  /**
+   * Cross-session guard. The relay force-binds the URL :id to the viewer's
+   * session, but upstream opencode's permission reply endpoint does NOT
+   * check that the permission request belongs to that session — a viewer
+   * could approve a prompt raised by ANOTHER session of the owner. Verify
+   * the permission request belongs to the bound session before forwarding.
+   */
+  private async guardRequest(method: string, path: string): Promise<string | null> {
+    const m = /^\/session\/[^/]+\/permissions\/([^/]+)$/.exec(path)
+    if (method !== 'POST' || !m) return null
+    const permissionID = decodeURIComponent(m[1]!)
+    if (!this.boundSessionId) return null
+    try {
+      const pending = await this.opencode.listPermissions()
+      const list = Array.isArray(pending) ? pending : []
+      const owned = list.some((p) => {
+        const rec = p as Record<string, unknown>
+        return (rec.id === permissionID || rec.requestID === permissionID) && rec.sessionID === this.boundSessionId
+      })
+      return owned ? null : 'permission request not found for this session'
+    } catch {
+      // If we cannot verify, fail closed.
+      return 'permission verification unavailable'
+    }
   }
 }
 
