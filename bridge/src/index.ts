@@ -3,7 +3,7 @@ import { realpathSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { Command } from 'commander'
 import { config, opencodeAuthHeader } from './config.js'
-import { detectOpenCodePort } from './detect.js'
+import { detectOpenCodePort, ensureOpenCodeServer } from './detect.js'
 import { OpencodeClient } from './opencode.js'
 import { RelayClient, RelayWSClient } from './relay.js'
 
@@ -51,8 +51,22 @@ export async function startBridge(
   apiKey: string,
   opts: StartBridgeOptions = {},
 ): Promise<BridgeHandle> {
-  const opencodeUrl =
-    opts.opencodeUrl ?? `http://127.0.0.1:${opts.port ?? (await detectOpenCodePort())}`
+  // When no opencode server is listening (plain console runs use an
+  // in-process server with no HTTP port), spawn `opencode serve` ourselves so
+  // remote control works without the TUI. The spawned server is tied to the
+  // bridge's lifetime below.
+  let spawnedServer: import('node:child_process').ChildProcess | undefined
+  let resolvedPort: number
+  if (opts.opencodeUrl) {
+    resolvedPort = 0 // unused; url given directly
+  } else if (opts.port !== undefined) {
+    resolvedPort = opts.port
+  } else {
+    const ensured = await ensureOpenCodeServer()
+    resolvedPort = ensured.port
+    spawnedServer = ensured.spawned
+  }
+  const opencodeUrl = opts.opencodeUrl ?? `http://127.0.0.1:${resolvedPort}`
   const opencode = new OpencodeClient(
     opencodeUrl,
     process.env.OPENCODE_SERVER_USERNAME ?? 'opencode',
@@ -87,6 +101,9 @@ export async function startBridge(
     stopped = true
     clearInterval(watchdog)
     ws.close()
+    // If we spawned the opencode server ourselves (no TUI was running), stop
+    // it too — the share's lifetime owns the server it created.
+    if (spawnedServer && !spawnedServer.killed) spawnedServer.kill()
     try {
       await relay.deleteSession(session_id)
     } catch {
