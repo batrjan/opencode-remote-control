@@ -89,6 +89,8 @@ export class RelayWSClient {
   private bridgeToken: string | null = null
   /** Set by close(): stops the keep-alive and every retry loop for good. */
   private stopped = false
+  /** Set when the relay rejected us — retrying can never succeed. */
+  private fatal = false
   private keepAlive: NodeJS.Timeout | null = null
   private awaitingPong = false
   private reconnectTimer: NodeJS.Timeout | null = null
@@ -135,6 +137,25 @@ export class RelayWSClient {
       ws.on('pong', () => {
         this.awaitingPong = false
       })
+      // The relay refuses the UPGRADE (HTTP 401) when the session is gone —
+      // it was stopped elsewhere, or the relay restarted and lost it. Every
+      // re-dial would be refused the same way, so this ends the share instead
+      // of looping. Transport failures stay retryable: that is the point.
+      // Note: with a listener attached, ws stops emitting 'error' for this
+      // case and leaves the socket to us — so settle and tear down here.
+      ws.on('unexpected-response', (_req, res) => {
+        const status = res.statusCode ?? 0
+        const err = new Error(`relay rejected the bridge (HTTP ${status})`)
+        if (status === 401 || status === 403) {
+          this.fatal = true
+          this.onFatal?.(err)
+        }
+        res.resume()
+        ws.terminate()
+        if (this.ws === ws) this.ws = null
+        if (!opened) reject(err)
+        else if (!this.fatal) this.scheduleReconnect()
+      })
       ws.on('error', (err) => {
         if (!opened) reject(err)
       })
@@ -149,6 +170,7 @@ export class RelayWSClient {
         // 4001/4003 mean the relay dropped us on purpose (session closed or
         // credentials rejected): re-dialling would loop forever.
         if (code === 4001 || code === 4003) {
+          this.fatal = true
           this.onFatal?.(new Error(`relay closed the bridge (code ${code})`))
           return
         }
@@ -193,11 +215,11 @@ export class RelayWSClient {
 
   /** Re-dial with exponential backoff until it works or close() is called. */
   private scheduleReconnect(): void {
-    if (this.stopped || this.reconnectTimer) return
+    if (this.stopped || this.fatal || this.reconnectTimer) return
     this.reconnectAttempt += 1
     const timer = setTimeout(() => {
       this.reconnectTimer = null
-      if (this.stopped) return
+      if (this.stopped || this.fatal) return
       this.dial()
         .then(() => {
           // The event stream is per-connection state on the relay side: a new

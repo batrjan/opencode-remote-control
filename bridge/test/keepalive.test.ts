@@ -211,3 +211,56 @@ test('a stopped client does not resubscribe to events either', async () => {
   await new Promise((resolve) => setTimeout(resolve, 400))
   expect(eventSubscriptions).toBe(1)
 }, 15_000)
+
+/**
+ * Production reality check: when the relay restarts it loses its in-memory
+ * session store, so the bridge's re-dial is refused at the HTTP upgrade with
+ * 401 — not with a close code. Retrying that forever keeps a dead share alive
+ * in the process table; it has to end the share instead. A relay that is
+ * merely DOWN must still be retried, since surviving that is the whole point.
+ */
+test('an upgrade rejected with 401 is fatal — the share ends instead of looping', async () => {
+  const { WebSocketServer } = await import('ws')
+  const wss = new WebSocketServer({ port: 0, path: '/bridge', verifyClient: (_info, done) => done(false) })
+  await new Promise<void>((resolve) => wss.once('listening', resolve))
+  const port = (wss.address() as AddressInfo).port
+  const ws = client()
+  ;(ws as unknown as { relayUrl: string }).relayUrl = `http://127.0.0.1:${port}`
+  let fatal: Error | undefined
+  let reconnects = 0
+  ws.onFatal = (err) => {
+    fatal = err
+  }
+  ws.onReconnect = () => {
+    reconnects += 1
+  }
+  await expect(ws.connect('sess-refused', 'stale-token')).rejects.toThrow()
+  expect(await waitFor(() => fatal !== undefined)).toBe(true)
+  expect(fatal!.message).toMatch(/401/)
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  expect(reconnects).toBe(0)
+  ws.close()
+  wss.close()
+}, 15_000)
+
+test('a relay that is merely unreachable keeps being retried', async () => {
+  // Nothing listens on this port: connect() fails, and the client must keep
+  // trying rather than treating a transport error as a dead share.
+  const { WebSocketServer } = await import('ws')
+  const probe = new WebSocketServer({ port: 0 })
+  await new Promise<void>((resolve) => probe.once('listening', resolve))
+  const deadPort = (probe.address() as AddressInfo).port
+  await new Promise<void>((resolve) => probe.close(() => resolve()))
+
+  const ws = client()
+  ;(ws as unknown as { relayUrl: string }).relayUrl = `http://127.0.0.1:${deadPort}`
+  let fatal: Error | undefined
+  ws.onFatal = (err) => {
+    fatal = err
+  }
+  await expect(ws.connect('sess-down', 'token')).rejects.toThrow()
+  // A refused connection is not fatal — no onFatal, and a later listener on the
+  // same port would be picked up by the backoff loop.
+  expect(fatal).toBeUndefined()
+  ws.close()
+}, 15_000)
