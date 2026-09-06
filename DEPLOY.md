@@ -1,16 +1,22 @@
 # Deployment: opencode-remote-control relay
 
+All server-specific values (host, SSH user, paths) are intentionally NOT stored
+in this repository. Configure them as secrets/variables in your environment.
+
 ## GitHub Secrets (required)
-- `SSH_HOST` — 
-- `SSH_USER` — 
-- `SSH_PRIVATE_KEY` — private key for 
+
+Set these in the repo's Settings → Secrets and variables → Actions:
+
+- `SSH_HOST` — your relay server hostname or IP
+- `SSH_USER` — your SSH user on that server
+- `SSH_PRIVATE_KEY` — the private key for that user (deploy key)
 
 ## Server bootstrap (one-time)
 
 ```bash
-ssh @
+ssh "$SSH_USER@$SSH_HOST"
 sudo mkdir -p /opt/opencode-remote-control /var/www/certbot
-sudo chown : /opt/opencode-remote-control
+sudo chown "$SSH_USER:$SSH_USER" /opt/opencode-remote-control
 ```
 
 ## Certbot (one-time)
