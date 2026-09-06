@@ -171,7 +171,11 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
    */
   function queryForSession(req: Request, session: Session): string {
     const params = new URLSearchParams(queryOf(req))
+    // Overwrite every spelling of the directory/location param the opencode
+    // server may read, so a garbage or home-dir value from the UI bootstrap
+    // cannot leak the wrong workspace through.
     params.set('directory', session.directory)
+    params.set('location[directory]', session.directory)
     const qs = params.toString()
     return qs ? `?${qs}` : ''
   }
