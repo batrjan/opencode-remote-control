@@ -133,16 +133,18 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     method: string,
     path: string,
     body?: unknown,
+    transform?: (raw: string, contentType?: string) => string,
   ): Promise<void> {
     const timeout = LONG_POLL_PREFIXES.some((p) => path.startsWith(p))
       ? LONG_POLL_TIMEOUT_MS
       : config.proxyTimeoutMs
     try {
       const out = await bridge.request(session_id, { method, path, body }, timeout)
+      const payload = transform ? transform(out.body, out.contentType) : out.body
       res
         .status(out.status)
         .type(out.contentType ?? 'application/json')
-        .send(out.body)
+        .send(payload)
     } catch (err) {
       const message = err instanceof Error ? err.message : 'proxy failed'
       if (message === 'bridge not connected') {
@@ -237,6 +239,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     const handler = (req: Request, res: Response) => {
       const session = requireViewer(req, res)
       if (!session) return
+      // STRICT isolation: the viewer can only ever reach its OWN session.
+      // The URL :id is ALWAYS replaced with the viewer's session, even for
+      // reads. See the parentID sanitization below for why this does not
+      // loop the UI's parent-chain walk.
       let path = template.replaceAll(':id', session.id)
       if (typeof req.params.permissionID === 'string') {
         path = path.replaceAll(':permissionID', encodeURIComponent(req.params.permissionID))
@@ -244,7 +250,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       if (typeof req.params.messageID === 'string') {
         path = path.replaceAll(':messageID', encodeURIComponent(req.params.messageID))
       }
-      void proxy(res, session.id, method, path + queryForSession(req, session), method === 'POST' ? req.body : undefined)
+      // Sanitize session-detail reads: strip parentID so the UI never walks
+      // a parent chain (which would loop under forced :id binding).
+      const sanitize = template === '/session/:id' && method === 'GET'
+      void proxy(res, session.id, method, path + queryForSession(req, session), method === 'POST' ? req.body : undefined, sanitize ? stripParentId : undefined)
     }
     if (method === 'GET') router.get(template, handler)
     else router.post(template, handler)
@@ -283,6 +292,28 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   })
 
   return router
+}
+
+/**
+ * Remove parentID from a session-detail JSON body. Under strict forced :id
+ * binding the UI's parent-chain walk would otherwise fetch the parent, get
+ * the SAME session back (because :id is always replaced), see parentID again,
+ * and loop forever ("Session parent cycle"). Stripping parentID makes the
+ * viewer's session look like a root session, so the chain ends immediately.
+ * Non-JSON bodies pass through untouched.
+ */
+function stripParentId(raw: string, contentType?: string): string {
+  if (contentType && !contentType.includes('application/json')) return raw
+  try {
+    const data = JSON.parse(raw)
+    if (data && typeof data === 'object' && !Array.isArray(data) && 'parentID' in data) {
+      delete (data as Record<string, unknown>).parentID
+      return JSON.stringify(data)
+    }
+    return raw
+  } catch {
+    return raw
+  }
 }
 
 /** viewer_token from the HttpOnly cookie or x-viewer-token header. */
