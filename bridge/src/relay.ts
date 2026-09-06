@@ -14,6 +14,18 @@ export interface RelaySession {
   viewer_url: string
 }
 
+/** Non-secret session status returned by GET /api/sessions/:id. */
+export interface SessionStatus {
+  session_id: string
+  directory: string
+  title: string
+  status: 'active' | 'closed'
+  created_at: number
+  last_seen: number
+  viewer_count: number
+  bridge_connected: boolean
+}
+
 export class RelayClient {
   constructor(
     public url: string,
@@ -48,12 +60,13 @@ export class RelayClient {
     return res.status
   }
 
-  /** Session status probe for `bridge status`. Returns the relay's HTTP status. */
-  async getSession(sessionId: string): Promise<number> {
+  /** Session status probe for `bridge status`. Returns parsed body + HTTP status. */
+  async getSession(sessionId: string): Promise<{ status: number; body?: SessionStatus }> {
     const res = await fetch(`${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
       headers: this.headers(),
     })
-    return res.status
+    if (res.status !== 200) return { status: res.status }
+    return { status: 200, body: (await res.json()) as SessionStatus }
   }
 }
 

@@ -88,12 +88,12 @@ test('start and stop bridge', async () => {
     expect(handle.viewer_url).toBe('/join')
     // The session is registered on the relay.
     const relayClient = new RelayClient(relayUrl, API_KEY)
-    expect(await relayClient.getSession('sess-lc')).toBe(200)
+    expect((await relayClient.getSession('sess-lc')).status).toBe(200)
   } finally {
     await stopBridge(relayUrl, handle.session_id, API_KEY)
   }
   // stopBridge deleted the relay session.
-  expect(await new RelayClient(relayUrl, API_KEY).getSession('sess-lc')).toBe(404)
+  expect((await new RelayClient(relayUrl, API_KEY).getSession('sess-lc')).status).toBe(404)
   // Idempotent: deleting an already-deleted session is not an error.
   await stopBridge(relayUrl, handle.session_id, API_KEY)
   await handle.stop() // releases the WS connection and timers
@@ -106,10 +106,10 @@ test('watchdog stops the bridge and notifies the relay when opencode dies', asyn
     sessionId: 'sess-wd',
     healthIntervalMs: 100,
   })
-  expect(await new RelayClient(relayUrl, API_KEY).getSession('sess-wd')).toBe(200)
+  expect((await new RelayClient(relayUrl, API_KEY).getSession('sess-wd')).status).toBe(200)
   await closeOpencode()
   await handle.closed // resolves once a health tick fails
-  expect(await new RelayClient(relayUrl, API_KEY).getSession('sess-wd')).toBe(404)
+  expect((await new RelayClient(relayUrl, API_KEY).getSession('sess-wd')).status).toBe(404)
   await listenOpencode() // restore for any later tests / clean teardown
 })
 

@@ -56,6 +56,8 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
       status: session.status,
       created_at: session.created_at,
       last_seen: session.last_seen,
+      viewer_count: session.viewers.size,
+      bridge_connected: bridge?.isConnected(session.id) ?? false,
     })
   })
 

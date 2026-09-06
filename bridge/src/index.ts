@@ -244,17 +244,38 @@ program
         console.log('session: skipped (--api-key or RELAY_API_KEY required)')
         ok = false
       } else {
-        const status = await new RelayClient(opts.relay, apiKey).getSession(opts.sessionId)
-        console.log(
-          `session ${opts.sessionId}: ${
-            status === 200 ? 'registered' : status === 404 ? 'not found' : `HTTP ${status}`
-          }`,
-        )
-        if (status !== 200) ok = false
+        const { status, body } = await new RelayClient(opts.relay, apiKey).getSession(opts.sessionId)
+        if (status === 404) {
+          console.log(`session ${opts.sessionId}: not found`)
+          ok = false
+        } else if (status !== 200 || !body) {
+          console.log(`session ${opts.sessionId}: HTTP ${status}`)
+          ok = false
+        } else {
+          const ageMs = Date.now() - body.created_at
+          const age = formatDuration(ageMs)
+          console.log(`session ${opts.sessionId}: ${body.status}`)
+          console.log(`  bridge: ${body.bridge_connected ? 'connected' : 'disconnected'}`)
+          console.log(`  viewers: ${body.viewer_count}`)
+          console.log(`  alive: ${age}`)
+          console.log(`  title: ${body.title || '(untitled)'}`)
+          console.log(`  directory: ${body.directory}`)
+        }
       }
     }
     if (!ok) process.exitCode = 1
   })
+
+function formatDuration(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  const m = Math.floor(s / 60)
+  const h = Math.floor(m / 60)
+  const d = Math.floor(h / 24)
+  if (d > 0) return `${d}d ${h % 24}h`
+  if (h > 0) return `${h}h ${m % 60}m`
+  if (m > 0) return `${m}m ${s % 60}s`
+  return `${s}s`
+}
 
 // Run the CLI only when executed directly (not when imported by tests).
 const invokedDirectly =
