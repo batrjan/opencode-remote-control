@@ -130,7 +130,7 @@ test('proxy GET /session/:id/message authenticates with the HttpOnly viewer cook
     .set('Cookie', viewerCookie)
   expect(res.status).toBe(200)
   expect(res.body).toEqual([{ id: 'm1', role: 'user' }])
-  expect(lastMessagePath).toBe('/session/sess1/message')
+  expect(lastMessagePath).toMatch(/^\/session\/sess1\/message\?directory=/)
 })
 
 test('proxy GET /session/:id/message also accepts the x-viewer-token header', async () => {
@@ -156,7 +156,7 @@ test('proxy forcibly binds the session id from the viewer token', async () => {
     .get('/session/someone-else/message')
     .set('Cookie', viewerCookie)
   expect(res.status).toBe(200)
-  expect(lastMessagePath).toBe('/session/sess1/message')
+  expect(lastMessagePath).toMatch(/^\/session\/sess1\/message\?directory=/)
 })
 
 test(

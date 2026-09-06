@@ -160,6 +160,22 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     return i === -1 ? '' : req.originalUrl.slice(i)
   }
 
+  /**
+   * Force the project context: every proxied request must run against the
+   * session's own directory, otherwise the (global) opencode server resolves
+   * the caller's home dir (or a garbage one from the UI bootstrap) as the
+   * "project" and the UI bootstraps against the wrong workspace — observed
+   * as corrupted `directory` params, `/api/reference` 500s, and a redirect
+   * to /new-session. The viewer has exactly one session and exactly one
+   * project, so we ALWAYS overwrite the directory param with the session's.
+   */
+  function queryForSession(req: Request, session: Session): string {
+    const params = new URLSearchParams(queryOf(req))
+    params.set('directory', session.directory)
+    const qs = params.toString()
+    return qs ? `?${qs}` : ''
+  }
+
   // GET /session — the UI's session list, collapsed to the viewer's own
   // session. Registered before '/session/:id'.
   router.get('/session', (req, res) => {
@@ -220,7 +236,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       if (typeof req.params.permissionID === 'string') {
         path = path.replaceAll(':permissionID', encodeURIComponent(req.params.permissionID))
       }
-      void proxy(res, session.id, method, path + queryOf(req), method === 'POST' ? req.body : undefined)
+      void proxy(res, session.id, method, path + queryForSession(req, session), method === 'POST' ? req.body : undefined)
     }
     if (method === 'GET') router.get(template, handler)
     else router.post(template, handler)
