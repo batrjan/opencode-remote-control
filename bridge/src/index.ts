@@ -156,20 +156,19 @@ export async function stopBridge(
   clearSessionState(sessionId)
 }
 
-/** Newest ROOT session, preferring ones whose directory matches the cwd.
- * Subagent sessions have a parentID and are never what the user is looking
- * at in their TUI — the remote share must mirror the main (root) session
- * the command was run from. */
+/** Newest ROOT session in the CURRENT working directory. Subagent sessions
+ * have a parentID and are never what the user is looking at. We query with
+ * `?directory=` because the opencode instance (e.g. the desktop app) hosts
+ * many projects at once — an unfiltered list would pick a session from an
+ * unrelated project. */
 async function pickSession(opencode: OpencodeClient): Promise<OpencodeSessionInfo> {
-  const sessions = (await opencode.getSessions()) as OpencodeSessionInfo[]
-  if (!Array.isArray(sessions) || sessions.length === 0) {
-    throw new Error('no opencode sessions found')
-  }
   const cwd = process.cwd()
-  const inCwd = sessions.filter((s) => s.directory === cwd)
-  const pool = inCwd.length > 0 ? inCwd : sessions
-  const roots = pool.filter((s) => !s.parentID)
-  const candidates = roots.length > 0 ? roots : pool
+  const sessions = (await opencode.getSessions(cwd)) as OpencodeSessionInfo[]
+  if (!Array.isArray(sessions) || sessions.length === 0) {
+    throw new Error(`no opencode sessions found in ${cwd}`)
+  }
+  const roots = sessions.filter((s) => !s.parentID)
+  const candidates = roots.length > 0 ? roots : sessions
   return candidates.sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0))[0]!
 }
 

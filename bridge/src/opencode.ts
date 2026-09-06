@@ -15,8 +15,9 @@ export class OpencodeClient {
     return { Authorization: basicAuthHeader(this.username, this.password) }
   }
 
-  async getSessions() {
-    const res = await fetch(`${this.url}/session`, { headers: this.auth() })
+  async getSessions(directory?: string) {
+    const query = directory ? `?directory=${encodeURIComponent(directory)}` : ''
+    const res = await fetch(`${this.url}/session${query}`, { headers: this.auth() })
     return res.json()
   }
 
