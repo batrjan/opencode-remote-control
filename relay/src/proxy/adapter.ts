@@ -32,6 +32,7 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   // Session detail + messages
   ['GET', '/session/:id'],
   ['GET', '/session/:id/message'],
+  ['GET', '/session/:id/message/:messageID'],
   ['POST', '/session/:id/message'],
   ['POST', '/session/:id/prompt_async'],
   ['POST', '/session/:id/abort'],
@@ -239,6 +240,9 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       let path = template.replaceAll(':id', session.id)
       if (typeof req.params.permissionID === 'string') {
         path = path.replaceAll(':permissionID', encodeURIComponent(req.params.permissionID))
+      }
+      if (typeof req.params.messageID === 'string') {
+        path = path.replaceAll(':messageID', encodeURIComponent(req.params.messageID))
       }
       void proxy(res, session.id, method, path + queryForSession(req, session), method === 'POST' ? req.body : undefined)
     }
