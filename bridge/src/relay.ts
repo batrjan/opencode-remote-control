@@ -29,11 +29,14 @@ export interface SessionStatus {
 export class RelayClient {
   constructor(
     public url: string,
-    public apiKey: string,
+    public apiKey?: string,
   ) {}
 
   private headers() {
-    return { 'Content-Type': 'application/json', 'x-api-key': this.apiKey }
+    const h: Record<string, string> = { 'Content-Type': 'application/json' }
+    // Optional legacy key — the public relay does not require it.
+    if (this.apiKey) h['x-api-key'] = this.apiKey
+    return h
   }
 
   /** Register a session; secrets (access_code, bridge_token) return once. */
@@ -51,11 +54,11 @@ export class RelayClient {
     return (await res.json()) as RelaySession
   }
 
-  /** End a session on the relay. Returns the relay's HTTP status. */
-  async deleteSession(sessionId: string): Promise<number> {
+  /** End a session on the relay. Requires the session's own bridge_token. */
+  async deleteSession(sessionId: string, bridgeToken: string): Promise<number> {
     const res = await fetch(`${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
       method: 'DELETE',
-      headers: this.headers(),
+      headers: { ...this.headers(), 'x-bridge-token': bridgeToken },
     })
     return res.status
   }

@@ -17,6 +17,8 @@ export interface Session {
   created_at: number
   last_seen: number
   status: 'active' | 'closed'
+  /** IP that registered the session — used for the public-registration cap. */
+  created_by_ip: string
   viewers: Map<string, ViewerToken> // salted hash -> { salt, created_at }
 }
 
@@ -33,6 +35,7 @@ export class Store {
   private blockedCodes: Set<string> = new Set() // attempt-key hashes, never secrets
   private ipAttempts: Map<string, IpAttempts> = new Map()
   private sessionFails: Map<string, { count: number; windowStart: number }> = new Map()
+  private registrations: Map<string, { count: number; windowStart: number }> = new Map()
 
   /**
    * @param maxTrackingEntries cap for codeFails/blockedCodes/ipAttempts
@@ -42,11 +45,38 @@ export class Store {
   constructor(private maxTrackingEntries: number = config.maxTrackingEntries) {}
 
   /**
+   * Public registration guard: how many sessions one IP may create per hour
+   * and hold active at once. Registration is public (no shared key) so the
+   * skill works out of the box — abuse is contained by these caps and by the
+   * fact that deleting a session requires its bridge_token, not the public
+   * path. Throws 'rate limited'.
+   */
+  checkRegistrationLimit(ip: string): void {
+    const now = Date.now()
+    let rec = this.registrations.get(ip)
+    if (!rec || now - rec.windowStart >= config.registrationWindowMs) {
+      rec = { count: 0, windowStart: now }
+      this.registrations.set(ip, rec)
+    }
+    if (rec.count >= config.registrationsPerWindow) {
+      throw new Error('rate limited')
+    }
+    let active = 0
+    for (const s of this.sessions.values()) {
+      if (s.created_by_ip === ip && s.status === 'active') active += 1
+    }
+    if (active >= config.maxActiveSessionsPerIp) {
+      throw new Error('rate limited')
+    }
+    rec.count += 1
+  }
+
+  /**
    * Register a new session. Returns the secrets exactly once; only salted
    * hashes are stored. Throws 'session exists' on a duplicate id — a second
    * registration must never silently overwrite (and hijack) a live session.
    */
-  createSession(session_id: string, directory: string, title: string) {
+  createSession(session_id: string, directory: string, title: string, created_by_ip: string) {
     if (this.sessions.has(session_id)) throw new Error('session exists')
     const access_code = generateCode()
     const code_salt = newSalt()
@@ -66,6 +96,7 @@ export class Store {
       created_at: now,
       last_seen: now,
       status: 'active',
+      created_by_ip,
       viewers: new Map(),
     }
     this.sessions.set(session_id, session)

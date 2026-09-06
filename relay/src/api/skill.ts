@@ -1,25 +1,23 @@
 import express from 'express'
-import type { Request, Response, NextFunction } from 'express'
-import { timingSafeEqual } from 'node:crypto'
 import type { Store } from '../store.js'
 import type { BridgeClient } from '../ws/bridge.js'
-import { relayApiKey } from '../config.js'
 
 /**
  * Session-management API used by the bridge client (spawned by the OpenCode
  * skill), hence "skill router". Mounted at /api/sessions.
  *
- * Every route requires the shared relay secret in the `x-api-key` header
- * (RELAY_API_KEY env). The comparison is constant-time; a missing key fails
- * closed (401 for every request).
+ * PUBLIC by design (works out of the box, no shared key):
+ * - POST   /api/sessions        — public registration, rate-limited per IP
+ * - GET    /api/sessions/:id    — non-secret status view (bridge status cmd)
+ * - DELETE /api/sessions/:id    — requires the session's OWN bridge_token in
+ *                                 the `x-bridge-token` header, so only the
+ *                                 session owner (the bridge that registered
+ *                                 it) can kill it — never another user.
  *
- * The optional BridgeClient is used to disconnect the session's bridge on
- * DELETE — per the lifecycle spec, stopping a session disconnects its bridge.
+ * The optional BridgeClient disconnects the session's bridge on DELETE.
  */
 export function skillRouter(store: Store, bridge?: BridgeClient) {
   const router = express.Router()
-
-  router.use(requireApiKey)
 
   router.post('/', (req, res) => {
     const body = req.body ?? {}
@@ -30,11 +28,18 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
     if (typeof directory !== 'string' || directory.length === 0) {
       return res.status(400).json({ error: 'directory is required' })
     }
+    const ip = req.ip ?? 'unknown'
+    try {
+      store.checkRegistrationLimit(ip)
+    } catch {
+      return res.status(429).json({ error: 'rate limited' })
+    }
     try {
       const result = store.createSession(
         session_id,
         directory,
         typeof title === 'string' ? title : '',
+        ip,
       )
       return res.status(201).json(result)
     } catch (err) {
@@ -62,6 +67,11 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
   })
 
   router.delete('/:id', (req, res) => {
+    const token = req.get('x-bridge-token') ?? ''
+    if (!token || !store.verifyBridgeToken(req.params.id, token)) {
+      // Same shape as "not found" — do not reveal whether the session exists.
+      return res.status(404).json({ error: 'session not found' })
+    }
     if (!store.deleteSession(req.params.id)) {
       return res.status(404).json({ error: 'session not found' })
     }
@@ -73,19 +83,4 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
   })
 
   return router
-}
-
-function requireApiKey(req: Request, res: Response, next: NextFunction) {
-  const expected = relayApiKey()
-  const provided = req.get('x-api-key') ?? ''
-  if (!expected || !safeEqual(provided, expected)) {
-    return res.status(401).json({ error: 'invalid api key' })
-  }
-  next()
-}
-
-function safeEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a)
-  const bufB = Buffer.from(b)
-  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB)
 }

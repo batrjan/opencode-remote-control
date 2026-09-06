@@ -51,7 +51,7 @@ remote-control installed.
   Skill:    ~/.agents/skills/remote-control/SKILL.md
   Commands: /remote-control start | stop | status
 
-Set RELAY_API_KEY in your environment, then in OpenCode run:
+Just run in OpenCode:
 
   /remote-control start
 

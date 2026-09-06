@@ -4,38 +4,16 @@ import { Store } from '../src/store'
 import request from 'supertest'
 
 /**
- * Bridge-facing session API security: x-api-key auth on every route,
- * 409 on duplicate session ids, DELETE lifecycle endpoint.
- * The key is read lazily from RELAY_API_KEY (see relay/src/config.ts),
- * so setting it here at module scope is enough.
+ * Public session API: registration is open (rate-limited per IP) so the
+ * skill works out of the box; DELETE requires the session's own bridge_token
+ * so only the owner can kill a share.
  */
-const API_KEY = 'test-relay-key'
-process.env.RELAY_API_KEY = API_KEY
-// One test activates a revoked code: keep the failed-attempt delay out of it.
 process.env.ACTIVATE_FAIL_DELAY_MS = '0'
 
-test('POST /api/sessions without x-api-key is 401', async () => {
+test('POST /api/sessions is public (no key) and creates the session', async () => {
   const app = createApp(new Store())
   const res = await request(app)
     .post('/api/sessions')
-    .send({ session_id: 'sess1', directory: '/path', title: 'title' })
-  expect(res.status).toBe(401)
-})
-
-test('POST /api/sessions with a wrong x-api-key is 401', async () => {
-  const app = createApp(new Store())
-  const res = await request(app)
-    .post('/api/sessions')
-    .set('x-api-key', 'wrong-key')
-    .send({ session_id: 'sess1', directory: '/path', title: 'title' })
-  expect(res.status).toBe(401)
-})
-
-test('POST /api/sessions with the key creates the session', async () => {
-  const app = createApp(new Store())
-  const res = await request(app)
-    .post('/api/sessions')
-    .set('x-api-key', API_KEY)
     .send({ session_id: 'sess1', directory: '/path', title: 'title' })
   expect(res.status).toBe(201)
   expect(res.body.session_id).toBe('sess1')
@@ -48,12 +26,10 @@ test('POST /api/sessions with a duplicate session_id is 409 and keeps the origin
   const app = createApp(store)
   const first = await request(app)
     .post('/api/sessions')
-    .set('x-api-key', API_KEY)
     .send({ session_id: 'sess1', directory: '/path', title: 'title' })
   expect(first.status).toBe(201)
   const res = await request(app)
     .post('/api/sessions')
-    .set('x-api-key', API_KEY)
     .send({ session_id: 'sess1', directory: '/other', title: 'takeover' })
   expect(res.status).toBe(409)
   expect(res.body.error).toBeTruthy()
@@ -61,29 +37,43 @@ test('POST /api/sessions with a duplicate session_id is 409 and keeps the origin
   expect(store.getSession('sess1')?.directory).toBe('/path')
 })
 
-test('DELETE /api/sessions/:id without x-api-key is 401', async () => {
+test('POST /api/sessions rate-limits registrations per IP', async () => {
+  const app = createApp(new Store())
+  // The per-IP hourly cap is 12; the 13th must be rejected.
+  let last = 0
+  for (let i = 0; i < 13; i++) {
+    const res = await request(app)
+      .post('/api/sessions')
+      .send({ session_id: `sess_rl_${i}`, directory: '/path', title: 't' })
+    last = res.status
+    if (last === 429) break
+  }
+  expect(last).toBe(429)
+})
+
+test('DELETE /api/sessions/:id without a bridge token is 404 (owner-only delete)', async () => {
   const store = new Store()
-  store.createSession('sess1', '/path', 'title')
+  store.createSession('sess1', '/path', 'title', 'test-ip')
   const app = createApp(store)
   const res = await request(app).delete('/api/sessions/sess1')
-  expect(res.status).toBe(401)
+  expect(res.status).toBe(404)
   expect(store.getSession('sess1')).toBeTruthy()
 })
 
-test('DELETE /api/sessions/:id with a wrong x-api-key is 401', async () => {
+test('DELETE /api/sessions/:id with a wrong bridge token is 404 (no oracle)', async () => {
   const store = new Store()
-  store.createSession('sess1', '/path', 'title')
+  store.createSession('sess1', '/path', 'title', 'test-ip')
   const app = createApp(store)
-  const res = await request(app).delete('/api/sessions/sess1').set('x-api-key', 'wrong-key')
-  expect(res.status).toBe(401)
+  const res = await request(app).delete('/api/sessions/sess1').set('x-bridge-token', 'wrong-token')
+  expect(res.status).toBe(404)
   expect(store.getSession('sess1')).toBeTruthy()
 })
 
-test('DELETE /api/sessions/:id with the key removes the session (204) and revokes the code', async () => {
+test('DELETE /api/sessions/:id with the session bridge token removes it (204) and revokes the code', async () => {
   const store = new Store()
-  const { access_code } = store.createSession('sess1', '/path', 'title')
+  const { access_code, bridge_token } = store.createSession('sess1', '/path', 'title', 'test-ip')
   const app = createApp(store)
-  const res = await request(app).delete('/api/sessions/sess1').set('x-api-key', API_KEY)
+  const res = await request(app).delete('/api/sessions/sess1').set('x-bridge-token', bridge_token)
   expect(res.status).toBe(204)
   expect(store.getSession('sess1')).toBeUndefined()
   // The access code is revoked with the session.
@@ -91,19 +81,17 @@ test('DELETE /api/sessions/:id with the key removes the session (204) and revoke
   expect(activated.status).toBe(400)
 })
 
-test('DELETE /api/sessions/:id on an unknown session is 404', async () => {
+test('DELETE /api/sessions/:id on an unknown session is 404 even with a token', async () => {
   const app = createApp(new Store())
-  const res = await request(app).delete('/api/sessions/nope').set('x-api-key', API_KEY)
+  const res = await request(app).delete('/api/sessions/nope').set('x-bridge-token', 'whatever')
   expect(res.status).toBe(404)
 })
 
-test('GET /api/sessions/:id returns non-secret session info (and enforces auth)', async () => {
+test('GET /api/sessions/:id returns non-secret session info (public)', async () => {
   const store = new Store()
-  store.createSession('sess1', '/path', 'title')
+  store.createSession('sess1', '/path', 'title', 'test-ip')
   const app = createApp(store)
-  const unauth = await request(app).get('/api/sessions/sess1')
-  expect(unauth.status).toBe(401)
-  const res = await request(app).get('/api/sessions/sess1').set('x-api-key', API_KEY)
+  const res = await request(app).get('/api/sessions/sess1')
   expect(res.status).toBe(200)
   expect(res.body.session_id).toBe('sess1')
   expect(res.body.directory).toBe('/path')
@@ -113,6 +101,6 @@ test('GET /api/sessions/:id returns non-secret session info (and enforces auth)'
   expect(res.body.bridge_token).toBeUndefined()
   expect(res.body.code_hash).toBeUndefined()
   expect(res.body.bridge_token_hash).toBeUndefined()
-  const missing = await request(app).get('/api/sessions/nope').set('x-api-key', API_KEY)
+  const missing = await request(app).get('/api/sessions/nope')
   expect(missing.status).toBe(404)
 })

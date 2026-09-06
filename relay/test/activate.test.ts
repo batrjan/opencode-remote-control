@@ -13,7 +13,7 @@ process.env.ACTIVATE_FAIL_DELAY_MS = '0'
 test('POST /api/activate returns viewer_token', async () => {
   const store = new Store()
   const app = createApp(store)
-  const { access_code } = store.createSession('sess1', '/path', 'title')
+  const { access_code } = store.createSession('sess1', '/path', 'title', 'test-ip')
   const res = await request(app).post('/api/activate').send({ code: access_code, session_id: 'sess1' })
   expect(res.status).toBe(200)
   expect(res.body.session_id).toBe('sess1')
@@ -23,8 +23,8 @@ test('POST /api/activate returns viewer_token', async () => {
 test('POST /api/activate requires a session_id and binds the code to it', async () => {
   const store = new Store()
   const app = createApp(store)
-  const { access_code } = store.createSession('sessA', '/path', 'title')
-  store.createSession('sessB', '/path', 'title')
+  const { access_code } = store.createSession('sessA', '/path', 'title', 'test-ip')
+  store.createSession('sessB', '/path', 'title', 'test-ip')
   // Missing session_id
   const noSession = await request(app).post('/api/activate').send({ code: access_code })
   expect(noSession.status).toBe(400)
@@ -43,7 +43,7 @@ test('POST /api/activate requires a session_id and binds the code to it', async 
 test('POST /api/activate normalizes code case', async () => {
   const store = new Store()
   const app = createApp(store)
-  const { access_code } = store.createSession('sess4', '/path', 'title')
+  const { access_code } = store.createSession('sess4', '/path', 'title', 'test-ip')
   const lowercased = access_code.toLowerCase()
   const res = await request(app).post('/api/activate').send({ code: lowercased, session_id: 'sess4' })
   expect(res.status).toBe(200)

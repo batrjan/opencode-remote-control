@@ -41,12 +41,21 @@ export const config = {
    * memory stays bounded under brute-force traffic.
    */
   maxTrackingEntries: 100_000,
+  /**
+   * Public session registration caps (no shared key — the skill works out of
+   * the box): registrations per IP per window, and max active sessions one IP
+   * may hold. Deleting a session requires its bridge_token instead, so the
+   * public path can never kill someone else's share.
+   */
+  registrationsPerWindow: 12,
+  registrationWindowMs: 3_600_000, // 1 hour
+  maxActiveSessionsPerIp: 5,
 } as const
 
 /**
- * Shared secret the bridge sends as `x-api-key` for the session-management
- * API (POST/GET/DELETE /api/sessions). Read lazily so tests can set it after
- * module load. Fail-closed: when unset, every session-API request is 401.
+ * Optional admin key. No longer required for the public session API
+ * (registration is public + rate-limited; deletion requires the session's
+ * bridge_token). Kept only for backward compatibility with older bridges.
  */
 export function relayApiKey(): string {
   return process.env.RELAY_API_KEY ?? ''

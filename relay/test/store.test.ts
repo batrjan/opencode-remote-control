@@ -3,28 +3,28 @@ import { Store } from '../src/store'
 
 test('create session and activate code', () => {
   const store = new Store()
-  const { access_code } = store.createSession('sess1', '/path', 'title')
+  const { access_code } = store.createSession('sess1', '/path', 'title', 'test-ip')
   expect(store.activate(access_code, 'sess1', 'client1')).toEqual({ session_id: 'sess1', viewer_token: expect.any(String) })
 })
 
 test('a valid code for one session does not activate another', () => {
   const store = new Store()
-  const { access_code } = store.createSession('sessA', '/path', 'title')
-  store.createSession('sessB', '/path', 'title')
+  const { access_code } = store.createSession('sessA', '/path', 'title', 'test-ip')
+  store.createSession('sessB', '/path', 'title', 'test-ip')
   expect(() => store.activate(access_code, 'sessB', 'client_x')).toThrow('invalid code')
   expect(store.activate(access_code, 'sessA', 'client_x')).toEqual({ session_id: 'sessA', viewer_token: expect.any(String) })
 })
 
 test('activation normalizes input to uppercase', () => {
   const store = new Store()
-  const { access_code } = store.createSession('sess3', '/path', 'title')
+  const { access_code } = store.createSession('sess3', '/path', 'title', 'test-ip')
   const lowercased = access_code.toLowerCase()
   expect(store.activate(lowercased, 'sess3', 'client_lc')).toEqual({ session_id: 'sess3', viewer_token: expect.any(String) })
 })
 
 test('rate limit per code blocks after threshold, using distinct IPs', () => {
   const store = new Store()
-  const { access_code } = store.createSession('sess2', '/path', 'title')
+  const { access_code } = store.createSession('sess2', '/path', 'title', 'test-ip')
   for (let i = 0; i < 11; i++) {
     expect(() => store.activate('BAD', 'sess2', `client_${i}`)).toThrow()
   }
@@ -34,14 +34,14 @@ test('rate limit per code blocks after threshold, using distinct IPs', () => {
 
 test('createSession rejects a duplicate session id', () => {
   const store = new Store()
-  store.createSession('sess1', '/path', 'title')
-  expect(() => store.createSession('sess1', '/other', 'takeover')).toThrow('session exists')
+  store.createSession('sess1', '/path', 'title', 'test-ip')
+  expect(() => store.createSession('sess1', '/other', 'takeover', 'test-ip')).toThrow('session exists')
   expect(store.getSession('sess1')?.directory).toBe('/path')
 })
 
 test('deleteSession reports whether the session existed', () => {
   const store = new Store()
-  store.createSession('sess1', '/path', 'title')
+  store.createSession('sess1', '/path', 'title', 'test-ip')
   expect(store.deleteSession('sess1')).toBe(true)
   expect(store.deleteSession('sess1')).toBe(false)
 })
@@ -96,7 +96,7 @@ test('ipAttempts evicts the oldest record when the cap is reached', () => {
 
 test('per-session brute-force lockout: many failed codes against one session lock it temporarily', () => {
   const store = new Store()
-  const { access_code } = store.createSession('sessB', '/path', 'title')
+  const { access_code } = store.createSession('sessB', '/path', 'title', 'test-ip')
   // Failed attempts against sessB until the per-session counter reaches the
   // lock threshold (one attempt below may not register depending on ordering).
   for (let i = 0; i < 21; i++) {

@@ -33,9 +33,9 @@ Certbot auto-renew is handled by the host certbot package (systemd timer on Ubun
 cd /opt/opencode-remote-control
 git clone https://github.com/batrjan/opencode-remote-control.git .
 # or rsync the repo
-# Create .env:
-echo "RELAY_API_KEY=$(openssl rand -hex 32)" > .env
-echo "PORT=8080" >> .env
+# Create .env (no API key needed — registration is public + rate-limited,
+# session deletion requires the session's own bridge token):
+echo "PORT=8080" > .env
 ```
 
 ## nginx (one-time)

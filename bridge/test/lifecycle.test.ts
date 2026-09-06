@@ -5,6 +5,7 @@ import { startServer } from '../../relay/src/server'
 import { RelayClient } from '../src/relay'
 import { opencodeAuthHeader } from '../src/config'
 import { startBridge, stopBridge } from '../src/index'
+import { clearSessionState } from '../src/state'
 
 /**
  * Lifecycle integration test: startBridge registers the session on a real
@@ -113,8 +114,9 @@ test('watchdog stops the bridge and notifies the relay when opencode dies', asyn
   await listenOpencode() // restore for any later tests / clean teardown
 })
 
-test('startBridge rejects a wrong relay api key', async () => {
-  await expect(
-    startBridge(relayUrl, 'wrong-key', { opencodeUrl, sessionId: 'sess-denied' }),
-  ).rejects.toThrow(/401/)
+test('stopBridge without a saved state is a no-op (idempotent, owner-only delete)', async () => {
+  // Registration is public, but DELETE requires the session's own
+  // bridge_token from the local state file. With no state, stop does nothing.
+  clearSessionState('sess-nostate')
+  await expect(stopBridge(relayUrl, 'sess-nostate', API_KEY)).resolves.toBeUndefined()
 })

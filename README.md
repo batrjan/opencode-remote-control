@@ -13,7 +13,7 @@ official OpenCode web UI.
 │ ┌──────────────┐  ┌────────┐  │      │  nginx (TLS via certbot)             │
 │ │   OpenCode   │  │ Bridge │  │ WSS  │    └─▶ relay container (Node.js)    │
 │ │ TUI + server │◀─│  CLI   │◀─┼──────┼───── WS /bridge                     │
-│ │ 127.0.0.1    │  └────────┘  │      │      POST /api/sessions (x-api-key) │
+│ │ 127.0.0.1    │  └────────┘  │      │      POST /api/sessions (public) │
 │ └──────────────┘   ▲          │      │      POST /api/activate (code)      │
 └────────────────────│──────────┘      │      /api/opencode/* → WS → bridge  │
         SSE / REST   │                 │      /join · /terminal (viewer UI)  │
@@ -33,22 +33,22 @@ to the session that issued the viewer token (allowlisted OpenCode endpoints only
 
 ## Quick start
 
-Prerequisites: Node.js ≥ 22, a running OpenCode server (TUI), and `RELAY_API_KEY`.
+Prerequisites: Node.js ≥ 22 and OpenCode (TUI or CLI). No API keys needed.
 
 ```bash
 # One-time: build the bridge
 cd bridge && npm install && npm run build
 
 # Share the current session (auto-detects opencode port and newest session)
-node dist/index.js start --relay https://opencode.b4tr.net --api-key "$RELAY_API_KEY"
-# → prints Access code: XXXXXX and Viewer URL: https://opencode.b4tr.net/join
+node dist/index.js start --relay https://opencode.b4tr.net
+# → prints the session URL and CODE: XXXXXX
 ```
 
 Share the code + URL with your viewer. They open `/join`, enter the code, and land in the
 OpenCode web UI proxied to your session. Stop sharing with:
 
 ```bash
-node dist/index.js stop --relay https://opencode.b4tr.net --api-key "$RELAY_API_KEY" --session-id <id>
+node dist/index.js stop --relay https://opencode.b4tr.net
 ```
 
 The bridge also stops on its own when OpenCode quits (watchdog) or on SIGINT/SIGTERM;
@@ -72,9 +72,9 @@ directly — the skill in `skill/SKILL.md` drives the same CLI for the agent.
 | Endpoint                  | Auth                          | Purpose                                          |
 | ------------------------- | ----------------------------- | ------------------------------------------------ |
 | `GET /health`             | none                          | Liveness: `{ ok, healthy, sessions, version }`. Probed by the Docker HEALTHCHECK, compose, and `bridge status`. |
-| `POST /api/sessions`      | `x-api-key`                   | Create a session; returns the access code + bridge token exactly once. |
-| `GET /api/sessions/:id`   | `x-api-key`                   | Session presence check (bridge `status`).        |
-| `DELETE /api/sessions/:id`| `x-api-key`                   | End a session; disconnects its bridge, revokes code + tokens. |
+| `POST /api/sessions`      | public (rate-limited)      | Create a session; returns the access code + bridge token exactly once. |
+| `GET /api/sessions/:id`   | public                        | Session presence check (bridge `status`).        |
+| `DELETE /api/sessions/:id`| `x-bridge-token` (owner only)    | End a session; disconnects its bridge, revokes code + tokens. |
 | `POST /api/activate`      | access code (rate-limited)    | Exchange a code for a viewer token; sets an HttpOnly, SameSite=Strict cookie. |
 | `/api/opencode/*`         | viewer cookie or `x-viewer-token` | Allowlisted proxy to the bridged OpenCode; `:id` is forced to the token's session. |
 | `GET /join`, `GET /terminal` | none                       | Code-entry page and the viewer UI.               |
@@ -89,7 +89,7 @@ cd relay  && npm install && npm test && npm run build   # vitest + tsc → dist/
 cd bridge && npm install && npm test && npm run build
 ```
 
-Relay env vars (see `relay/.env.example`): `RELAY_API_KEY` (required, session API),
+Relay env vars (see `relay/.env.example`): 
 `PORT` (default 8080), `ACTIVATE_FAIL_DELAY_MS` (brute-force brake, default 1000).
 
 ## Deployment

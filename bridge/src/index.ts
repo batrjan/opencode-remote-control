@@ -6,6 +6,7 @@ import { config, opencodeAuthHeader } from './config.js'
 import { detectOpenCodePort, ensureOpenCodeServer } from './detect.js'
 import { OpencodeClient } from './opencode.js'
 import { RelayClient, RelayWSClient } from './relay.js'
+import { saveSessionState, loadSessionState, clearSessionState, latestSessionState } from './state.js'
 
 /**
  * Bridge CLI and lifecycle: `start` registers the current opencode session
@@ -48,7 +49,7 @@ interface OpencodeSessionInfo {
 
 export async function startBridge(
   relayUrl: string,
-  apiKey: string,
+  apiKey: string | undefined,
   opts: StartBridgeOptions = {},
 ): Promise<BridgeHandle> {
   // When no opencode server is listening (plain console runs use an
@@ -80,6 +81,15 @@ export async function startBridge(
     picked?.directory ?? process.cwd(),
     picked?.title ?? '',
   )
+  // Persist the owner token so `stop` (even from another shell) can delete
+  // the session later. 0600 perms; cleared on stop.
+  saveSessionState({
+    session_id,
+    access_code,
+    bridge_token,
+    relay: relayUrl,
+    started_at: Date.now(),
+  })
   const ws = new RelayWSClient(relayUrl, opencode)
   try {
     await ws.connect(session_id, bridge_token)
@@ -87,7 +97,8 @@ export async function startBridge(
   } catch (err) {
     // Never leave an orphaned session behind when the WS/SSE setup fails.
     ws.close()
-    await relay.deleteSession(session_id).catch(() => {})
+    await relay.deleteSession(session_id, bridge_token).catch(() => {})
+    clearSessionState(session_id)
     throw err
   }
 
@@ -105,10 +116,11 @@ export async function startBridge(
     // it too — the share's lifetime owns the server it created.
     if (spawnedServer && !spawnedServer.killed) spawnedServer.kill()
     try {
-      await relay.deleteSession(session_id)
+      await relay.deleteSession(session_id, bridge_token)
     } catch {
       // Best effort: the relay may itself be unreachable at shutdown.
     }
+    clearSessionState(session_id)
     resolveClosed()
   }
   // Watchdog: opencode gone (process exited / port closed) → notify the
@@ -126,13 +138,22 @@ export async function startBridge(
 export async function stopBridge(
   relayUrl: string,
   sessionId: string,
-  apiKey: string,
+  apiKey?: string,
 ): Promise<void> {
-  const status = await new RelayClient(relayUrl, apiKey).deleteSession(sessionId)
+  // Deleting a session requires its OWN bridge_token (never a shared key) —
+  // read it from the state `start` persisted.
+  const state = loadSessionState(sessionId)
+  if (!state) {
+    // Nothing to do: without the owner token we cannot (and should not)
+    // delete the session. Treat as already-stopped (idempotent).
+    return
+  }
+  const status = await new RelayClient(relayUrl, apiKey).deleteSession(sessionId, state.bridge_token)
   // 404 means the session is already gone — stop stays idempotent.
   if (status !== 204 && status !== 404) {
     throw new Error(`relay deleteSession failed: ${status}`)
   }
+  clearSessionState(sessionId)
 }
 
 /** Newest ROOT session, preferring ones whose directory matches the cwd.
@@ -166,12 +187,14 @@ async function opencodeHealthy(opencodeUrl: string): Promise<boolean> {
 
 /* ---------------------------------- CLI ---------------------------------- */
 
-function requireApiKey(flag: string | undefined): string | undefined {
-  return flag ?? process.env.RELAY_API_KEY ?? undefined
-}
-
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+/** Resolve the session id: explicit flag wins, else the most recent state
+ * written by `start`. */
+function resolveSessionId(flag: string | undefined): string | undefined {
+  return flag ?? latestSessionState()?.session_id
 }
 
 const program = new Command()
@@ -181,16 +204,10 @@ program
   .command('start')
   .description('Register this session with the relay and serve proxy requests until stopped')
   .option('--relay <url>', 'relay base URL', config.defaultRelayUrl)
-  .option('--api-key <key>', 'relay API key (or RELAY_API_KEY env)')
+  .option('--api-key <key>', 'relay API key (optional; the public relay does not need it)')
   .option('--port <port>', 'opencode port (auto-detected when omitted)')
   .option('--session-id <id>', 'opencode session id (newest session when omitted)')
   .action(async (opts: { relay: string; apiKey?: string; port?: string; sessionId?: string }) => {
-    const apiKey = requireApiKey(opts.apiKey)
-    if (!apiKey) {
-      console.error('error: --api-key or RELAY_API_KEY is required')
-      process.exitCode = 1
-      return
-    }
     const port = opts.port === undefined ? undefined : Number(opts.port)
     if (port !== undefined && !Number.isInteger(port)) {
       console.error('error: --port must be an integer')
@@ -199,7 +216,7 @@ program
     }
     let handle: BridgeHandle
     try {
-      handle = await startBridge(opts.relay, apiKey, { port, sessionId: opts.sessionId })
+      handle = await startBridge(opts.relay, opts.apiKey, { port, sessionId: opts.sessionId })
     } catch (err) {
       console.error(`bridge start failed: ${errorMessage(err)}`)
       process.exitCode = 1
@@ -220,17 +237,17 @@ program
   .command('stop')
   .description('End a remote-control session on the relay')
   .option('--relay <url>', 'relay base URL', config.defaultRelayUrl)
-  .option('--api-key <key>', 'relay API key (or RELAY_API_KEY env)')
-  .requiredOption('--session-id <id>', 'opencode session id')
-  .action(async (opts: { relay: string; apiKey?: string; sessionId: string }) => {
-    const apiKey = requireApiKey(opts.apiKey)
-    if (!apiKey) {
-      console.error('error: --api-key or RELAY_API_KEY is required')
+  .option('--api-key <key>', 'relay API key (optional)')
+  .option('--session-id <id>', 'opencode session id (latest started when omitted)')
+  .action(async (opts: { relay: string; apiKey?: string; sessionId?: string }) => {
+    const sessionId = resolveSessionId(opts.sessionId)
+    if (!sessionId) {
+      console.error('error: no session id (pass --session-id or start a share first)')
       process.exitCode = 1
       return
     }
     try {
-      await stopBridge(opts.relay, opts.sessionId, apiKey)
+      await stopBridge(opts.relay, sessionId, opts.apiKey)
       console.log('Remote control stopped.')
     } catch (err) {
       console.error(`bridge stop failed: ${errorMessage(err)}`)
@@ -242,8 +259,8 @@ program
   .command('status')
   .description('Probe relay health, local opencode detection, and session presence')
   .option('--relay <url>', 'relay base URL', config.defaultRelayUrl)
-  .option('--api-key <key>', 'relay API key (or RELAY_API_KEY env)')
-  .option('--session-id <id>', 'opencode session id to check on the relay')
+  .option('--api-key <key>', 'relay API key (optional)')
+  .option('--session-id <id>', 'opencode session id (latest started when omitted)')
   .action(async (opts: { relay: string; apiKey?: string; sessionId?: string }) => {
     let ok = true
     try {
@@ -261,29 +278,24 @@ program
       console.log('opencode: not detected')
       ok = false
     }
-    if (opts.sessionId) {
-      const apiKey = requireApiKey(opts.apiKey)
-      if (!apiKey) {
-        console.log('session: skipped (--api-key or RELAY_API_KEY required)')
+    const sessionId = resolveSessionId(opts.sessionId)
+    if (sessionId) {
+      const { status, body } = await new RelayClient(opts.relay, opts.apiKey).getSession(sessionId)
+      if (status === 404) {
+        console.log(`session ${sessionId}: not found`)
+        ok = false
+      } else if (status !== 200 || !body) {
+        console.log(`session ${sessionId}: HTTP ${status}`)
         ok = false
       } else {
-        const { status, body } = await new RelayClient(opts.relay, apiKey).getSession(opts.sessionId)
-        if (status === 404) {
-          console.log(`session ${opts.sessionId}: not found`)
-          ok = false
-        } else if (status !== 200 || !body) {
-          console.log(`session ${opts.sessionId}: HTTP ${status}`)
-          ok = false
-        } else {
-          const ageMs = Date.now() - body.created_at
-          const age = formatDuration(ageMs)
-          console.log(`session ${opts.sessionId}: ${body.status}`)
-          console.log(`  bridge: ${body.bridge_connected ? 'connected' : 'disconnected'}`)
-          console.log(`  viewers: ${body.viewer_count}`)
-          console.log(`  alive: ${age}`)
-          console.log(`  title: ${body.title || '(untitled)'}`)
-          console.log(`  directory: ${body.directory}`)
-        }
+        const ageMs = Date.now() - body.created_at
+        const age = formatDuration(ageMs)
+        console.log(`session ${sessionId}: ${body.status}`)
+        console.log(`  bridge: ${body.bridge_connected ? 'connected' : 'disconnected'}`)
+        console.log(`  viewers: ${body.viewer_count}`)
+        console.log(`  alive: ${age}`)
+        console.log(`  title: ${body.title || '(untitled)'}`)
+        console.log(`  directory: ${body.directory}`)
       }
     }
     if (!ok) process.exitCode = 1

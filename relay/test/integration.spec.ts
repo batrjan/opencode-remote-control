@@ -34,6 +34,7 @@ let opencode: Server
 let bridge: RelayWSClient
 let viewerToken: string
 let viewerCookie: string
+let bridgeToken: string
 let lastPromptBody: unknown
 let lastMessagePath: string
 let pushOpencodeEvent: (data: string) => void = () => {}
@@ -101,6 +102,7 @@ beforeAll(async () => {
     .set('x-api-key', API_KEY)
     .send({ session_id: 'sess1', directory: '/path', title: 'integration' })
   expect(created.status).toBe(201)
+  bridgeToken = created.body.bridge_token
 
   const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'sess1' })
   expect(activated.status).toBe(200)
@@ -206,13 +208,15 @@ test('DELETE /api/sessions/:id disconnects the session bridge', async () => {
   })
   const closed = new Promise<number>((resolve) => ws.on('close', (code) => resolve(code)))
 
-  const del = await request(relay).delete('/api/sessions/ses_stopAAAAAAAAAAAAAAAAAA').set('x-api-key', API_KEY)
+  const del = await request(relay)
+    .delete('/api/sessions/ses_stopAAAAAAAAAAAAAAAAAA')
+    .set('x-bridge-token', created.body.bridge_token)
   expect(del.status).toBe(204)
   expect(await closed).toBe(4001)
 })
 
 test('stop: after session delete the viewer cookie no longer authorizes proxying', async () => {
-  const del = await request(relay).delete('/api/sessions/sess1').set('x-api-key', API_KEY)
+  const del = await request(relay).delete('/api/sessions/sess1').set('x-bridge-token', bridgeToken)
   expect(del.status).toBe(204)
   const res = await request(relay)
     .get('/session/sess1/message')
