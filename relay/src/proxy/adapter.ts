@@ -66,7 +66,23 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   ['GET', '/find/symbol'],
   // UI telemetry
   ['POST', '/log'],
+  // Permission API (opencode's tool-approval surface). The viewer drives the
+  // same session the bridge is bound to, so these are proxied to the bound
+  // session's opencode. /permission/request is a long-poll and gets the
+  // extended timeout below.
+  ['GET', '/permission'],
+  ['GET', '/permission/request'],
+  ['GET', '/permission/saved'],
+  ['GET', '/permission/:requestID'],
+  ['POST', '/permission/:requestID/reply'],
+  ['POST', '/permission/saved'],
+  ['POST', '/permission/saved/:id'],
 ]
+
+/** Paths that are long-polls upstream (opencode holds them open until an
+ * event arrives). They get a longer proxy timeout than normal requests. */
+const LONG_POLL_PREFIXES = ['/permission/request']
+const LONG_POLL_TIMEOUT_MS = 120_000
 
 export function proxyAdapter(store: Store, bridge: BridgeClient) {
   const router = express.Router()
@@ -90,8 +106,11 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     path: string,
     body?: unknown,
   ): Promise<void> {
+    const timeout = LONG_POLL_PREFIXES.some((p) => path.startsWith(p))
+      ? LONG_POLL_TIMEOUT_MS
+      : config.proxyTimeoutMs
     try {
-      const out = await bridge.request(session_id, { method, path, body }, config.proxyTimeoutMs)
+      const out = await bridge.request(session_id, { method, path, body }, timeout)
       res
         .status(out.status)
         .type(out.contentType ?? 'application/json')
