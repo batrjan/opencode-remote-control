@@ -9,7 +9,7 @@
 #   bash install.sh
 #
 # Installs:
-#   - ~/.agents/skills/remote-control/   (SKILL.md + bridge binary + bootstrap)
+#   - ~/.agents/skills/remote-control/bin/   (bridge binary + bootstrap)
 #   - ~/.config/opencode/commands/remote-control/  (/remote-control start|stop|status)
 set -euo pipefail
 
@@ -29,12 +29,13 @@ npm ci
 npm run build
 npm prune --omit=dev
 
-# Install the skill.
+# Install the bridge binary (kept in the skill dir, but NO SKILL.md — the
+# slash commands below are the interface; a skill would inject its full text
+# into every command call).
 mkdir -p "$SKILL_DIR/bin" "$COMMANDS_DIR"
 cp -R "$TMP/repo/bridge/dist/"* "$SKILL_DIR/bin/"
 cp "$TMP/repo/bridge/package.json" "$TMP/repo/bridge/package-lock.json" "$SKILL_DIR/bin/"
 cp -R "$TMP/repo/bridge/node_modules" "$SKILL_DIR/bin/"
-cp "$TMP/repo/skill/SKILL.md" "$SKILL_DIR/SKILL.md"
 cp "$TMP/repo/skill/bootstrap.sh" "$SKILL_DIR/bootstrap.sh" 2>/dev/null || true
 chmod +x "$SKILL_DIR/bootstrap.sh" 2>/dev/null || true
 
@@ -48,7 +49,7 @@ cat <<'DONE'
 
 remote-control installed.
 
-  Skill:    ~/.agents/skills/remote-control/SKILL.md
+  Bridge:   ~/.agents/skills/remote-control/bin/
   Commands: /remote-control start | stop | status
 
 Just run in OpenCode:
