@@ -9,7 +9,7 @@ import { RelayWSClient } from '../../bridge/src/relay'
 
 /**
  * SSE fan-out test: mock opencode /event → bridge WS client forwards → relay
- * re-emits as SSE to the viewer at /api/opencode/event.
+ * re-emits as SSE to the viewer at /event.
  */
 
 let relay: Server
@@ -72,7 +72,7 @@ afterAll(async () => {
 })
 
 test('viewer SSE stream receives opencode events pushed via the bridge', async () => {
-  const res = await fetch(`${relayUrl}/api/opencode/event`, {
+  const res = await fetch(`${relayUrl}/event`, {
     headers: { 'x-viewer-token': viewerToken },
   })
   expect(res.status).toBe(200)
@@ -92,7 +92,7 @@ test('viewer SSE stream receives opencode events pushed via the bridge', async (
 })
 
 test('SSE endpoint rejects an invalid viewer token', async () => {
-  const res = await fetch(`${relayUrl}/api/opencode/event`, {
+  const res = await fetch(`${relayUrl}/event`, {
     headers: { 'x-viewer-token': 'wrong' },
   })
   expect(res.status).toBe(401)

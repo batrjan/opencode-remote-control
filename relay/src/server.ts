@@ -19,31 +19,18 @@ import { config } from './config.js'
  */
 const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url))
 
-/**
- * Bootstrap injected into the viewer UI (/terminal) at serve time. The
- * opencode web app reads its default server URL from this localStorage key;
- * unseeded it falls back to location.origin and every API call misses the
- * /api/opencode proxy (404). Injecting at serve time covers both Dockerfile
- * UI sources (prebuilt and source-built) with a single implementation.
- */
-const VIEWER_BOOTSTRAP = `<script id="oc-relay-bootstrap">
-;(function () {
-  localStorage.setItem(
-    'opencode.settings.dat:defaultServerUrl',
-    location.origin + '/api/opencode',
-  )
-})()
-</script>`
-
 let cachedTerminalHtml: string | undefined
 
-/** The UI's index.html with VIEWER_BOOTSTRAP injected before </head>. */
+/**
+ * The official UI's index.html. The proxy adapter is mounted at the server
+ * ROOT (see startServer), so the UI's default server URL is location.origin
+ * — exactly how the real opencode web behaves when served by its own server.
+ * No bootstrap/localStorage seeding is needed: absolute API paths
+ * (/provider, /global/health, /session/...) all land on the root proxy.
+ */
 function terminalHtml(): string {
   if (cachedTerminalHtml === undefined) {
-    const html = readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8')
-    const anchor = html.indexOf('</head>')
-    cachedTerminalHtml =
-      anchor === -1 ? html + VIEWER_BOOTSTRAP : html.slice(0, anchor) + VIEWER_BOOTSTRAP + html.slice(anchor)
+    cachedTerminalHtml = readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8')
   }
   return cachedTerminalHtml
 }
@@ -82,9 +69,10 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   app.get('/terminal', (_req, res) => res.type('html').send(terminalHtml()))
   // Session-bound viewer entry: /<session_id>. Without a valid viewer cookie
   // it serves the code-entry page (with the session id embedded); with one it
-  // serves the opencode UI. Registered last so it never shadows the routes
-  // above.
-  app.get('/:id', (req, res) => {
+  // serves the opencode UI. The :id must look like an opencode session id
+  // (ses_...) so single-segment API paths (/config, /agent, /provider, ...)
+  // fall through to the root-mounted proxy instead of being captured here.
+  app.get('/:id(ses_[A-Za-z0-9]+)', (req, res) => {
     const session = store.getSession(req.params.id)
     if (!session) return res.status(404).type('html').send('<h1>Session not found</h1>')
     const token = cookieViewerToken(req)
@@ -93,6 +81,11 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
     }
     return res.type('html').send(joinHtml(session.id))
   })
+  // The proxy adapter mounts at the root LAST. It only routes its own
+  // allowlisted opencode paths (/session/..., /agent, /provider, /file, ...);
+  // everything else falls through to this 404. Because it is registered after
+  // every relay route (/api/*, /join, /terminal, /:id), those keep working.
+  if (bridge) app.use(proxyAdapter(store, bridge))
   return app
 }
 
@@ -130,7 +123,8 @@ function cookieViewerToken(req: express.Request): string | undefined {
 
 /**
  * Full server: HTTP API + WS endpoint for bridges at /bridge + proxy
- * adapter at /api/opencode. Returns the listening http.Server.
+ * adapter mounted at the root (inside createApp). Returns the listening
+ * http.Server.
  */
 export async function startServer(port: number = config.port): Promise<http.Server> {
   const store = new Store()
@@ -141,7 +135,6 @@ export async function startServer(port: number = config.port): Promise<http.Serv
   const bridge = new BridgeClient(server, store)
   const app = createApp(store, bridge)
   server.on('request', app)
-  app.use('/api/opencode', proxyAdapter(store, bridge))
   server.on('close', () => bridge.close())
   await new Promise<void>((resolve) => server.listen(port, resolve))
   return server

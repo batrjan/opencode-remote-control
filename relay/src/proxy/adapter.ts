@@ -5,7 +5,13 @@ import type { BridgeClient } from '../ws/bridge.js'
 import { config } from '../config.js'
 
 /**
- * HTTP → WS → opencode proxy adapter, mounted at /api/opencode.
+ * HTTP → WS → opencode proxy adapter, mounted at the server ROOT.
+ *
+ * The official opencode web UI (like the real opencode web) resolves its API
+ * calls against `server.url`, and absolute paths (/provider, /global/health,
+ * /session/...) are fetched from the server root — a `/api/opencode` prefix
+ * would be dropped by `new URL('/provider', base)`. Mounting at the root
+ * makes `server.url = location.origin` work exactly as upstream intended.
  *
  * Viewer auth: every request must carry a viewer_token (HttpOnly cookie or
  * x-viewer-token header). The session is resolved from the token and any :id
