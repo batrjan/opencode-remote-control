@@ -28,9 +28,45 @@ let cachedTerminalHtml: string | undefined
  * No bootstrap/localStorage seeding is needed: absolute API paths
  * (/provider, /global/health, /session/...) all land on the root proxy.
  */
+/**
+ * Reset script injected into the UI at serve time. Earlier relay versions
+ * seeded defaultServerUrl with an /api/opencode prefix; that value persists
+ * in the viewer's localStorage and now produces a phantom second server
+ * ("Permission server not found: .../api/opencode"). The proxy is mounted at
+ * the root now, so the correct server URL is location.origin — force it,
+ * overwriting any legacy value.
+ */
+const SERVER_URL_RESET = `<script id="oc-relay-server-url">
+;(() => {
+  try {
+    const origin = location.origin
+    localStorage.setItem('opencode.settings.dat:defaultServerUrl', origin)
+    // Purge any persisted server entry pointing at the retired /api/opencode
+    // mount so it cannot be selected as the active server.
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i)
+      if (!k || !k.startsWith('opencode.')) continue
+      const v = localStorage.getItem(k)
+      if (v && v.includes('/api/opencode')) {
+        try {
+          const parsed = JSON.parse(v)
+          const cleaned = JSON.stringify(parsed).split('/api/opencode').join('')
+          localStorage.setItem(k, cleaned)
+        } catch {
+          localStorage.removeItem(k)
+        }
+      }
+    }
+  } catch {}
+})()
+</script>`
+
 function terminalHtml(): string {
   if (cachedTerminalHtml === undefined) {
-    cachedTerminalHtml = readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8')
+    const html = readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8')
+    const anchor = html.indexOf('</head>')
+    cachedTerminalHtml =
+      anchor === -1 ? html + SERVER_URL_RESET : html.slice(0, anchor) + SERVER_URL_RESET + html.slice(anchor)
   }
   return cachedTerminalHtml
 }
