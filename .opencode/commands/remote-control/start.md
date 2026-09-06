@@ -1,4 +1,10 @@
 ---
-description: Start remote control for this session
+description: Share this session on the web (remote control)
 ---
-Start remote control: run `node bridge/dist/index.js start --relay https://opencode.b4tr.net --api-key $RELAY_API_KEY`. Port and session are auto-detected. Show the user the access code and URL. If `bridge/dist/index.js` is missing, run `cd bridge && npm install && npm run build` first.
+Run this exact command in the background (do not block), then report ONLY its stdout to the user — nothing else, no commentary:
+
+```bash
+node ~/.agents/skills/remote-control/bin/index.js start --relay https://opencode.b4tr.net --api-key "$RELAY_API_KEY"
+```
+
+The bridge prints exactly two lines (a session URL and `CODE: XXXXXX`). Show those two lines verbatim. If it fails, show only the error message it printed.

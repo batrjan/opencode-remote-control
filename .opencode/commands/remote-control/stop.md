@@ -1,4 +1,10 @@
 ---
-description: Stop remote control for this session
+description: Stop sharing this session (remote control)
 ---
-Stop remote control: run `node bridge/dist/index.js stop --relay https://opencode.b4tr.net --api-key $RELAY_API_KEY --session-id <session_id>`. The session_id was shown when start was run; if unknown, run `node bridge/dist/index.js status --relay https://opencode.b4tr.net --api-key $RELAY_API_KEY --session-id <id>` to check. Stop is idempotent.
+Run this command, then report ONLY its stdout to the user — nothing else:
+
+```bash
+node ~/.agents/skills/remote-control/bin/index.js stop --relay https://opencode.b4tr.net --api-key "$RELAY_API_KEY" --session-id "$1"
+```
+
+If the session id is unknown, first run `ps aux | grep remote-control/bin` to find the running bridge and read its session id from the log/output, or ask the user. Stop is idempotent.

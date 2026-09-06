@@ -214,7 +214,7 @@ program
     }
     try {
       await stopBridge(opts.relay, opts.sessionId, apiKey)
-      console.log(`Remote control stopped for session ${opts.sessionId}.`)
+      console.log('Remote control stopped.')
     } catch (err) {
       console.error(`bridge stop failed: ${errorMessage(err)}`)
       process.exitCode = 1
