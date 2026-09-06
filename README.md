@@ -19,7 +19,7 @@ official OpenCode web UI.
         SSE / REST   │                 │      /join · /terminal (viewer UI)  │
                      │                 │      GET /health                    │
         started by ──┘                 └──────────────────────────────────────┘
-        /remote-control start (skill)                    ▲
+        /remote-control start (plugin)                   ▲
                                               HTTPS      │  code → HttpOnly cookie
                                                   ┌──────┴───────┐
                                                   │ Web browser  │
@@ -54,8 +54,9 @@ node dist/index.js stop --relay https://opencode.b4tr.net
 The bridge also stops on its own when OpenCode quits (watchdog) or on SIGINT/SIGTERM;
 every stop path deletes the relay session and revokes the code.
 
-In the OpenCode TUI you can use `/remote-control start` and `/remote-control stop`
-directly — the skill in `skill/SKILL.md` drives the same CLI for the agent.
+In the OpenCode TUI, the native plugin (`plugin/remote-control.js`, installed to
+`~/.config/opencode/plugins/`) provides `/remote-control start|stop|status` — slash
+commands run the bridge directly (no LLM prompt, instant).
 
 ## Components
 
@@ -63,7 +64,7 @@ directly — the skill in `skill/SKILL.md` drives the same CLI for the agent.
 | --------- | ------------------------------------------------------------------------------------------- |
 | `relay/`  | Public server: Express API, in-memory session store, WS bridge endpoint, proxy adapter, static viewer UI. Ships as a Docker image. |
 | `bridge/` | Local CLI (`start` / `stop` / `status`) that registers the session, holds the WS to the relay, executes proxied requests against local OpenCode, and forwards SSE events. |
-| `skill/`  | Agent skill implementing `/remote-control start|stop` on top of the bridge CLI.             |
+| `plugin/` | Native TUI plugin: slash commands run the bridge directly (no LLM). `skill/bootstrap.sh` rebuilds the bridge binary. |
 | `nginx/`  | Host nginx vhost (TLS termination → `127.0.0.1:8080`, authoritative `X-Forwarded-For`).      |
 | `.github/workflows/deploy.yml` | Push to `main`: build relay image → GHCR → SSH deploy. See DEPLOY.md.          |
 
