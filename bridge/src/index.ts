@@ -312,9 +312,13 @@ function formatDuration(ms: number): string {
 }
 
 // Run the CLI only when executed directly (not when imported by tests).
+// A bundled single-file build (esbuild CJS) has a different argv[1] relation
+// to import.meta.url, so always run when this file is the process entrypoint.
 const invokedDirectly =
   process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href
+  (import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href ||
+    process.argv[1].endsWith('remote-control-bridge.cjs') ||
+    process.argv[1].endsWith('bridge/index.cjs'))
 if (invokedDirectly) {
   program.parseAsync(process.argv).catch((err) => {
     console.error(err)

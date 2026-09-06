@@ -1,0 +1,17 @@
+{
+  "name": "opencode-remote-control",
+  "version": "0.1.0",
+  "description": "Share the current OpenCode session on the web with a short access code (remote control).",
+  "type": "module",
+  "exports": {
+    "./tui": "./remote-control.js"
+  },
+  "engines": {
+    "node": ">=22",
+    "opencode": ">=1.0.0"
+  },
+  "files": [
+    "remote-control.js",
+    "bridge/remote-control-bridge.cjs"
+  ]
+}
