@@ -146,6 +146,8 @@
             body: JSON.stringify({ code, session_id: sessionId }),
           })
           if (res.ok) {
+            // /:id checks the freshly set cookie and 302s to the canonical
+            // opencode UI session URL (/<base64(directory)>/session/<id>).
             window.location.assign('/' + sessionId)
             return
           }

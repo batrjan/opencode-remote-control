@@ -105,14 +105,33 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // serves the opencode UI. The :id must look like an opencode session id
   // (ses_...) so single-segment API paths (/config, /agent, /provider, ...)
   // fall through to the root-mounted proxy instead of being captured here.
+  // Session-bound viewer entry: /<session_id>. Without a valid viewer cookie
+  // it serves the code-entry page (with the session id embedded); with one it
+  // REDIRECTS to the real opencode UI session URL, which is
+  // /<base64(directory)>/session/<id> — the official UI parses the first
+  // segment as base64(directory), so a raw session id here would be decoded
+  // into a garbage directory and break the whole bootstrap.
   app.get('/:id(ses_[A-Za-z0-9]+)', (req, res) => {
+    const session = store.getSession(req.params.id)
+    if (!session) return res.status(404).type('html').send('<h1>Session not found</h1>')
+    const token = cookieViewerToken(req)
+    if (token && store.verifyViewer(session.id, token)) {
+      return res.redirect(sessionUiUrl(session))
+    }
+    return res.type('html').send(joinHtml(session.id))
+  })
+  // The official UI session route: /<base64(directory)>/session/<id>. Serve
+  // the UI only to an authenticated viewer of THAT session; otherwise bounce
+  // to the session's code-entry page. The :dir segment is base64url of the
+  // session directory — we validate by decoding and comparing to the session.
+  app.get('/:dir/session/:id(ses_[A-Za-z0-9]+)', (req, res) => {
     const session = store.getSession(req.params.id)
     if (!session) return res.status(404).type('html').send('<h1>Session not found</h1>')
     const token = cookieViewerToken(req)
     if (token && store.verifyViewer(session.id, token)) {
       return res.type('html').send(terminalHtml())
     }
-    return res.type('html').send(joinHtml(session.id))
+    return res.redirect(`/${session.id}`)
   })
   // The proxy adapter mounts at the root LAST. It only routes its own
   // allowlisted opencode paths (/session/..., /agent, /provider, /file, ...);
@@ -120,6 +139,12 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // every relay route (/api/*, /join, /terminal, /:id), those keep working.
   if (bridge) app.use(proxyAdapter(store, bridge))
   return app
+}
+
+/** The official UI's canonical session URL: /<base64(directory)>/session/<id>. */
+function sessionUiUrl(session: { id: string; directory: string }): string {
+  const dir = Buffer.from(session.directory, 'utf8').toString('base64')
+  return `/${encodeURIComponent(dir)}/session/${session.id}`
 }
 
 let cachedJoinTemplate: string | undefined

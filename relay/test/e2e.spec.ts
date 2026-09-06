@@ -116,11 +116,15 @@ test('GET /<session_id> serves the join page unauthenticated, the UI with a view
   expect(unauth.text).toContain('__OC_SESSION_ID__')
   expect(unauth.text).toContain('ses_e2eAAAAAAAAAAAAAAAAAAA')
   expect(unauth.text).toContain('/api/activate')
-  // Authenticated: the official UI.
+  // Authenticated: /<session_id> 302s to the canonical UI session URL.
   const authed = await request(relay).get('/ses_e2eAAAAAAAAAAAAAAAAAAA').set('Cookie', viewerCookie)
-  expect(authed.status).toBe(200)
-  expect(authed.text).toContain('<div id="root"')
-  expect(authed.text).toContain('')
+  expect(authed.status).toBe(302)
+  const uiUrl = authed.headers.location
+  expect(uiUrl).toMatch(/^\/[^/]+\/session\/ses_e2eAAAAAAAAAAAAAAAAAAA$/)
+  // The canonical URL itself serves the official UI to the authenticated viewer.
+  const ui = await request(relay).get(uiUrl).set('Cookie', viewerCookie)
+  expect(ui.status).toBe(200)
+  expect(ui.text).toContain('<div id="root"')
 })
 
 test('GET /<unknown_session_id> is 404', async () => {
