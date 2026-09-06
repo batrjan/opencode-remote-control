@@ -1,6 +1,6 @@
 ---
 name: remote-control
-description: Share the current OpenCode session on the web via the relay (opencode.b4tr.net) with a 6-character access code. Use when the user runs /remote-control start or /remote-control stop or /remote-control status, or asks to share, mirror, or remotely control this session.
+description: Share this OpenCode session on the web with a short access code.
 ---
 
 # Remote Control
