@@ -74,8 +74,11 @@ jobs:
             fi
 
             # Keep the three newest build contexts and rollback tags; drop the rest.
+            # Deliberately NOT `docker image prune`: the builder's intermediate
+            # stages are dangling images, so pruning them throws away the layer
+            # cache and makes the next deploy rebuild the web UI from source
+            # (~6 minutes instead of ~30 seconds).
             ls -1dt "$HOME"/rc-build/*/ 2>/dev/null | tail -n +4 | xargs -r rm -rf
             docker images --format '{{.Repository}}:{{.Tag}}' \
               | grep '^relay-local:rollback-' | sort -r | tail -n +4 \
               | xargs -r -n1 docker rmi -f || true
-            docker image prune -f >/dev/null || true
