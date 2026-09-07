@@ -220,7 +220,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   // GET /project — upstream returns EVERY project the owner has open, so a
   // viewer of one shared session could read the filesystem paths of unrelated
   // work. Keep only the project the shared session actually lives in.
-  router.get('/project', (req, res) => {
+  router.get(['/project', '/api/project'], (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
     void proxy(res, session.id, 'GET', `/project${queryForSession(req, session)}`, undefined, (raw, contentType) =>
@@ -230,7 +230,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
 
   // GET /session — the UI's session list, collapsed to the viewer's own
   // session. Registered before '/session/:id'.
-  router.get('/session', (req, res) => {
+  router.get(['/session', '/api/session'], (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
     void (async () => {
@@ -258,7 +258,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   // own session. Upstream returns every pending request on the instance
   // (all of the owner's sessions); a viewer must only ever see (and thus be
   // able to reason about) its own. The list endpoint is read-only.
-  router.get('/permission', (req, res) => {
+  router.get(['/permission', '/api/permission'], (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
     void (async () => {
@@ -286,7 +286,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
 
   // GET /session/status — global status map, filtered to the viewer's
   // session only (other sessions' statuses are not the viewer's business).
-  router.get('/session/status', (req, res) => {
+  router.get(['/session/status', '/api/session/status'], (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
     void (async () => {
@@ -362,6 +362,26 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     return session.id // chain too deep -> refuse rather than guess
   }
 
+  /**
+   * Mount paths for one route template: the bare path and its `/api`-prefixed
+   * twin.
+   *
+   * The opencode web UI speaks BOTH dialects against the same server — its
+   * bootstrap asks `/api/session?limit=…` while the session view uses
+   * `/session/…`, and upstream opencode serves each. The relay only ever
+   * mounted the bare half, so a viewer joining a session whose project the
+   * browser had not cached got 404 on `/api/session`, concluded there were no
+   * sessions, and landed on an empty "create a session" screen instead of the
+   * share.
+   *
+   * The handler and the upstream path are unchanged — the upstream path is
+   * built from `template`, never from the request — so the `/api` twin
+   * inherits exactly the same forced session binding and isolation.
+   */
+  function mountPaths(template: string): string[] {
+    return template.startsWith('/api/') ? [template] : [template, `/api${template}`]
+  }
+
   for (const [method, template] of ALLOWED_ROUTES) {
     const handler = (req: Request, res: Response) => {
       const session = requireViewer(req, res)
@@ -401,8 +421,8 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
         )
       })()
     }
-    if (method === 'GET') router.get(template, handler)
-    else router.post(template, handler)
+    if (method === 'GET') router.get(mountPaths(template), handler)
+    else router.post(mountPaths(template), handler)
   }
 
   /**

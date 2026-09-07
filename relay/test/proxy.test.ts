@@ -404,3 +404,65 @@ test('filterProjects keeps a project whose sandbox path contains the session dir
     { id: 'sandboxed', worktree: '/elsewhere', sandboxes: ['/sb/root', '/work'] },
   ])
 })
+
+/**
+ * The opencode web UI speaks two dialects against the same server: its
+ * bootstrap fetches `/api/session?limit=…&order=desc` while the session view
+ * uses `/session/…`. Upstream opencode answers both; the relay only mounted
+ * the bare half, so a viewer joining a session whose project their browser had
+ * not cached got 404 on `/api/session`, concluded there were no sessions, and
+ * landed on an empty "create a session" screen instead of the share.
+ */
+test('the /api dialect reaches the same routes as the bare one', async () => {
+  // Equivalence is the property under test: whatever the bare route answers,
+  // its /api twin must answer identically (the fixture's exact body is beside
+  // the point).
+  const bareList = await request(relay).get('/session?limit=5000&order=desc').set('x-viewer-token', viewerToken)
+  const apiList = await request(relay).get('/api/session?limit=5000&order=desc').set('x-viewer-token', viewerToken)
+  expect(apiList.status).toBe(bareList.status)
+  expect(apiList.status).toBe(200)
+  expect(apiList.body).toEqual(bareList.body)
+
+  const bareMsg = await request(relay).get('/session/sess1/message').set('x-viewer-token', viewerToken)
+  lastPath = ''
+  const apiMsg = await request(relay).get('/api/session/sess1/message').set('x-viewer-token', viewerToken)
+  expect(apiMsg.status).toBe(200)
+  expect(apiMsg.body).toEqual(bareMsg.body)
+  // The /api twin forwards the BARE upstream path — opencode's canonical one.
+  expect(lastPath).toBe('/session/sess1/message')
+})
+
+test('the /api dialect enforces the same isolation as the bare one', async () => {
+  // No token at all.
+  expect((await request(relay).get('/api/session')).status).toBe(401)
+  expect((await request(relay).get('/api/session/sess1/message')).status).toBe(401)
+
+  // A foreign session id is rewritten to the caller's own, never fetched raw.
+  lastPath = ''
+  const foreign = await request(relay).get('/api/session/sess2/message').set('x-viewer-token', viewerToken)
+  expect(foreign.status).toBe(200)
+  expect(lastPath).toBe('/session/sess1/message')
+  expect(foreign.body).toEqual([{ id: 'm1', limit: null }])
+
+  // The other viewer's /api list matches their own bare list — not sess1's.
+  const otherBare = await request(relay).get('/session').set('x-viewer-token', sess2ViewerToken)
+  const otherApi = await request(relay).get('/api/session').set('x-viewer-token', sess2ViewerToken)
+  expect(otherApi.body).toEqual(otherBare.body)
+
+  // Routes that are deliberately NOT proxied stay unreachable under /api.
+  for (const blocked of ['/api/experimental/worktree', '/api/auth', '/api/tui/control']) {
+    expect((await request(relay).get(blocked).set('x-viewer-token', viewerToken)).status).toBe(404)
+  }
+})
+
+test('/api/project is filtered to the session project, like the bare route', async () => {
+  const bare = await request(relay).get('/project').set('x-viewer-token', viewerToken)
+  const api = await request(relay).get('/api/project').set('x-viewer-token', viewerToken)
+  expect(api.status).toBe(bare.status)
+  expect(api.body).toEqual(bare.body)
+})
+
+test('an already /api-prefixed allowlist entry is not double-prefixed', async () => {
+  // '/api/agent' is in the allowlist as-is; '/api/api/agent' must not exist.
+  expect((await request(relay).get('/api/api/agent').set('x-viewer-token', viewerToken)).status).toBe(404)
+})
