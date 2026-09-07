@@ -61,10 +61,18 @@ beforeAll(async () => {
       return json(res, 200, { id: 'ses_stranger', title: 'someone else' }) // no parentID
     }
     if (req.method === 'GET' && url.pathname === '/project') {
+      // ?nomatch=1 simulates a session whose directory belongs to none of the
+      // owner's registered projects (a scratch dir, a fresh checkout).
+      if (url.searchParams.get('nomatch')) return json(res, 200, [{ id: 'p2', worktree: '/somewhere/else' }])
       return json(res, 200, [
         { id: 'p1', worktree: '/path' },
         { id: 'p2', worktree: '/somewhere/else' },
       ])
+    }
+    // opencode files a directory that belongs to no registered project under a
+    // catch-all project whose worktree is that very directory.
+    if (req.method === 'GET' && url.pathname === '/project/current') {
+      return json(res, 200, { id: 'global', worktree: url.searchParams.get('directory'), vcs: 'git' })
     }
     if (req.method === 'GET' && url.pathname === '/session/sess1/todo') {
       return json(res, 200, [{ id: 'todo1' }])
@@ -465,4 +473,35 @@ test('/api/project is filtered to the session project, like the bare route', asy
 test('an already /api-prefixed allowlist entry is not double-prefixed', async () => {
   // '/api/agent' is in the allowlist as-is; '/api/api/agent' must not exist.
   expect((await request(relay).get('/api/api/agent').set('x-viewer-token', viewerToken)).status).toBe(404)
+})
+
+/**
+ * A shared session does not always live inside one of the owner's registered
+ * projects — a scratch dir or a fresh checkout files under opencode's
+ * catch-all "global" project instead. The project filter then matched nothing
+ * and returned [], which left the viewer authenticated but homeless: the UI
+ * had no project to hang the session on, so it rendered "nothing here yet" at
+ * the root instead of the share. Observed live: entering a valid code landed
+ * on the empty project list.
+ */
+test('a session outside every registered project still gets its own project', async () => {
+  const res = await request(relay).get('/project?nomatch=1').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  // Not empty — the UI needs exactly one project: the session's own, taken
+  // from /project/current rather than the owner's unrelated list.
+  expect(Array.isArray(res.body)).toBe(true)
+  expect(res.body).toHaveLength(1)
+  expect(res.body[0].worktree).toBe('/path')
+  // And still none of the owner's unrelated projects.
+  expect(JSON.stringify(res.body)).not.toContain('/somewhere/else')
+
+  // The /api twin behaves identically.
+  const api = await request(relay).get('/api/project?nomatch=1').set('x-viewer-token', viewerToken)
+  expect(api.body).toEqual(res.body)
+})
+
+test('a session inside a registered project still gets that project, not the fallback', async () => {
+  const res = await request(relay).get('/project').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual([{ id: 'p1', worktree: '/path' }])
 })

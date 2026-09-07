@@ -223,9 +223,42 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   router.get(['/project', '/api/project'], (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
-    void proxy(res, session.id, 'GET', `/project${queryForSession(req, session)}`, undefined, (raw, contentType) =>
-      filterProjects(raw, session.directory, contentType),
-    )
+    void (async () => {
+      const query = queryForSession(req, session)
+      try {
+        const out = await bridge.request(
+          session.id,
+          { method: 'GET', path: `/project${query}` },
+          config.proxyTimeoutMs,
+        )
+        const filtered = filterProjects(out.body, session.directory, out.contentType)
+        // A shared session does NOT always live inside one of the owner's
+        // registered projects — a scratch dir, a fresh checkout or a path
+        // opencode files under the catch-all "global" project all filter down
+        // to nothing. Returning that empty list left the viewer authenticated
+        // but homeless: the UI has no project to hang the session on, so it
+        // renders "nothing here yet" at the root instead of the share.
+        // Fall back to the session's OWN project, which is exactly the one
+        // thing the viewer is entitled to see.
+        if (isEmptyJsonArray(filtered)) {
+          const current = await bridge.request(
+            session.id,
+            { method: 'GET', path: `/project/current${query}` },
+            config.proxyTimeoutMs,
+          )
+          if (current.status === 200 && current.body.trim().startsWith('{')) {
+            res.status(200).type('application/json').send(`[${current.body}]`)
+            return
+          }
+        }
+        res.status(out.status).type(out.contentType ?? 'application/json').send(filtered)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'proxy failed'
+        if (message === 'bridge not connected') res.status(502).json({ error: 'bridge not connected' })
+        else if (message === 'proxy timeout') res.status(504).json({ error: 'proxy timeout' })
+        else res.status(502).json({ error: 'proxy failed' })
+      }
+    })()
   })
 
   // GET /session — the UI's session list, collapsed to the viewer's own
@@ -512,6 +545,16 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
  * worktree or sits inside it (monorepo packages open a subdirectory).
  * Non-JSON or unexpected shapes pass through untouched.
  */
+/** Whether a filtered project payload came back as an empty JSON array. */
+function isEmptyJsonArray(raw: string): boolean {
+  try {
+    const v = JSON.parse(raw)
+    return Array.isArray(v) && v.length === 0
+  } catch {
+    return false
+  }
+}
+
 export function filterProjects(raw: string, directory: string, contentType?: string): string {
   if (contentType && !contentType.includes('application/json')) return raw
   try {
