@@ -75,7 +75,12 @@ export async function startBridge(
     process.env.OPENCODE_SERVER_USERNAME ?? 'opencode',
     process.env.OPENCODE_SERVER_PASSWORD ?? '',
   )
-  const picked = opts.sessionId === undefined ? await pickSession(opencode) : undefined
+  // With an explicit --session-id we still need the session's OWN directory:
+  // it is what the relay pins every proxied request to and what scopes the
+  // event stream. Falling back to process.cwd() pointed both at whatever
+  // folder the bridge happened to start in.
+  const picked =
+    opts.sessionId === undefined ? await pickSession(opencode) : await fetchSession(opencode, opts.sessionId)
   const session_id = opts.sessionId ?? picked!.id
   const relay = new RelayClient(relayUrl, apiKey)
   const { access_code, bridge_token, viewer_url } = await relay.createSession(
@@ -98,7 +103,7 @@ export async function startBridge(
   })
   const ws = new RelayWSClient(relayUrl, opencode)
   try {
-    await ws.connect(session_id, bridge_token)
+    await ws.connect(session_id, bridge_token, picked?.directory)
     await ws.startEventForwarding()
   } catch (err) {
     // Never leave an orphaned session behind when the WS/SSE setup fails.
@@ -206,6 +211,25 @@ async function pickSession(opencode: OpencodeClient): Promise<OpencodeSessionInf
   const roots = sessions.filter((s) => !s.parentID)
   const candidates = roots.length > 0 ? roots : sessions
   return candidates.sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0))[0]!
+}
+
+/**
+ * Session detail for an explicitly requested id. Best effort: an unreachable
+ * or unknown session leaves the caller on its previous fallbacks rather than
+ * failing the share.
+ */
+async function fetchSession(
+  opencode: OpencodeClient,
+  sessionId: string,
+): Promise<OpencodeSessionInfo | undefined> {
+  try {
+    const out = await opencode.request('GET', `/session/${encodeURIComponent(sessionId)}`)
+    if (out.status !== 200) return undefined
+    const info = JSON.parse(out.body) as OpencodeSessionInfo
+    return info && typeof info.id === 'string' ? info : undefined
+  } catch {
+    return undefined
+  }
 }
 
 async function opencodeHealthy(opencodeUrl: string): Promise<boolean> {

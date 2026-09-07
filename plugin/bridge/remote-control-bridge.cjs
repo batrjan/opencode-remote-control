@@ -7255,9 +7255,19 @@ var OpencodeClient = class {
     const res = await fetch(`${this.url}/config`, { headers: this.auth() });
     return res.json();
   }
-  /** SSE stream of server events; caller consumes the ReadableStream. */
-  async getEvent(signal) {
-    const res = await fetch(`${this.url}/event`, { headers: this.auth(), signal });
+  /**
+   * SSE stream of server events; caller consumes the ReadableStream.
+   *
+   * `directory` scopes the stream. opencode filters /event by the project
+   * directory, defaulting to the SERVER's own instance directory — so a
+   * subscription without it silently yields nothing but heartbeats whenever
+   * the shared session lives somewhere else (the desktop app hosting many
+   * projects, or a bridge started from another folder). The viewer then sat on
+   * "thinking" forever while the answer was already complete on disk.
+   */
+  async getEvent(signal, directory) {
+    const query = directory ? `?directory=${encodeURIComponent(directory)}` : "";
+    const res = await fetch(`${this.url}/event${query}`, { headers: this.auth(), signal });
     return res.body;
   }
   /**
@@ -7365,6 +7375,8 @@ var RelayWSClient = class {
   eventAbortController = null;
   boundSessionId = null;
   bridgeToken = null;
+  /** Directory of the shared session; scopes the opencode event stream. */
+  sessionDirectory;
   /** Set by close(): stops the keep-alive and every retry loop for good. */
   stopped = false;
   /** Set when the relay rejected us — retrying can never succeed. */
@@ -7383,9 +7395,10 @@ var RelayWSClient = class {
    * open; rejects if the relay refuses the credentials (close 4003) or the
    * connection fails before opening.
    */
-  connect(session_id, bridge_token) {
+  connect(session_id, bridge_token, directory) {
     this.boundSessionId = session_id;
     this.bridgeToken = bridge_token;
+    this.sessionDirectory = directory;
     return this.dial();
   }
   /** Open one socket and wire keep-alive + reconnect onto it. */
@@ -7496,7 +7509,7 @@ var RelayWSClient = class {
    */
   async startEventForwarding() {
     this.eventAbortController = new AbortController();
-    const stream = await this.opencode.getEvent(this.eventAbortController.signal);
+    const stream = await this.opencode.getEvent(this.eventAbortController.signal, this.sessionDirectory);
     if (!stream) throw new Error("opencode /event stream unavailable");
     this.forwardingEvents = true;
     void readSseStream(stream, (data) => this.send({ type: "event", data })).finally(() => {
@@ -7671,7 +7684,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     process.env.OPENCODE_SERVER_USERNAME ?? "opencode",
     process.env.OPENCODE_SERVER_PASSWORD ?? ""
   );
-  const picked = opts.sessionId === void 0 ? await pickSession(opencode) : void 0;
+  const picked = opts.sessionId === void 0 ? await pickSession(opencode) : await fetchSession(opencode, opts.sessionId);
   const session_id = opts.sessionId ?? picked.id;
   const relay = new RelayClient(relayUrl, apiKey);
   const { access_code, bridge_token, viewer_url } = await relay.createSession(
@@ -7689,7 +7702,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
   });
   const ws = new RelayWSClient(relayUrl, opencode);
   try {
-    await ws.connect(session_id, bridge_token);
+    await ws.connect(session_id, bridge_token, picked?.directory);
     await ws.startEventForwarding();
   } catch (err) {
     ws.close();
@@ -7758,6 +7771,16 @@ async function pickSession(opencode) {
   const roots = sessions.filter((s) => !s.parentID);
   const candidates = roots.length > 0 ? roots : sessions;
   return candidates.sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0))[0];
+}
+async function fetchSession(opencode, sessionId) {
+  try {
+    const out = await opencode.request("GET", `/session/${encodeURIComponent(sessionId)}`);
+    if (out.status !== 200) return void 0;
+    const info = JSON.parse(out.body);
+    return info && typeof info.id === "string" ? info : void 0;
+  } catch {
+    return void 0;
+  }
 }
 async function opencodeHealthy(opencodeUrl) {
   try {

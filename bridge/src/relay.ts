@@ -91,6 +91,8 @@ export class RelayWSClient {
   private eventAbortController: AbortController | null = null
   private boundSessionId: string | null = null
   private bridgeToken: string | null = null
+  /** Directory of the shared session; scopes the opencode event stream. */
+  private sessionDirectory: string | undefined
   /** Set by close(): stops the keep-alive and every retry loop for good. */
   private stopped = false
   /** Set when the relay rejected us — retrying can never succeed. */
@@ -115,9 +117,11 @@ export class RelayWSClient {
    * open; rejects if the relay refuses the credentials (close 4003) or the
    * connection fails before opening.
    */
-  connect(session_id: string, bridge_token: string): Promise<void> {
+  connect(session_id: string, bridge_token: string, directory?: string): Promise<void> {
     this.boundSessionId = session_id
     this.bridgeToken = bridge_token
+    // Scopes the /event subscription — see OpencodeClient.getEvent.
+    this.sessionDirectory = directory
     return this.dial()
   }
 
@@ -246,7 +250,7 @@ export class RelayWSClient {
    */
   async startEventForwarding(): Promise<void> {
     this.eventAbortController = new AbortController()
-    const stream = await this.opencode.getEvent(this.eventAbortController.signal)
+    const stream = await this.opencode.getEvent(this.eventAbortController.signal, this.sessionDirectory)
     if (!stream) throw new Error('opencode /event stream unavailable')
     this.forwardingEvents = true
     void readSseStream(stream, (data) => this.send({ type: 'event', data })).finally(() => {

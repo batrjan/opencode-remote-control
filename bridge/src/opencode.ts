@@ -56,9 +56,19 @@ export class OpencodeClient {
     return res.json()
   }
 
-  /** SSE stream of server events; caller consumes the ReadableStream. */
-  async getEvent(signal?: AbortSignal) {
-    const res = await fetch(`${this.url}/event`, { headers: this.auth(), signal })
+  /**
+   * SSE stream of server events; caller consumes the ReadableStream.
+   *
+   * `directory` scopes the stream. opencode filters /event by the project
+   * directory, defaulting to the SERVER's own instance directory — so a
+   * subscription without it silently yields nothing but heartbeats whenever
+   * the shared session lives somewhere else (the desktop app hosting many
+   * projects, or a bridge started from another folder). The viewer then sat on
+   * "thinking" forever while the answer was already complete on disk.
+   */
+  async getEvent(signal?: AbortSignal, directory?: string) {
+    const query = directory ? `?directory=${encodeURIComponent(directory)}` : ''
+    const res = await fetch(`${this.url}/event${query}`, { headers: this.auth(), signal })
     return res.body
   }
 
