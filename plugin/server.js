@@ -25,11 +25,29 @@ const COMMANDS = {
   "remote-control/status": "Remote control status",
 }
 
-/** Command bodies are prompts; ours only tells the agent to relay our output. */
-const TEMPLATE = [
-  "The remote-control plugin already executed this command locally and put its",
-  "output in this message. Repeat that output verbatim and add nothing else —",
-  "do not run any tools.",
+/**
+ * Command bodies are prompts, and opencode REQUIRES one — a server-plugin
+ * command always produces a model turn, with no supported way to suppress it
+ * (Command.template is mandatory; command.execute.before can only edit parts).
+ *
+ * The body is therefore blank and gets replaced at execute time. It used to
+ * carry the instruction below, which rode along as a SECOND visible message
+ * part: users saw "The remote-control plugin already executed this command…"
+ * in the chat instead of their share link, and the model sometimes echoed that
+ * instruction rather than the output.
+ */
+const TEMPLATE = " "
+
+/**
+ * Sent as a `synthetic` part: the model reads it, the transcript does not show
+ * it. Without any instruction the model treats a bare share link as a riddle
+ * and answers "what would you like me to do?" — with it, the turn is a silent
+ * acknowledgement and the user just sees their link and code.
+ */
+const RELAY_INSTRUCTION = [
+  "The remote-control plugin already ran this command locally; its output is",
+  "the message above. Reply with exactly the single word OK. Do not repeat the",
+  "output, do not explain it, do not run any tools.",
 ].join(" ")
 
 
@@ -121,8 +139,13 @@ export function createHooks(run = runAction, registerCommands = defaultRegisterC
         text = `remote-control ${action} failed: ${String(err?.message ?? err)}`
       }
       // Mutate in place: opencode keeps a reference to this array, so a
-      // reassignment would be dropped.
+      // reassignment would be dropped. Clearing first drops the blank command
+      // template, so the visible message is exactly the plugin's output — the
+      // share link and code, nothing else. The instruction rides along as a
+      // synthetic part, which the model reads and the transcript hides.
+      output.parts.length = 0
       output.parts.push({ type: "text", text })
+      output.parts.push({ type: "text", text: RELAY_INSTRUCTION, synthetic: true })
     },
   }
 }

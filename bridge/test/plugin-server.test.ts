@@ -69,8 +69,13 @@ test('command.execute.before runs the action and appends its output IN PLACE', a
     output as never,
   )
   expect(seen).toEqual([['start', 'ses_x']])
+  // Same array object: opencode holds this reference, so it must be mutated in
+  // place rather than replaced.
   expect(output.parts).toBe(parts)
-  expect(parts).toEqual([{ type: 'text', text: 'https://relay/ses_x\nCODE: ABC123' }])
+  // The visible part is exactly the output; the model's instruction rides
+  // along as a synthetic part the transcript hides.
+  const visible = (parts as Array<Record<string, unknown>>).filter((p) => !p.synthetic)
+  expect(visible).toEqual([{ type: 'text', text: 'https://relay/ses_x\nCODE: ABC123' }])
 })
 
 test('command.execute.before ignores commands that are not ours', async () => {
@@ -96,7 +101,8 @@ test('a failing action is reported in the message, never thrown', async () => {
       output as never,
     ),
   ).resolves.toBeUndefined()
-  expect(output.parts).toEqual([{ type: 'text', text: 'remote-control start failed: relay unreachable' }])
+  const visible = (output.parts as Array<Record<string, unknown>>).filter((p) => !p.synthetic)
+  expect(visible).toEqual([{ type: 'text', text: 'remote-control start failed: relay unreachable' }])
 })
 
 test('server() returns the same hook surface', async () => {
@@ -193,4 +199,59 @@ test('defaultRegisterCommands only steps aside for a TUI that has the TUI entry'
   // The real predicate reads this process and the on-disk tui.json files; it
   // must return a boolean and never throw, whatever the environment looks like.
   expect(typeof defaultRegisterCommands()).toBe('boolean')
+})
+
+/**
+ * A server-plugin command always produces a model turn — opencode requires
+ * Command.template and command.execute.before can only edit parts. The
+ * instruction that keeps the model quiet therefore used to ride along as a
+ * second VISIBLE part: users ran /remote-control/start and saw "The
+ * remote-control plugin already executed this command locally…" in the chat
+ * instead of their share link, and the model sometimes echoed that instruction
+ * rather than the output. Dropping the instruction entirely was worse — with a
+ * bare share link and no instruction the model asks "what would you like me to
+ * do?" and starts reasoning about the transcript.
+ *
+ * So: the visible part is exactly the plugin's output, and the instruction is a
+ * `synthetic` part, which opencode's UI filters out of the transcript while the
+ * model still reads it.
+ */
+test('the transcript shows only the command output; the instruction is synthetic', async () => {
+  const hooks = createHooks(async () => 'https://relay/ses_x\nCODE: ABC123', () => true)
+  // opencode seeds the array with the command template; it must not survive.
+  const output = { parts: [{ type: 'text', text: 'TEMPLATE-BODY' }] as Array<Record<string, unknown>> }
+  await hooks['command.execute.before']({ command: 'remote-control/start', sessionID: 'ses_x' }, output)
+
+  const visible = output.parts.filter((p) => !p.synthetic)
+  expect(visible).toHaveLength(1)
+  expect(visible[0]!.text).toBe('https://relay/ses_x\nCODE: ABC123')
+  // The template opencode put there is gone — it never reaches the transcript.
+  expect(JSON.stringify(output.parts)).not.toContain('TEMPLATE-BODY')
+
+  // The model still gets its instruction, hidden from the UI.
+  const hidden = output.parts.filter((p) => p.synthetic)
+  expect(hidden).toHaveLength(1)
+  expect(String(hidden[0]!.text)).toMatch(/already ran this command/i)
+})
+
+test('a failing action reports the failure as the visible output, still without the instruction', async () => {
+  const hooks = createHooks(async () => {
+    throw new Error('relay unreachable')
+  }, () => true)
+  const output = { parts: [{ type: 'text', text: 'TEMPLATE-BODY' }] as Array<Record<string, unknown>> }
+  await hooks['command.execute.before']({ command: 'remote-control/stop', sessionID: 'ses_x' }, output)
+
+  const visible = output.parts.filter((p) => !p.synthetic)
+  expect(visible).toHaveLength(1)
+  expect(String(visible[0]!.text)).toContain('relay unreachable')
+  expect(JSON.stringify(output.parts)).not.toContain('TEMPLATE-BODY')
+})
+
+test('the registered command template carries no instruction text', async () => {
+  const hooks = createHooks(async () => 'x', () => true)
+  const config: { command?: Record<string, { template?: string; description?: string }> } = {}
+  await hooks.config(config)
+  for (const [name, cmd] of Object.entries(config.command ?? {})) {
+    expect(cmd.template?.trim(), name).toBe('')
+  }
 })
