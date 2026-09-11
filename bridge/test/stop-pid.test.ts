@@ -1,6 +1,6 @@
 import { afterEach, expect, test, vi } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { terminateBridgeProcess, type ProcessSnapshot } from '../src/index'
+import { terminateBridgeProcess, type ProcessSnapshot, terminateSpawnedServer } from '../src/index'
 
 /**
  * `stop` reads a pid out of a state file that outlives a bridge killed with
@@ -149,4 +149,79 @@ test('a snapshot without a start time is judged on the command line alone', () =
   const snapshot: ProcessSnapshot = { command: BRIDGE_COMMAND }
   terminateBridgeProcess(4246, Date.now(), () => snapshot)
   expect(kill).toHaveBeenCalledWith(4246, 'SIGTERM')
+})
+
+/**
+ * The orphan a SIGKILL leaves behind.
+ *
+ * The bridge spawns `opencode serve` when nothing is listening (the TUI has no
+ * HTTP port) and kills it on the way out — but only along paths that run
+ * JavaScript. `kill -9`, a panic or a reboot skip all of them, and the server
+ * then runs forever holding its port; the NEXT `start` detects that stale
+ * server and attaches to it, binding a new share to a server left over from an
+ * old one. Verified against the real thing before this existed: after killing
+ * the bridge with -9, `stop` cleaned the relay session and the state file while
+ * the spawned server kept listening on 4096.
+ */
+test('stop terminates the opencode server the bridge spawned', () => {
+  const signalled: number[] = []
+  const realKill = process.kill.bind(process)
+  const spy = ((pid: number, sig?: string | number) => {
+    signalled.push(pid)
+    return true
+  }) as typeof process.kill
+  process.kill = spy
+  try {
+    terminateSpawnedServer(4242, Date.now(), () => ({
+      command: '/Users/me/.opencode/bin/opencode serve --hostname 127.0.0.1',
+      startedAt: Date.now() - 60_000,
+    }))
+  } finally {
+    process.kill = realKill
+  }
+  expect(signalled).toEqual([4242])
+})
+
+test('stop does not terminate a pid that is no longer an opencode server', () => {
+  const signalled: number[] = []
+  const realKill = process.kill.bind(process)
+  process.kill = ((pid: number) => {
+    signalled.push(pid)
+    return true
+  }) as typeof process.kill
+  try {
+    for (const command of [
+      '/usr/bin/node /Users/me/code/other-app/server.js',
+      '/bin/zsh -l',
+      'opencode', // the TUI, not a server the bridge started
+      '/opt/homebrew/bin/opencodex serve',
+    ]) {
+      terminateSpawnedServer(4242, Date.now(), () => ({ command, startedAt: Date.now() - 60_000 }))
+    }
+    // A pid that is simply gone, and our own pid.
+    terminateSpawnedServer(4242, Date.now(), () => null)
+    terminateSpawnedServer(process.pid, Date.now(), () => ({ command: 'opencode serve' }))
+  } finally {
+    process.kill = realKill
+  }
+  expect(signalled).toEqual([])
+})
+
+test('stop does not terminate a server that started after the share was registered', () => {
+  const signalled: number[] = []
+  const realKill = process.kill.bind(process)
+  process.kill = ((pid: number) => {
+    signalled.push(pid)
+    return true
+  }) as typeof process.kill
+  try {
+    const shareRegisteredAt = Date.now() - 3_600_000
+    terminateSpawnedServer(4242, shareRegisteredAt, () => ({
+      command: '/usr/local/bin/opencode serve --hostname 127.0.0.1',
+      startedAt: Date.now(), // a fresh process wearing a recycled pid
+    }))
+  } finally {
+    process.kill = realKill
+  }
+  expect(signalled).toEqual([])
 })

@@ -101,6 +101,10 @@ export async function startBridge(
     relay: relayUrl,
     started_at: Date.now(),
     pid: process.pid,
+    // Only when WE spawned it: a server that was already listening belongs to
+    // the user (their GUI, their own `opencode serve`) and must never be killed
+    // by `stop`.
+    server_pid: spawnedServer?.pid,
   })
   const ws = new RelayWSClient(relayUrl, opencode)
   try {
@@ -180,6 +184,53 @@ export async function stopBridge(
   }
   clearSessionState(sessionId)
   terminateBridgeProcess(state.pid, state.started_at)
+  // The bridge kills its own `opencode serve` on every exit path that runs
+  // JavaScript — but a SIGKILL, a panic or a reboot runs none of them, and the
+  // server then outlives the share, holding its port until the machine is
+  // rebooted. Worse, the next `start` detects that stale server and attaches to
+  // it, so a new share can end up bound to a server left over from an old one.
+  // Finish the cleanup here, with the same identity check the bridge pid gets.
+  terminateSpawnedServer(state.server_pid, state.started_at)
+}
+
+/** Command lines that belong to an `opencode serve` the bridge started. */
+const SERVE_COMMAND_RE = /(^|[/\\])opencode(\.exe)?\s+serve(\s|$)/
+
+/**
+ * SIGTERM a leftover `opencode serve`, but only if the pid really is one.
+ *
+ * Same reasoning as terminateBridgeProcess: the pid comes from a state file
+ * that can outlive the process it names, and pids are recycled. Never throws —
+ * `stop` stays idempotent even where `ps` is unavailable.
+ */
+export function terminateSpawnedServer(
+  pid: number | undefined,
+  startedAt?: number,
+  inspect: (pid: number) => ProcessSnapshot | null = describeProcess,
+): void {
+  if (!pid || pid === process.pid) return
+  let snapshot: ProcessSnapshot | null = null
+  try {
+    snapshot = inspect(pid)
+  } catch {
+    snapshot = null
+  }
+  if (!snapshot) return // already gone: nothing to clean up, nothing to report
+  if (!SERVE_COMMAND_RE.test(snapshot.command)) {
+    console.warn(
+      `bridge stop: not signalling opencode server pid ${pid} — pid now belongs to an unrelated process: ${snapshot.command.slice(0, 120)}`,
+    )
+    return
+  }
+  if (startedAt !== undefined && snapshot.startedAt !== undefined && snapshot.startedAt > startedAt + PID_START_SLACK_MS) {
+    console.warn(`bridge stop: not signalling opencode server pid ${pid} — it started after this share was registered`)
+    return
+  }
+  try {
+    process.kill(pid, 'SIGTERM')
+  } catch {
+    // Already gone (ESRCH) or not ours (EPERM).
+  }
 }
 
 /** What the OS reports about a live pid: its command line and, when `ps`

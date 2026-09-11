@@ -3706,7 +3706,8 @@ var src_exports = {};
 __export(src_exports, {
   startBridge: () => startBridge,
   stopBridge: () => stopBridge,
-  terminateBridgeProcess: () => terminateBridgeProcess
+  terminateBridgeProcess: () => terminateBridgeProcess,
+  terminateSpawnedServer: () => terminateSpawnedServer
 });
 module.exports = __toCommonJS(src_exports);
 var import_node_child_process3 = require("node:child_process");
@@ -7857,7 +7858,11 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     bridge_token,
     relay: relayUrl,
     started_at: Date.now(),
-    pid: process.pid
+    pid: process.pid,
+    // Only when WE spawned it: a server that was already listening belongs to
+    // the user (their GUI, their own `opencode serve`) and must never be killed
+    // by `stop`.
+    server_pid: spawnedServer?.pid
   });
   const ws = new RelayWSClient(relayUrl, opencode);
   try {
@@ -7913,6 +7918,32 @@ async function stopBridge(relayUrl, sessionId, apiKey) {
   }
   clearSessionState(sessionId);
   terminateBridgeProcess(state.pid, state.started_at);
+  terminateSpawnedServer(state.server_pid, state.started_at);
+}
+var SERVE_COMMAND_RE = /(^|[/\\])opencode(\.exe)?\s+serve(\s|$)/;
+function terminateSpawnedServer(pid, startedAt, inspect = describeProcess) {
+  if (!pid || pid === process.pid) return;
+  let snapshot = null;
+  try {
+    snapshot = inspect(pid);
+  } catch {
+    snapshot = null;
+  }
+  if (!snapshot) return;
+  if (!SERVE_COMMAND_RE.test(snapshot.command)) {
+    console.warn(
+      `bridge stop: not signalling opencode server pid ${pid} \u2014 pid now belongs to an unrelated process: ${snapshot.command.slice(0, 120)}`
+    );
+    return;
+  }
+  if (startedAt !== void 0 && snapshot.startedAt !== void 0 && snapshot.startedAt > startedAt + PID_START_SLACK_MS) {
+    console.warn(`bridge stop: not signalling opencode server pid ${pid} \u2014 it started after this share was registered`);
+    return;
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+  }
 }
 var BRIDGE_ENTRY_RE = /(remote-control-bridge(\.cjs)?|remote-control[/\\]bin[/\\]index\.(js|cjs|mjs)|bridge[/\\](dist[/\\])?index\.(js|cjs|mjs|ts)|[/\\]\.bin[/\\]bridge(\s|$))/;
 var NODE_EXEC_RE = /(^|[/\\])(node|nodejs|node\d+(\.\d+)*|bun|deno|tsx|ts-node)(\.exe)?$/;
@@ -8112,5 +8143,6 @@ if (invokedDirectly) {
 0 && (module.exports = {
   startBridge,
   stopBridge,
-  terminateBridgeProcess
+  terminateBridgeProcess,
+  terminateSpawnedServer
 });

@@ -19,6 +19,18 @@ export interface SessionState {
   /** PID of the long-running `start` process, so `stop` can terminate it.
    * Absent in state written by older versions. */
   pid?: number
+  /**
+   * PID of the `opencode serve` this bridge spawned, when it spawned one.
+   *
+   * The bridge kills its own child on the way out, but only along paths that
+   * run JavaScript: a SIGKILL, a panic or a reboot skip that handler and leave
+   * the server running forever, holding its port. The next `start` then detects
+   * that stale server and attaches to it — a server belonging to a share that
+   * ended, possibly for another project. Recording the pid lets `stop` finish
+   * the job even when the bridge never got to. Absent when the bridge attached
+   * to a server it did not start (that one is not ours to kill).
+   */
+  server_pid?: number
 }
 
 function stateDir(): string {
