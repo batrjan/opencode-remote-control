@@ -166,6 +166,27 @@ The TUI itself exposes no HTTP port, so the bridge starts its own
 `opencode serve` against the same project and stops it again on
 `/remote-control/stop`.
 
+### What "live" covers, and what it does not
+
+OpenCode's event stream is per **process**. The bridge forwards the `/event`
+stream of the server it is attached to, so a viewer sees, live:
+
+- everything the viewer themselves does (their prompts run through that server),
+- everything anyone does through that same server — including another viewer.
+
+It does **not** see work the owner does in a *different* OpenCode process. On
+the TUI path that is the owner's own typing: the TUI has no HTTP port, so the
+bridge spawns a second `opencode serve`, and the two processes share the
+session database but not an event bus. Measured directly: a message written by
+a separate process lands in the session (a viewer's next fetch returns it) while
+the bridge's `/event` stream carries nothing but heartbeats for it. The viewer's
+UI therefore shows the owner's new messages only after a reload.
+
+If you want the owner's own turns mirrored live, share from a process that
+*is* the server — `opencode serve` (or the desktop GUI) plus
+`opencode attach <url>` for the owner's terminal — so both ends drive the same
+instance. Driving a session from the browser works fully either way.
+
 ## Components
 
 | Path      | What it is                                                                                  |
