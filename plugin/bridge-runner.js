@@ -7,12 +7,51 @@
 // `tui()` / `server()` — hence two entries over one shared implementation.
 
 import { spawn, execFile } from "node:child_process"
-import { chmodSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
-const RELAY = "https://opencode.b4tr.net"
+/** The public relay, used when nothing overrides it. Matches the bridge CLI's own default. */
+const DEFAULT_RELAY = "https://opencode.b4tr.net"
+
+/**
+ * Resolve the relay the plugin talks to.
+ *
+ * The bridge CLI has always taken `--relay`, but the plugin pinned the public
+ * host, so a self-hosted relay was unreachable from the slash commands — the
+ * one place most users ever start a share from. The value ends up on a spawned
+ * command line, so it is validated rather than passed through: only http/https
+ * (a `javascript:`/`file:` value would be a gift to anyone who can set the
+ * environment), and trailing slashes are stripped because the bridge appends
+ * its own paths (`${relay}/health`) and would otherwise build `//health`.
+ *
+ * Anything invalid warns and falls back — a typo in an env var must not leave
+ * the user with a broken share and no explanation.
+ */
+export function relayUrl(env = process.env) {
+  // First NON-EMPTY wins, not first non-nullish: an exported-but-empty
+  // OPENCODE_REMOTE_CONTROL_RELAY ("" is a string, so `??` accepts it) would
+  // otherwise shadow a perfectly good REMOTE_CONTROL_RELAY and silently route
+  // the share through the public relay instead of the self-hosted one.
+  const raw = [env.OPENCODE_REMOTE_CONTROL_RELAY, env.REMOTE_CONTROL_RELAY]
+    .map((v) => String(v ?? "").trim())
+    .find((v) => v !== "")
+  if (!raw) return DEFAULT_RELAY
+  let parsed
+  try {
+    parsed = new URL(raw)
+  } catch {
+    parsed = undefined
+  }
+  if (!parsed || (parsed.protocol !== "http:" && parsed.protocol !== "https:")) {
+    console.warn(
+      `remote-control: ignoring invalid relay ${JSON.stringify(raw)} (expected http:// or https://), using ${DEFAULT_RELAY}`,
+    )
+    return DEFAULT_RELAY
+  }
+  return raw.replace(/\/+$/, "")
+}
 
 /**
  * Where the bridge logs while starting — the share URL and the ACCESS CODE
@@ -23,6 +62,27 @@ const RELAY = "https://opencode.b4tr.net"
  */
 export function logPath(env = process.env) {
   return path.join(env.HOME || homedir(), ".agents", "skills", "remote-control", "state", "bridge.log")
+}
+
+/**
+ * Delete the bridge log once a share is over.
+ *
+ * The log keeps the share URL and the `CODE: XXXXXX` line, and nothing used to
+ * clear it: a code from a long-stopped session sat in the home directory until
+ * the next start happened to truncate the file. Called after a successful
+ * stop, so the secret's lifetime matches the share's.
+ *
+ * Best effort by contract — a share that ended must never report failure
+ * because its log could not be deleted, so this never throws; the boolean says
+ * whether the log is gone (an absent file is already gone: silent success).
+ */
+export function clearLog(file = logPath()) {
+  try {
+    rmSync(file, { force: true })
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** Create the private log dir/file and return a write fd for the bridge. */
@@ -82,7 +142,7 @@ function startBridge(sessionID) {
   return new Promise((resolve, reject) => {
     const bin = bridgeBin()
     if (!bin) return reject(new Error("bridge not found — install the plugin from git (see package README)"))
-    const args = [bin, "start", "--relay", RELAY]
+    const args = [bin, "start", "--relay", relayUrl()]
     if (sessionID) args.push("--session-id", sessionID)
     const LOG = logPath()
     let out
@@ -156,10 +216,17 @@ export async function runAction(action, sessionID) {
   switch (action) {
     case "start":
       return await startBridge(sessionID)
-    case "stop":
-      return (await runBridge(["stop", "--relay", RELAY])) || "Remote control stopped."
+    case "stop": {
+      const out = await runBridge(["stop", "--relay", relayUrl()])
+      // The share is down, so the URL + access code in the log are spent:
+      // scrub them here rather than leaving them in the home directory until
+      // some later start truncates the file. Only on success — a stop that
+      // failed may have left the share (and that code) live.
+      clearLog()
+      return out || "Remote control stopped."
+    }
     case "status":
-      return (await runBridge(["status", "--relay", RELAY], { allowFailure: true })) || "no active session"
+      return (await runBridge(["status", "--relay", relayUrl()], { allowFailure: true })) || "no active session"
     default:
       throw new Error(`unknown action: ${action} (use start, stop or status)`)
   }
@@ -181,4 +248,8 @@ export function resolveAction(command, args) {
 
 const ACTIONS = new Set(["start", "stop", "status"])
 
-export { RELAY, bridgeBin, startBridge, runBridge }
+// `RELAY` was the pinned constant before the endpoint became configurable; it
+// is kept as an alias of the default so any out-of-tree importer (the plugin
+// files here use runAction, but installs copy this module around) still
+// resolves. New code calls relayUrl().
+export { DEFAULT_RELAY, DEFAULT_RELAY as RELAY, bridgeBin, startBridge, runBridge }

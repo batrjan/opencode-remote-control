@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { execFileSync } from 'node:child_process'
 import { realpathSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { Command } from 'commander'
@@ -178,22 +179,128 @@ export async function stopBridge(
     throw new Error(`relay deleteSession failed: ${status}`)
   }
   clearSessionState(sessionId)
-  terminateBridgeProcess(state.pid)
+  terminateBridgeProcess(state.pid, state.started_at)
+}
+
+/** What the OS reports about a live pid: its command line and, when `ps`
+ * supports `lstart`, when that process started (epoch ms). */
+export interface ProcessSnapshot {
+  command: string
+  startedAt?: number
+}
+
+/**
+ * Command lines that belong to a bridge. Covers every way the CLI is launched:
+ * the prebuilt plugin bundle (`plugin/bridge/remote-control-bridge.cjs`), the
+ * skill layout install.sh writes (`~/.agents/skills/remote-control/bin/index.js`),
+ * a repo checkout (`bridge/dist/index.js`, `bridge/src/index.ts`) and the npm
+ * bin shim (`node_modules/.bin/bridge`).
+ */
+const BRIDGE_ENTRY_RE =
+  /(remote-control-bridge(\.cjs)?|remote-control[/\\]bin[/\\]index\.(js|cjs|mjs)|bridge[/\\](dist[/\\])?index\.(js|cjs|mjs|ts)|[/\\]\.bin[/\\]bridge(\s|$))/
+/** The interpreter a bridge always runs under. */
+const NODE_EXEC_RE = /(^|[/\\])(node|nodejs|node\d+(\.\d+)*|bun|deno|tsx|ts-node)(\.exe)?$/
+
+/**
+ * How much later than the recorded `started_at` a process may have started and
+ * still be the bridge that wrote it. The state file is written AFTER the
+ * process is up (registration talks to the relay first), so the bridge's own
+ * start time is always EARLIER than `started_at`; a process that appeared
+ * after it is a different one wearing a recycled pid. The slack absorbs a slow
+ * registration, ps's one-second resolution and clock jitter.
+ */
+const PID_START_SLACK_MS = 120_000
+
+/** Read a pid's command line (and start time when available); null if the pid
+ * is gone or `ps` cannot answer. Never throws. */
+function describeProcess(pid: number): ProcessSnapshot | null {
+  const ps = (format: string): string | null => {
+    try {
+      const out = execFileSync('ps', ['-p', String(pid), '-o', format], {
+        encoding: 'utf8',
+        timeout: 2000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      })
+      const line = out.split('\n')[0]?.trim() ?? ''
+      return line.length > 0 ? line : null
+    } catch {
+      // No such pid, `ps` missing, or a format this ps does not know.
+      return null
+    }
+  }
+  // One call for both fields. `lstart` is a fixed 5-token date ("Thu Sep 11
+  // 09:12:13 2026") on both macOS and Linux, so the command is everything
+  // after it. A ps build that rejects `lstart` fails the whole call, hence the
+  // command-only retry — losing the start time must never lose the command.
+  const combined = ps('lstart=,command=')
+  if (combined) {
+    const m = /^(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(\S.*)$/.exec(combined)
+    const started = m ? Date.parse(m[1]!) : NaN
+    if (m && Number.isFinite(started)) return { command: m[2]!, startedAt: started }
+  }
+  const command = ps('command=')
+  return command ? { command } : null
+}
+
+/** Whether a command line is a node process running the bridge entry point. */
+function isBridgeCommand(command: string): boolean {
+  const exec = command.trim().split(/\s+/)[0] ?? ''
+  return NODE_EXEC_RE.test(exec) && BRIDGE_ENTRY_RE.test(command)
+}
+
+/** Why this pid must not be signalled, or null when it is safe to. */
+function refuseToSignal(snapshot: ProcessSnapshot | null, startedAt?: number): string | null {
+  if (!snapshot) return 'no such process (already gone)'
+  if (!isBridgeCommand(snapshot.command)) {
+    return `pid now belongs to an unrelated process: ${snapshot.command.slice(0, 120)}`
+  }
+  if (startedAt !== undefined && snapshot.startedAt !== undefined && snapshot.startedAt > startedAt + PID_START_SLACK_MS) {
+    return 'process started after this share was registered (recycled pid)'
+  }
+  return null
 }
 
 /**
  * Signal the long-running `start` process so it shuts down (its SIGTERM
  * handler closes the WS and kills the `opencode serve` it spawned). Without
  * this, `stop` only removed the relay session and left both processes — and
- * the spawned server's port — behind. Never signals the caller itself (the
- * library path runs stop inside the bridge process) and tolerates a stale pid.
+ * the spawned server's port — behind.
+ *
+ * The pid comes from a state file that outlives a bridge killed with -9, a
+ * panic or a reboot, and the OS recycles pids — so `stop` used to SIGTERM
+ * whatever stranger had inherited the number. Verify the pid still runs a
+ * bridge (command line, corroborated by the process's own start time) before
+ * signalling. Never signals the caller itself (the library path runs stop
+ * inside the bridge process), and never throws: `stop` stays idempotent even
+ * when `ps` is unavailable.
+ *
+ * `inspect` is injectable so the check itself can be tested deterministically.
  */
-function terminateBridgeProcess(pid: number | undefined): void {
+export function terminateBridgeProcess(
+  pid: number | undefined,
+  startedAt?: number,
+  inspect: (pid: number) => ProcessSnapshot | null = describeProcess,
+): void {
   if (!pid || pid === process.pid) return
+  let snapshot: ProcessSnapshot | null = null
+  try {
+    snapshot = inspect(pid)
+  } catch {
+    // An unusable lookup must not turn `stop` into a crash — and must not turn
+    // into a blind kill either: fall through with no evidence, which refuses.
+    snapshot = null
+  }
+  const refusal = refuseToSignal(snapshot, startedAt)
+  if (refusal) {
+    // Silence here would be indistinguishable from a successful stop, and the
+    // stale-state case is exactly when the user wonders why nothing happened.
+    console.warn(`bridge stop: not signalling pid ${pid} — ${refusal}`)
+    return
+  }
   try {
     process.kill(pid, 'SIGTERM')
   } catch {
-    // Already gone (ESRCH) or not ours (EPERM) — nothing to clean up.
+    // Raced with its own exit (ESRCH) or not ours (EPERM) — nothing to clean up.
   }
 }
 

@@ -3702,12 +3702,14 @@ var require_websocket_server = __commonJS({
 });
 
 // src/index.ts
-var index_exports = {};
-__export(index_exports, {
+var src_exports = {};
+__export(src_exports, {
   startBridge: () => startBridge,
-  stopBridge: () => stopBridge
+  stopBridge: () => stopBridge,
+  terminateBridgeProcess: () => terminateBridgeProcess
 });
-module.exports = __toCommonJS(index_exports);
+module.exports = __toCommonJS(src_exports);
+var import_node_child_process3 = require("node:child_process");
 var import_node_fs3 = require("node:fs");
 var import_node_url = require("node:url");
 
@@ -7366,6 +7368,150 @@ var RelayClient = class {
     return { status: 200, body: await res.json() };
   }
 };
+var RELAY_PROXY_ROUTES = [
+  // Session detail + messages (relay ALLOWED_ROUTES; ':id' is the viewer's
+  // bound session or one of its subagents on the child-readable routes).
+  ["GET", "/session/:id"],
+  ["GET", "/session/:id/message"],
+  ["GET", "/session/:id/message/:messageID"],
+  ["POST", "/session/:id/message"],
+  ["POST", "/session/:id/prompt_async"],
+  ["POST", "/session/:id/abort"],
+  ["POST", "/session/:id/command"],
+  ["POST", "/session/:id/shell"],
+  ["POST", "/session/:id/summarize"],
+  ["POST", "/session/:id/revert"],
+  ["POST", "/session/:id/unrevert"],
+  ["POST", "/session/:id/fork"],
+  ["POST", "/session/:id/permissions/:permissionID"],
+  ["GET", "/session/:id/todo"],
+  ["GET", "/session/:id/children"],
+  ["GET", "/session/:id/diff"],
+  // Read-only global metadata the UI needs to boot.
+  ["GET", "/agent"],
+  ["GET", "/command"],
+  ["GET", "/config"],
+  ["GET", "/config/providers"],
+  ["GET", "/provider"],
+  ["GET", "/provider/auth"],
+  ["GET", "/project"],
+  ["GET", "/project/current"],
+  ["GET", "/path"],
+  ["GET", "/vcs"],
+  ["GET", "/mcp"],
+  ["GET", "/lsp"],
+  ["GET", "/formatter"],
+  ["GET", "/experimental/tool"],
+  ["GET", "/experimental/tool/ids"],
+  // Read-only project browsing (the UI's file tree and previews).
+  ["GET", "/file"],
+  ["GET", "/file/content"],
+  ["GET", "/file/status"],
+  ["GET", "/find"],
+  ["GET", "/find/file"],
+  ["GET", "/find/symbol"],
+  // Global v2 surface probed at boot. NOTE: '/global/event' and '/event' are
+  // deliberately absent — the SSE stream is never proxied. The bridge opens it
+  // itself (startEventForwarding) and the relay fans it out locally from that
+  // subscription, so a `proxy` frame asking for it is by definition not the
+  // relay doing its job.
+  ["GET", "/global/health"],
+  ["GET", "/global/config"],
+  // Question / resource / reference APIs the UI bootstrap resolves.
+  ["GET", "/question"],
+  ["POST", "/question"],
+  ["GET", "/experimental/resource"],
+  ["GET", "/experimental/capabilities"],
+  ["GET", "/experimental/workspace"],
+  ["GET", "/api/reference"],
+  ["GET", "/api/agent"],
+  ["GET", "/api/command"],
+  ["GET", "/api/skill"],
+  ["GET", "/skill"],
+  ["GET", "/pty"],
+  ["GET", "/pty/shells"],
+  // UI telemetry.
+  ["POST", "/log"],
+  // Built by the relay's own handlers, not by a route template: the filtered
+  // permission list and the per-session status map.
+  ["GET", "/permission"],
+  ["GET", "/session/status"]
+];
+var PROXY_TEMPLATES = (() => {
+  const byMethod = /* @__PURE__ */ new Map([
+    ["GET", []],
+    ["POST", []]
+  ]);
+  for (const [method, template] of RELAY_PROXY_ROUTES) {
+    const list = byMethod.get(method);
+    list.push(template);
+    list.push(template.startsWith("/api/") ? template.slice(4) : `/api${template}`);
+  }
+  return byMethod;
+})();
+var SESSION_ID_RE = /^ses_[A-Za-z0-9_-]+$/;
+var warnedAllowAny = false;
+function allowAnyPath() {
+  if (process.env.REMOTE_CONTROL_ALLOW_ANY_PATH !== "1") return false;
+  if (!warnedAllowAny) {
+    warnedAllowAny = true;
+    console.warn(
+      "WARNING: REMOTE_CONTROL_ALLOW_ANY_PATH=1 \u2014 this bridge will forward ANY method/path the relay sends to your local opencode server. Unset it unless you are debugging a new relay route."
+    );
+  }
+  return true;
+}
+function isSafeIdSegment(raw) {
+  if (raw.length === 0 || raw.includes("\0")) return false;
+  let decoded;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    return false;
+  }
+  if (/[/\\\0]/.test(decoded)) return false;
+  return decoded !== "." && decoded !== "..";
+}
+function isSessionIdSegment(raw, boundSessionId) {
+  if (SESSION_ID_RE.test(raw)) return true;
+  return Boolean(boundSessionId) && raw === boundSessionId;
+}
+function matchesTemplate(template, pathname, boundSessionId) {
+  const want = template.split("/");
+  const got = pathname.split("/");
+  if (want.length !== got.length) return false;
+  for (let i = 0; i < want.length; i++) {
+    const segment = want[i];
+    const value = got[i];
+    if (segment.startsWith(":")) {
+      if (!isSafeIdSegment(value)) return false;
+      if (segment === ":id" && !isSessionIdSegment(value, boundSessionId)) return false;
+    } else if (segment !== value) {
+      return false;
+    }
+  }
+  return true;
+}
+function isProxyRequestAllowed(method, path3, boundSessionId) {
+  if (allowAnyPath()) return true;
+  const verb = method.toUpperCase();
+  if (verb !== "GET" && verb !== "POST") return false;
+  const templates = PROXY_TEMPLATES.get(verb);
+  if (!templates) return false;
+  const pathname = path3.split(/[?#]/)[0] ?? "";
+  if (!pathname.startsWith("/")) return false;
+  return templates.some((template) => matchesTemplate(template, pathname, boundSessionId));
+}
+var warnedRejections = /* @__PURE__ */ new Set();
+var MAX_LOGGED_REJECTIONS = 50;
+function warnRejectedProxyRequest(method, path3) {
+  const key = `${method} ${path3.split(/[?#]/)[0] ?? ""}`;
+  if (warnedRejections.has(key) || warnedRejections.size >= MAX_LOGGED_REJECTIONS) return;
+  warnedRejections.add(key);
+  console.warn(
+    `bridge: refused a relay request outside the allowlist: ${key} (set REMOTE_CONTROL_ALLOW_ANY_PATH=1 only if you trust this relay)`
+  );
+}
 var RelayWSClient = class {
   constructor(relayUrl, opencode) {
     this.relayUrl = relayUrl;
@@ -7542,8 +7688,21 @@ var RelayWSClient = class {
       return;
     }
     if (msg.type !== "proxy" || typeof msg.request_id !== "string") return;
+    const method = msg.method ?? "GET";
+    const path3 = msg.path ?? "/";
+    if (!isProxyRequestAllowed(method, path3, this.boundSessionId)) {
+      warnRejectedProxyRequest(method, path3);
+      this.send({
+        type: "proxy_response",
+        request_id: msg.request_id,
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "path not allowed by bridge" })
+      });
+      return;
+    }
     try {
-      const guardError = await this.guardRequest(msg.method ?? "GET", msg.path ?? "/");
+      const guardError = await this.guardRequest(method, path3);
       if (guardError) {
         this.send({
           type: "proxy_response",
@@ -7554,7 +7713,7 @@ var RelayWSClient = class {
         });
         return;
       }
-      const out = await this.opencode.request(msg.method ?? "GET", msg.path ?? "/", msg.body);
+      const out = await this.opencode.request(method, path3, msg.body);
       this.send({ type: "proxy_response", request_id: msg.request_id, ...out });
     } catch {
       this.send({
@@ -7753,10 +7912,61 @@ async function stopBridge(relayUrl, sessionId, apiKey) {
     throw new Error(`relay deleteSession failed: ${status}`);
   }
   clearSessionState(sessionId);
-  terminateBridgeProcess(state.pid);
+  terminateBridgeProcess(state.pid, state.started_at);
 }
-function terminateBridgeProcess(pid) {
+var BRIDGE_ENTRY_RE = /(remote-control-bridge(\.cjs)?|remote-control[/\\]bin[/\\]index\.(js|cjs|mjs)|bridge[/\\](dist[/\\])?index\.(js|cjs|mjs|ts)|[/\\]\.bin[/\\]bridge(\s|$))/;
+var NODE_EXEC_RE = /(^|[/\\])(node|nodejs|node\d+(\.\d+)*|bun|deno|tsx|ts-node)(\.exe)?$/;
+var PID_START_SLACK_MS = 12e4;
+function describeProcess(pid) {
+  const ps = (format) => {
+    try {
+      const out = (0, import_node_child_process3.execFileSync)("ps", ["-p", String(pid), "-o", format], {
+        encoding: "utf8",
+        timeout: 2e3,
+        stdio: ["ignore", "pipe", "ignore"]
+      });
+      const line = out.split("\n")[0]?.trim() ?? "";
+      return line.length > 0 ? line : null;
+    } catch {
+      return null;
+    }
+  };
+  const combined = ps("lstart=,command=");
+  if (combined) {
+    const m = /^(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(\S.*)$/.exec(combined);
+    const started = m ? Date.parse(m[1]) : NaN;
+    if (m && Number.isFinite(started)) return { command: m[2], startedAt: started };
+  }
+  const command = ps("command=");
+  return command ? { command } : null;
+}
+function isBridgeCommand(command) {
+  const exec2 = command.trim().split(/\s+/)[0] ?? "";
+  return NODE_EXEC_RE.test(exec2) && BRIDGE_ENTRY_RE.test(command);
+}
+function refuseToSignal(snapshot, startedAt) {
+  if (!snapshot) return "no such process (already gone)";
+  if (!isBridgeCommand(snapshot.command)) {
+    return `pid now belongs to an unrelated process: ${snapshot.command.slice(0, 120)}`;
+  }
+  if (startedAt !== void 0 && snapshot.startedAt !== void 0 && snapshot.startedAt > startedAt + PID_START_SLACK_MS) {
+    return "process started after this share was registered (recycled pid)";
+  }
+  return null;
+}
+function terminateBridgeProcess(pid, startedAt, inspect = describeProcess) {
   if (!pid || pid === process.pid) return;
+  let snapshot = null;
+  try {
+    snapshot = inspect(pid);
+  } catch {
+    snapshot = null;
+  }
+  const refusal = refuseToSignal(snapshot, startedAt);
+  if (refusal) {
+    console.warn(`bridge stop: not signalling pid ${pid} \u2014 ${refusal}`);
+    return;
+  }
   try {
     process.kill(pid, "SIGTERM");
   } catch {
@@ -7901,5 +8111,6 @@ if (invokedDirectly) {
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   startBridge,
-  stopBridge
+  stopBridge,
+  terminateBridgeProcess
 });

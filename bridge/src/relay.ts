@@ -4,9 +4,13 @@ import { backoffDelay, eventRetryMs, wsPingIntervalMs } from './config.js'
 
 /**
  * Client for the public relay's bridge-facing session API.
- * Every request carries the shared relay secret in `x-api-key`
- * (DELETE requires it per the design spec; POST is expected to be guarded
- * by it in a later relay hardening task, so it is sent there too).
+ *
+ * Auth is per-session, not shared: registration (POST) is public and
+ * rate-limited per IP, while DELETE/GET carry the session's OWN `bridge_token`
+ * in `x-bridge-token`, so only the bridge that registered a session can end it
+ * or read its owner-only fields. `apiKey` is a legacy `x-api-key` header kept
+ * for relays that still gate registration behind a shared secret; the public
+ * relay does not require it.
  */
 export interface RelaySession {
   session_id: string
@@ -76,6 +80,235 @@ export class RelayClient {
     if (res.status !== 200) return { status: res.status }
     return { status: 200, body: (await res.json()) as SessionStatus }
   }
+}
+
+/* -------------------------- bridge-side path allowlist -------------------------- */
+
+/** The only verbs the relay proxy protocol ever legitimately carries. */
+type ProxyMethod = 'GET' | 'POST'
+
+/**
+ * What the relay may ask THIS machine to do.
+ *
+ * A `proxy` frame hands us a method and a path that land verbatim on the local
+ * opencode server — a server that runs shell commands, reads any file and
+ * rewrites the project. The only allowlist used to live in the relay
+ * (relay/src/proxy/adapter.ts), i.e. on a host the bridge merely dials: a
+ * compromised, swapped or DNS-hijacked relay could drive any verb at any path
+ * against every connected user's machine, which is remote code execution on
+ * their laptop. The check has to exist on the side that pays for it being
+ * wrong, so the same surface is re-derived here.
+ *
+ * This table is a SUPERSET of what the relay actually sends: every entry of the
+ * relay's ALLOWED_ROUTES, plus the paths its own handlers build rather than
+ * template (`/project`, `/project/current`, `/permission`, `/session/status`,
+ * and `/session/<ses_…>` from the subagent ancestry walk). Each entry also
+ * covers its `/api/…` twin — the opencode web UI speaks both dialects against
+ * the same server and the relay mounts both.
+ *
+ * ':id' stands for a session id; ':messageID' / ':permissionID' stand for one
+ * opaque path segment (the relay percent-encodes them).
+ */
+const RELAY_PROXY_ROUTES: ReadonlyArray<readonly [ProxyMethod, string]> = [
+  // Session detail + messages (relay ALLOWED_ROUTES; ':id' is the viewer's
+  // bound session or one of its subagents on the child-readable routes).
+  ['GET', '/session/:id'],
+  ['GET', '/session/:id/message'],
+  ['GET', '/session/:id/message/:messageID'],
+  ['POST', '/session/:id/message'],
+  ['POST', '/session/:id/prompt_async'],
+  ['POST', '/session/:id/abort'],
+  ['POST', '/session/:id/command'],
+  ['POST', '/session/:id/shell'],
+  ['POST', '/session/:id/summarize'],
+  ['POST', '/session/:id/revert'],
+  ['POST', '/session/:id/unrevert'],
+  ['POST', '/session/:id/fork'],
+  ['POST', '/session/:id/permissions/:permissionID'],
+  ['GET', '/session/:id/todo'],
+  ['GET', '/session/:id/children'],
+  ['GET', '/session/:id/diff'],
+  // Read-only global metadata the UI needs to boot.
+  ['GET', '/agent'],
+  ['GET', '/command'],
+  ['GET', '/config'],
+  ['GET', '/config/providers'],
+  ['GET', '/provider'],
+  ['GET', '/provider/auth'],
+  ['GET', '/project'],
+  ['GET', '/project/current'],
+  ['GET', '/path'],
+  ['GET', '/vcs'],
+  ['GET', '/mcp'],
+  ['GET', '/lsp'],
+  ['GET', '/formatter'],
+  ['GET', '/experimental/tool'],
+  ['GET', '/experimental/tool/ids'],
+  // Read-only project browsing (the UI's file tree and previews).
+  ['GET', '/file'],
+  ['GET', '/file/content'],
+  ['GET', '/file/status'],
+  ['GET', '/find'],
+  ['GET', '/find/file'],
+  ['GET', '/find/symbol'],
+  // Global v2 surface probed at boot. NOTE: '/global/event' and '/event' are
+  // deliberately absent — the SSE stream is never proxied. The bridge opens it
+  // itself (startEventForwarding) and the relay fans it out locally from that
+  // subscription, so a `proxy` frame asking for it is by definition not the
+  // relay doing its job.
+  ['GET', '/global/health'],
+  ['GET', '/global/config'],
+  // Question / resource / reference APIs the UI bootstrap resolves.
+  ['GET', '/question'],
+  ['POST', '/question'],
+  ['GET', '/experimental/resource'],
+  ['GET', '/experimental/capabilities'],
+  ['GET', '/experimental/workspace'],
+  ['GET', '/api/reference'],
+  ['GET', '/api/agent'],
+  ['GET', '/api/command'],
+  ['GET', '/api/skill'],
+  ['GET', '/skill'],
+  ['GET', '/pty'],
+  ['GET', '/pty/shells'],
+  // UI telemetry.
+  ['POST', '/log'],
+  // Built by the relay's own handlers, not by a route template: the filtered
+  // permission list and the per-session status map.
+  ['GET', '/permission'],
+  ['GET', '/session/status'],
+]
+
+/**
+ * Both dialects of every route, indexed by verb. The relay serves `/session/…`
+ * and `/api/session/…` from the same handlers, and forwards a few routes
+ * (`/api/reference`, `/api/skill`, …) under the prefix verbatim — so each
+ * template is allowed with and without it.
+ */
+const PROXY_TEMPLATES: ReadonlyMap<ProxyMethod, readonly string[]> = (() => {
+  const byMethod = new Map<ProxyMethod, string[]>([
+    ['GET', []],
+    ['POST', []],
+  ])
+  for (const [method, template] of RELAY_PROXY_ROUTES) {
+    const list = byMethod.get(method)!
+    list.push(template)
+    list.push(template.startsWith('/api/') ? template.slice(4) : `/api${template}`)
+  }
+  return byMethod
+})()
+
+/** A real opencode session id — the shape the relay pins every ':id' to. */
+const SESSION_ID_RE = /^ses_[A-Za-z0-9_-]+$/
+
+let warnedAllowAny = false
+
+/**
+ * Forward-compatibility escape hatch. A route added to a newer relay would
+ * otherwise be refused by every bridge that has not been updated, bricking the
+ * feature with no way out — so allow an operator to opt back into the old
+ * "trust the relay" behaviour, loudly and deliberately.
+ */
+function allowAnyPath(): boolean {
+  if (process.env.REMOTE_CONTROL_ALLOW_ANY_PATH !== '1') return false
+  if (!warnedAllowAny) {
+    warnedAllowAny = true
+    console.warn(
+      'WARNING: REMOTE_CONTROL_ALLOW_ANY_PATH=1 — this bridge will forward ANY method/path the relay sends to your local opencode server. Unset it unless you are debugging a new relay route.',
+    )
+  }
+  return true
+}
+
+/**
+ * Whether one path segment may stand in for an id.
+ *
+ * A segment must stay ONE segment: fetch() re-normalises a percent-encoded dot
+ * segment ('%2e%2e') and an encoded slash can reopen the path structure the
+ * template just fixed, so judge the decoded value. A NUL truncates the URL for
+ * anything downstream that speaks C strings. Malformed percent escapes throw
+ * on decode and are refused rather than guessed at.
+ */
+function isSafeIdSegment(raw: string): boolean {
+  if (raw.length === 0 || raw.includes('\0')) return false
+  let decoded: string
+  try {
+    decoded = decodeURIComponent(raw)
+  } catch {
+    return false
+  }
+  if (/[/\\\0]/.test(decoded)) return false
+  return decoded !== '.' && decoded !== '..'
+}
+
+/**
+ * A session id segment: the canonical `ses_…` shape, or this bridge's own
+ * bound session — the relay force-binds ':id' to the session it registered,
+ * and that id is whatever the local opencode server called it.
+ */
+function isSessionIdSegment(raw: string, boundSessionId?: string | null): boolean {
+  if (SESSION_ID_RE.test(raw)) return true
+  return Boolean(boundSessionId) && raw === boundSessionId
+}
+
+function matchesTemplate(template: string, pathname: string, boundSessionId?: string | null): boolean {
+  const want = template.split('/')
+  const got = pathname.split('/')
+  if (want.length !== got.length) return false
+  for (let i = 0; i < want.length; i++) {
+    const segment = want[i]!
+    const value = got[i]!
+    if (segment.startsWith(':')) {
+      if (!isSafeIdSegment(value)) return false
+      if (segment === ':id' && !isSessionIdSegment(value, boundSessionId)) return false
+    } else if (segment !== value) {
+      return false
+    }
+  }
+  return true
+}
+
+/**
+ * Whether a relay-supplied method+path may be forwarded to local opencode.
+ * Exported so the allowlist can be tested directly, without a socket.
+ *
+ * `boundSessionId` is this bridge's own session (see isSessionIdSegment).
+ */
+export function isProxyRequestAllowed(
+  method: string,
+  path: string,
+  boundSessionId?: string | null,
+): boolean {
+  if (allowAnyPath()) return true
+  const verb = method.toUpperCase()
+  if (verb !== 'GET' && verb !== 'POST') return false
+  const templates = PROXY_TEMPLATES.get(verb)
+  if (!templates) return false
+  // The relay appends its own ?directory=… to every forwarded path, so match
+  // the pathname alone — a query can only ever reach the endpoint the path
+  // already named, and a fragment never leaves fetch() at all.
+  const pathname = path.split(/[?#]/)[0] ?? ''
+  if (!pathname.startsWith('/')) return false
+  return templates.some((template) => matchesTemplate(template, pathname, boundSessionId))
+}
+
+/** method+path pairs already reported, so one confused relay cannot spam the
+ * log (and cannot grow this set without bound either). */
+const warnedRejections = new Set<string>()
+const MAX_LOGGED_REJECTIONS = 50
+
+/**
+ * Report a refused proxy request exactly once. A relay that asks for something
+ * outside the contract is either compromised or newer than this bridge — both
+ * are worth seeing in the terminal instead of failing silently.
+ */
+function warnRejectedProxyRequest(method: string, path: string): void {
+  const key = `${method} ${path.split(/[?#]/)[0] ?? ''}`
+  if (warnedRejections.has(key) || warnedRejections.size >= MAX_LOGGED_REJECTIONS) return
+  warnedRejections.add(key)
+  console.warn(
+    `bridge: refused a relay request outside the allowlist: ${key} (set REMOTE_CONTROL_ALLOW_ANY_PATH=1 only if you trust this relay)`,
+  )
 }
 
 /**
@@ -286,8 +519,23 @@ export class RelayWSClient {
       return
     }
     if (msg.type !== 'proxy' || typeof msg.request_id !== 'string') return
+    const method = msg.method ?? 'GET'
+    const path = msg.path ?? '/'
+    // Check before opencode is touched at all: the relay does not get to pick
+    // which verb runs against which local endpoint (see RELAY_PROXY_ROUTES).
+    if (!isProxyRequestAllowed(method, path, this.boundSessionId)) {
+      warnRejectedProxyRequest(method, path)
+      this.send({
+        type: 'proxy_response',
+        request_id: msg.request_id,
+        status: 403,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'path not allowed by bridge' }),
+      })
+      return
+    }
     try {
-      const guardError = await this.guardRequest(msg.method ?? 'GET', msg.path ?? '/')
+      const guardError = await this.guardRequest(method, path)
       if (guardError) {
         this.send({
           type: 'proxy_response',
@@ -298,7 +546,7 @@ export class RelayWSClient {
         })
         return
       }
-      const out = await this.opencode.request(msg.method ?? 'GET', msg.path ?? '/', msg.body)
+      const out = await this.opencode.request(method, path, msg.body)
       this.send({ type: 'proxy_response', request_id: msg.request_id, ...out })
     } catch {
       this.send({
