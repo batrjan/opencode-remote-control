@@ -64,6 +64,21 @@ jobs:
 
       - run: npm ci
 
+      # NEITHER suite is self-contained: they test the two halves against each
+      # other across the package boundary. Four bridge files (keepalive,
+      # lifecycle, stop-teardown, reconnect-after-restart) start a REAL relay
+      # via ../../relay/src/server, and several relay files drive a REAL bridge
+      # via ../../bridge/src/relay. Each therefore needs the other package's
+      # dependencies resolvable. Anyone running this locally has both installed
+      # already, which is exactly why it stayed invisible until CI ran on a
+      # clean checkout and vitest reported "Failed to load url express".
+      # Installed for both jobs rather than only the one that happens to need
+      # it today: a new cross-package import should not turn into a confusing
+      # module-resolution failure in the other matrix leg.
+      - name: Install the other package's dependencies (cross-package tests)
+        run: npm ci
+        working-directory: ${{ matrix.package == 'relay' && 'bridge' || 'relay' }}
+
       - name: Tests
         run: npm test -- ${{ matrix.test_args }}
 
