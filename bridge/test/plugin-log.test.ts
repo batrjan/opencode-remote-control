@@ -66,7 +66,14 @@ test('the bridge log (share URL + access code) is private to the user, never /tm
   try {
     const file = logPath({ HOME: home })
     expect(file.startsWith(home)).toBe(true)
-    expect(file.startsWith('/tmp/')).toBe(false)
+    // What the original bug was: a FIXED name directly in the shared temp
+    // directory — world-readable, and open to a symlink swap on a multi-user
+    // box. The log must sit in the user's own state directory instead. Asserted
+    // as "not loose in the temp root" rather than "not under /tmp", because the
+    // fake HOME above IS a temp directory and on Linux tmpdir() is /tmp, which
+    // made the old spelling of this check fail on its own fixture.
+    expect(path.dirname(file)).not.toBe(tmpdir())
+    expect(path.dirname(file)).toBe(path.join(home, '.agents', 'skills', 'remote-control', 'state'))
     // Fresh: dir 0700, file 0600.
     closeSync(openLog(file))
     expect(statSync(path.dirname(file)).mode & 0o777).toBe(0o700)
