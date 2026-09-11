@@ -27,9 +27,51 @@ official OpenCode web UI.
                                                   └──────────────┘
 ```
 
-The relay never sees your code: it stores only salted hashes of the access code and
-tokens, rate-limits code guessing, and the proxy adapter force-binds every viewer request
-to the session that issued the viewer token (allowlisted OpenCode endpoints only).
+The relay holds no plaintext secrets: it stores only salted hashes of the access code and
+of every token, rate-limits code guessing, and the proxy adapter force-binds each viewer
+request to the session that issued the viewer token (allowlisted OpenCode endpoints only).
+What it does *not* do is limit a viewer to looking — see below.
+
+## What sharing grants
+
+A share is **full interactive control of the session**, not a read-only view. The proxy
+allowlist is the surface the official OpenCode web UI drives, and that surface writes:
+anyone holding the link *and* the code acts on the machine running OpenCode, as you.
+
+| A viewer can | Through |
+| ------------ | ------- |
+| Run arbitrary shell commands in the project | `POST /session/:id/shell`, `POST /session/:id/command` |
+| Start arbitrary agent turns — editing files, running tools, spending your model credits | `POST /session/:id/message`, `POST /session/:id/prompt_async` |
+| Read and search any file the project can reach | `GET /file/content`, `GET /find`, `GET /find/file`, `GET /find/symbol` |
+| Answer permission prompts raised by that session | `POST /session/:id/permissions/:permissionID` |
+
+So the access code is a credential to the project directory. Hand it only to someone you
+would let sit at your keyboard, and stop the share when they are done.
+
+| What protects the share | Detail |
+| ----------------------- | ------ |
+| Access code | 6 characters from a 34-symbol alphabet (`A–Z0–9` minus `O` and `I`) ≈ 30 bits. Small enough that it only holds up because guessing is throttled. |
+| Per-IP activation limits | 5 attempts per minute and 50 per hour, per client address — which is only the real client if `RELAY_TRUST_PROXY` matches the deployment (see [DEPLOY.md](DEPLOY.md)). |
+| Per-session lockout | 20 failed activations against one session within 15 minutes lock activation for that session regardless of source IP — the defense against grinding a known session URL from many addresses. A specific wrong code is refused outright after 10 tries. |
+| Wrong-code delay | Every rejected code is answered after a ~1 s delay (`ACTIVATE_FAIL_DELAY_MS`), so each guess costs real time. |
+| Forced session binding | The proxy routes only allowlisted paths and rewrites the `:id` in every one of them to the token's own session, so a viewer can never reach another share (subagent sessions of the shared one stay readable — they belong to it). The bridge re-checks each forwarded path against its own allowlist before touching OpenCode. |
+| Viewer tokens | HttpOnly, `SameSite=Strict`, `Secure` cookie; salted-hashed at the relay; expire after 24 h of inactivity (sliding) and capped at 32 per session, the least-recently-used evicted first — a share cannot accumulate viewers forever. |
+| Transport and storage | TLS terminates at nginx; the persisted session set is encrypted at rest (AES-256-GCM) with a key kept off the state volume. |
+
+What it does **not** protect against:
+
+- **Someone you gave the code to.** There is no per-viewer identity, no read-only mode and
+  no per-person audit trail. Sharing is trusting; the only revocation is ending the share.
+- **A compromised relay host.** It keeps no plaintext secrets, but it mints the access code
+  and routes every proxied request, so it sees a live share's traffic — prompts, command
+  output, any file a viewer opens — and can issue requests of its own. The bridge's own path
+  allowlist is the defense-in-depth here: anything outside it is refused with a 403, so a
+  hostile relay reaches no more of the OpenCode API than a viewer already can. It cannot
+  make that surface harmless — the surface runs commands.
+
+Ending a share: `/remote-control/stop` (deletes the relay session, revokes the code and
+every viewer token, and disconnects the bridge), quitting OpenCode (the watchdog does the
+same), or leaving it alone — the relay reaps a session after 24 h without bridge traffic.
 
 ## Quick start
 
@@ -129,10 +171,10 @@ The TUI itself exposes no HTTP port, so the bridge starts its own
 | Path      | What it is                                                                                  |
 | --------- | ------------------------------------------------------------------------------------------- |
 | `relay/`  | Public server: Express API, in-memory session store, WS bridge endpoint, proxy adapter, static viewer UI. Ships as a Docker image. |
-| `bridge/` | Local CLI (`start` / `stop` / `status`) that registers the session, holds the WS to the relay, executes proxied requests against local OpenCode, and forwards SSE events. |
+| `bridge/` | Local CLI (`start` / `stop` / `status`) that registers the session, holds the WS to the relay, executes proxied requests against local OpenCode (only those on its own path allowlist), and forwards SSE events. |
 | `plugin/` | Two OpenCode plugin entries over one implementation: `remote-control.js` (TUI slash commands), `server.js` (desktop GUI / web UI / `opencode run`), `bridge-runner.js` (shared actions). The prebuilt bridge (`plugin/bridge/remote-control-bridge.cjs`) ships in the package — no build step. |
 | `nginx/`  | Host nginx vhost (TLS termination → `127.0.0.1:8080`, authoritative `X-Forwarded-For`).      |
-| `.github/workflows/deploy.yml` | Push to `main`: build relay image → GHCR → SSH deploy. See DEPLOY.md.          |
+| `.github/workflows/deploy.yml` | Push to `main`: run the test suites → ship `relay/` over SSH → build and restart on the host → health check (or automatic rollback). See DEPLOY.md. |
 
 ## Relay HTTP surface
 
@@ -148,6 +190,13 @@ The TUI itself exposes no HTTP port, so the bridge starts its own
 | `GET /join`, `GET /terminal` | none                       | Code-entry page and the viewer UI.               |
 | `GET /api/health`         | none                          | Static `{healthy:true}` so the viewer UI selects the base-URL-prefixed API dialect. |
 
+Request sizes are capped per side, because the two sides want opposite things: the
+unauthenticated JSON API (`POST /api/sessions`, `POST /api/activate`) accepts at most
+**32 KB**, while authenticated proxy traffic gets **25 MB** so a viewer can paste a whole
+file into a prompt. The proxy's parser is mounted behind the viewer check, so an anonymous
+request can never make the relay buffer the larger limit. Anything over the cap gets
+`413 {"error":"payload too large"}`.
+
 ## Development
 
 Node.js ≥ 22. Each package builds and tests independently:
@@ -157,15 +206,25 @@ cd relay  && npm install && npm test && npm run build   # vitest + tsc → dist/
 cd bridge && npm install && npm test && npm run build
 ```
 
-Relay env vars (see `relay/.env.example`): 
-`PORT` (default 8080), `ACTIVATE_FAIL_DELAY_MS` (brute-force brake, default 1000),
-`RELAY_WS_PING_INTERVAL_MS` / `RELAY_WS_PONG_GRACE_ROUNDS` / `RELAY_SSE_HEARTBEAT_MS`
-(keep-alive, see above).
+Env vars (relay defaults also in `relay/.env.example`):
+
+| Var | Side | Effect |
+| --- | ---- | ------ |
+| `PORT` | relay | Listen port (default 8080). |
+| `ACTIVATE_FAIL_DELAY_MS` | relay | Delay before a wrong access code is rejected (brute-force brake, default 1000). |
+| `RELAY_WS_PING_INTERVAL_MS`, `RELAY_WS_PONG_GRACE_ROUNDS`, `RELAY_SSE_HEARTBEAT_MS` | relay | Keep-alive tuning — see the table above. |
+| `RELAY_STATE_FILE`, `RELAY_STATE_KEY` | relay | Where the session set is persisted, and the key it is encrypted with. Empty path = in-memory only. |
+| `RELAY_TRUST_PROXY` | relay | Which proxy hop's `X-Forwarded-For` to believe. Every per-IP limit keys on it, so a wrong value makes them global — see [DEPLOY.md](DEPLOY.md). |
+| `OPENCODE_REMOTE_CONTROL_RELAY`, `REMOTE_CONTROL_RELAY` | plugin, bridge | Point the slash commands at a self-hosted relay instead of the public one (`https://opencode.b4tr.net`); the first set wins. The value reaches a spawned command line, so it must parse as `http://` or `https://` — anything else warns and falls back to the default; trailing slashes are stripped. |
+| `REMOTE_CONTROL_WS_PING_INTERVAL_MS`, `REMOTE_CONTROL_RECONNECT_BASE_MS`, `REMOTE_CONTROL_RECONNECT_MAX_MS`, `REMOTE_CONTROL_EVENT_RETRY_MS` | bridge | Keep-alive tuning — see the table above. |
+| `REMOTE_CONTROL_ALLOW_ANY_PATH=1` | bridge | Escape hatch: turns off the bridge's own path allowlist (it warns once, loudly), so the bridge runs whatever method and path the relay sends. This removes a safety net and exists only so an older bridge can still serve a newer relay that added a route. Leave it unset. |
 
 ## Deployment
 
-Push to `main` deploys automatically (build → GHCR → SSH). Server bootstrap, TLS,
-nginx, and rollback: [DEPLOY.md](DEPLOY.md).
+Push to `main` deploys automatically: the tests run first, the build context is shipped
+over SSH, the host builds the image and restarts the relay, and a container that fails its
+health check is rolled back to the previously tagged image. Server bootstrap, TLS, nginx
+and manual rollback: [DEPLOY.md](DEPLOY.md).
 
 ## Documentation
 

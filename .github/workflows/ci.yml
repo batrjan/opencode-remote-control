@@ -1,0 +1,120 @@
+name: ci
+
+# The suite (relay + bridge) and the bundle-freshness check.
+#
+# `workflow_call` is the point of this file: deploy.yml calls it as its first
+# job and gates on it. Deploying used to start from `push: main` alone, so the
+# ~180 tests in this repo guarded nothing — a red main still shipped to
+# production. Running the SAME workflow for PRs and as the deploy gate means
+# the check a reviewer sees green is literally the check the deploy waits on.
+#
+# A push to main therefore runs this twice (once directly, once through
+# deploy.yml). That is deliberate: the standalone run keeps a plain green/red
+# badge on main even when deploy.yml is skipped or disabled, and the suite is
+# seconds of runner time.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Report both packages on a red run; knowing only "relay failed" hides
+      # whether the bridge is fine.
+      fail-fast: false
+      matrix:
+        include:
+          - package: relay
+            # relay/test/docker.test.ts shells out to a real `docker build`.
+            # It self-skips where docker is missing (test.runIf), but a GitHub
+            # runner HAS docker, so in CI it would always run — pulling
+            # node:22-slim from Docker Hub (unauthenticated, rate-limited) and
+            # running npm ci inside the image on every PR. Worse, it builds
+            # with the Dockerfile's default UI_SOURCE=prebuilt against a clean
+            # checkout, where relay/public holds only index.html + join.html
+            # (relay/.gitignore drops the ~84MB of built assets) — so it would
+            # spend minutes proving a UI-less image builds, which is not the
+            # image deploy.yml ships (--build-arg UI_SOURCE=source). Excluded
+            # here; it still runs locally for anyone with docker.
+            #
+            # A CLI --exclude is APPENDED to vitest's built-in exclude list
+            # (verified on the pinned vitest 2.1.9), so node_modules and dist
+            # stay excluded without restating them.
+            test_args: --exclude 'test/docker.test.ts'
+          - package: bridge
+            test_args: ''
+    defaults:
+      run:
+        working-directory: ${{ matrix.package }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ matrix.package }}/package-lock.json
+
+      - run: npm ci
+
+      - name: Tests
+        run: npm test -- ${{ matrix.test_args }}
+
+      # tsc --noEmit, not `npm run build`: vitest type-checks nothing, so a
+      # type error in src/ passes the suite and only surfaces when the relay
+      # image is built on the production host.
+      - name: Typecheck
+        run: npx tsc -p tsconfig.json --noEmit
+
+  bundle:
+    name: bridge bundle matches bridge/src
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bridge/package-lock.json
+
+      - run: npm ci
+        working-directory: bridge
+
+      # plugin/bridge/remote-control-bridge.cjs is committed and is what users
+      # actually execute (the plugin spawns it directly), so a bridge/src change
+      # that was never re-bundled ships as the old behaviour, silently. Rebuild
+      # it and fail if the committed bytes differ.
+      #
+      # Byte comparison is safe because the build is pinned: esbuild is an exact
+      # version in bridge/package.json, npm ci fixes ws/commander from the
+      # lockfile, and build-bridge-bundle.mjs pins esbuild's working directory
+      # so its per-module path comments do not depend on where the repo sits.
+      - name: Rebuild the committed bundle
+        run: npm run bundle
+        working-directory: bridge
+
+      # --stat, not a plain diff: the bundle is one 260KB machine-generated
+      # file and printing its diff would bury the error message.
+      - name: Fail if the committed bundle is stale
+        run: |
+          if ! git diff --stat --exit-code -- plugin/bridge/remote-control-bridge.cjs; then
+            echo "::error file=plugin/bridge/remote-control-bridge.cjs::Stale bundle. Run 'npm run bundle' in bridge/ and commit the result."
+            exit 1
+          fi
+
+      # So a mismatch is one download away from being fixed, rather than
+      # requiring the contributor to reproduce the build environment.
+      - name: Upload the freshly built bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-control-bridge-cjs
+          path: plugin/bridge/remote-control-bridge.cjs

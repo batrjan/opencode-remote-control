@@ -43,18 +43,62 @@ echo "PORT=8080" > .env
 
 ## nginx (one-time)
 
+The vhost references rate-limit zones that must be defined in the `http`
+context, so the `conf.d` file has to be installed **first** — `nginx -t` fails
+with `[emerg] unknown limit_req_zone "oc_activate"` otherwise. `nginx.conf`
+includes `conf.d/*.conf` before `sites-enabled/*`, which is what makes this
+order work at all.
+
 ```bash
-sudo cp nginx/opencode.b4tr.net.conf /etc/nginx/sites-available/
-sudo ln -s /etc/nginx/sites-available/opencode.b4tr.net.conf /etc/nginx/sites-enabled/
+sudo cp nginx/conf.d/opencode-remote-control-limits.conf /etc/nginx/conf.d/
+sudo cp nginx/opencode.b4tr.net.conf /etc/nginx/sites-available/opencode.b4tr.net
+sudo ln -s /etc/nginx/sites-available/opencode.b4tr.net /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
+What the vhost adds beyond TLS termination:
+
+| Directive | Why |
+| --------- | --- |
+| `client_max_body_size 32m` (server), `64k` on `/api/activate` and `/api/sessions` | nginx's 1 MB default capped a viewer's prompt long before the relay's own 25 MB limit; the public endpoints are cut the other way, since a registration is a few hundred bytes. |
+| `limit_req zone=oc_activate` (20 r/m), `oc_register` (60 r/m), `oc_general` (50 r/s, burst 200) | A code-guessing flood is stopped at the edge instead of costing the relay a hash and a one-second timer per attempt. The relay's own limiter is still the security control; this is the shield in front of it. |
+| `limit_conn oc_conn 256` | One client cannot park thousands of SSE sockets. |
+| No limits on `location = /bridge` | One long-lived socket per share; throttling a reconnect storm would keep shares down rather than protect anything. |
+
+`events { worker_connections }` in `nginx.conf` also wants raising from
+Ubuntu's default 768 — every viewer tab holds two SSE connections open.
+
 ## Deploy
 
-Push to `main` triggers the GitHub Actions workflow: ship `relay/` to the host
-over SSH → `docker build` there → `docker compose up -d --force-recreate relay`
-→ wait for `/health`. No registry is involved, so the only secrets needed are
-the three SSH ones above.
+Push to `main` triggers the GitHub Actions workflow. It gates on the tests and
+it undoes itself when the new container does not come up:
+
+1. **Test.** The deploy job `needs` a first job that calls `ci.yml`: the relay
+   and bridge suites, `tsc --noEmit` for both, and the check that the committed
+   bridge bundle matches `bridge/src`. Anything red stops the run before the
+   host is touched. `ci.yml` is *called*, not copied, so the check a reviewer
+   approved on the PR is the same check the deploy waits on.
+2. **Ship.** `relay/` is copied to `~/rc-build/<sha>/` over SSH.
+3. **Tag the outgoing image.** The running `relay-local:amd64` is tagged
+   `relay-local:rollback-<YYYYmmdd-HHMMSS>` *before* the build moves the tag —
+   that image is what step 6 restores. A fresh host has no previous image, so
+   such a deploy logs that it has no rollback target.
+4. **Build and restart.** The host runs `docker build` itself, then
+   `docker compose up -d --force-recreate relay`.
+5. **Health check.** Poll `http://127.0.0.1:8080/health` 20 times, 3 s apart
+   (~1 minute), until the new container answers.
+6. **Roll back if it never answers.** The workflow dumps the failed
+   container's logs, points `relay-local:amd64` back at the rollback tag (so a
+   later bare `docker compose up` on the host cannot resurrect the broken
+   build), recreates the container from that tag, and waits for *it* to pass
+   the same health check. The job then fails whatever the outcome — what was
+   pushed is not what is running — and the image/context cleanup is skipped on
+   this path so the rollback tags survive for inspection. Two cases still need
+   hands on the host, and both say so loudly in the log: a rollback that is
+   itself unhealthy, and a first deploy — no previous image exists, so there is
+   nothing to roll back to and production is left on the broken build.
+
+No registry is involved, so the only secrets needed are the three SSH ones above.
 
 The host builds the image itself and `docker-compose.yml` defaults to it:
 
@@ -143,6 +187,10 @@ docker compose up -d
 ```
 
 ## Rollback
+
+A deploy whose new container fails its health check rolls itself back (step 6
+above). The manual path below is for the other case: a deploy that came up
+healthy and then turned out to be wrong.
 
 Each deploy tags the outgoing image before replacing it, and the three newest
 tags are kept:

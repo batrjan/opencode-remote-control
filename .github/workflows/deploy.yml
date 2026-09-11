@@ -15,7 +15,19 @@ on:
 # building there removes the registry from the path entirely and needs nothing
 # beyond the SSH secrets that already exist.
 jobs:
+  # The gate. This workflow used to go straight from `push: main` to building
+  # the image and recreating the production container, so the ~180 tests in the
+  # repo never ran against the commit being shipped — a red main deployed
+  # exactly like a green one. ci.yml is CALLED rather than copied so the check
+  # a reviewer approved on the PR and the check the deploy waits on cannot
+  # drift apart.
+  test:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     permissions: {}
     concurrency:
@@ -48,7 +60,35 @@ jobs:
             cd "$HOME/rc-build/$SHA/relay"
 
             # Keep the running image reachable for a rollback before the tag moves.
-            docker tag relay-local:amd64 "relay-local:rollback-$(date +%Y%m%d-%H%M)" || true
+            # The stamp carries seconds, not just minutes: two deploys inside the
+            # same minute collided on one tag, and the second overwrote the only
+            # pointer to the last good image with the first deploy's build.
+            ROLLBACK_TAG="relay-local:rollback-$(date +%Y%m%d-%H%M%S)"
+            if docker tag relay-local:amd64 "$ROLLBACK_TAG"; then
+              echo "rollback target: $ROLLBACK_TAG"
+            else
+              # First deploy on a fresh host: there is no previous image at all.
+              echo "no relay-local:amd64 yet — this deploy has no rollback target" >&2
+              ROLLBACK_TAG=""
+            fi
+
+            # Poll /health until the relay answers. A function, so the rollback
+            # can reuse it and so every failing probe stays inside an `if` —
+            # a bare failing command under `set -e` would end the script before
+            # the rollback ran, which is half of why the old rollback never did.
+            # POSIX sh only: ssh-action runs a plain login shell, so no `local`.
+            wait_healthy() {
+              i=1
+              while [ "$i" -le 20 ]; do
+                if curl -fsS -m 3 http://127.0.0.1:8080/health; then
+                  echo
+                  return 0
+                fi
+                sleep 3
+                i=$((i + 1))
+              done
+              return 1
+            }
 
             # A clean checkout has no relay/public (the UI assets are gitignored),
             # so the image builds the opencode web UI from the pinned upstream ref.
@@ -69,21 +109,58 @@ jobs:
               echo "RELAY_STATE_KEY=$(openssl rand -hex 32)" >> .env
               echo "generated RELAY_STATE_KEY in .env"
             fi
-            docker compose up -d --force-recreate relay
-
-            # Fail the deploy if the new container never becomes healthy.
-            for i in $(seq 1 20); do
-              if curl -fsS -m 3 http://127.0.0.1:8080/health; then
-                echo
-                echo "relay healthy"
-                ok=1
-                break
+            # Fail the deploy if the new container never becomes healthy — and
+            # actually roll back. The old script logged "rolling back" and then
+            # exited: --force-recreate had already replaced the running
+            # container, so a failed deploy left production serving the broken
+            # build while the deploy log claimed it had been undone.
+            #
+            # The recreate itself sits INSIDE the `if`, which is what suspends
+            # `set -e` for it. As a bare command it was the one failure the
+            # rollback could not survive: a compose error (bad image, port
+            # taken, OOM) aborted the script on that very line, so the rollback
+            # below never ran at all — the case it exists for.
+            #
+            # RELAY_IMAGE is pinned explicitly rather than left to compose's
+            # `${RELAY_IMAGE:-relay-local:amd64}` default: a pin left in the
+            # host's .env by an earlier manual rollback (DEPLOY.md documents
+            # exactly that) silently kept recreating the OLD image, and the
+            # health probe then passed — a green deploy that shipped nothing.
+            if RELAY_IMAGE=relay-local:amd64 docker compose up -d --force-recreate relay && wait_healthy; then
+              # Health says "a relay is up", not "OUR relay is up". Assert the
+              # running container is really the image this deploy built.
+              RUNNING=$(docker inspect -f '{{.Config.Image}}' \
+                "$(docker compose ps -q relay)" 2>/dev/null || echo unknown)
+              if [ "$RUNNING" != "relay-local:amd64" ]; then
+                echo "DEPLOY MISMATCH: container is running '$RUNNING', not relay-local:amd64" >&2
+                exit 1
               fi
-              sleep 3
-            done
-            if [ -z "$ok" ]; then
-              echo "relay did not become healthy — rolling back" >&2
+              echo "relay healthy (running $RUNNING)"
+            else
+              echo "relay did not become healthy" >&2
               docker compose logs --tail 50 relay >&2 || true
+
+              if [ -z "$ROLLBACK_TAG" ]; then
+                echo "NO ROLLBACK TARGET — production is running the broken build" >&2
+                exit 1
+              fi
+
+              echo "rolling back to $ROLLBACK_TAG" >&2
+              # Move the default tag back to the last good image as well as
+              # recreating from the rollback tag explicitly: docker-compose.yml
+              # reads `image: ${RELAY_IMAGE:-relay-local:amd64}`, so leaving
+              # relay-local:amd64 pointed at the broken build would let any later
+              # plain `docker compose up` on the host bring it straight back.
+              docker tag "$ROLLBACK_TAG" relay-local:amd64 \
+                || echo "warning: could not move relay-local:amd64 back to $ROLLBACK_TAG" >&2
+              if RELAY_IMAGE="$ROLLBACK_TAG" docker compose up -d --force-recreate relay && wait_healthy; then
+                echo "ROLLED BACK: production is serving $ROLLBACK_TAG; this build was NOT deployed" >&2
+              else
+                echo "ROLLBACK FAILED: relay is not healthy on $ROLLBACK_TAG either — production is DOWN" >&2
+                docker compose logs --tail 50 relay >&2 || true
+              fi
+              # Red either way: what was pushed is not what is running. The
+              # cleanup below is deliberately skipped so the rollback tags stay.
               exit 1
             fi
 
