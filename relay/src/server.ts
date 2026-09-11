@@ -197,10 +197,25 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
  */
 const PUBLIC_BODY_LIMIT = '32kb'
 
-/** The official UI's canonical session URL: /<base64(directory)>/session/<id>. */
+/**
+ * The official UI's canonical session URL: /<base64url(directory)>/session/<id>.
+ *
+ * BASE64URL, unpadded — that is the UI's own spelling, not a stylistic choice.
+ * Its encoder is `btoa(x).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'')`
+ * and its decoder undoes exactly that, so anything else fails to parse and the
+ * viewer is dropped on an empty project list ("nothing here yet") with an
+ * invalid-directory toast, instead of the session they were invited to.
+ *
+ * This used to emit standard base64 through encodeURIComponent, which broke in
+ * two ways. The padding became %3D%3D and the UI's decoder choked on it — and
+ * because padding depends on the directory's length modulo 3, a share worked or
+ * failed purely on how long the project path happened to be. A '/' in the
+ * base64 alphabet was worse: percent-encoded it still broke the decoder, and
+ * unencoded it would split the path segment outright. base64url has neither
+ * problem and needs no escaping at all.
+ */
 function sessionUiUrl(session: { id: string; directory: string }): string {
-  const dir = Buffer.from(session.directory, 'utf8').toString('base64')
-  return `/${encodeURIComponent(dir)}/session/${session.id}`
+  return `/${Buffer.from(session.directory, 'utf8').toString('base64url')}/session/${session.id}`
 }
 
 let cachedJoinTemplate: string | undefined
