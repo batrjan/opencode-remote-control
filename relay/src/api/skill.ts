@@ -54,6 +54,11 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
         typeof title === 'string' ? title : '',
         ip,
       )
+      // Consume the registration slot only now that a session really exists:
+      // checking used to increment, so a request that ended in 409 below (a
+      // duplicate id — a bridge retrying its own registration, typically) burned
+      // an hour of the caller's quota while creating nothing.
+      store.commitRegistration(ip)
       return res.status(201).json(result)
     } catch (err) {
       if (err instanceof Error && err.message === 'session exists') {

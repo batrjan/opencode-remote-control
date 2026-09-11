@@ -57,6 +57,21 @@ export const config = {
    */
   orphanReapMs: 24 * 3_600_000,
   orphanSweepIntervalMs: 15 * 60_000, // sweep every 15 minutes
+  /**
+   * Viewer tokens are a SLIDING window: a token that has not been used for
+   * this long stops authenticating and is pruned. Without it a viewer kept
+   * access for the entire life of the share and the viewer map grew forever.
+   * Matched to orphanReapMs so a viewer token never outlives the session it
+   * belongs to (both 24 hours).
+   */
+  viewerIdleTtlMs: 24 * 3_600_000,
+  /**
+   * Max concurrent viewer tokens one session may hold. Every activation mints
+   * a fresh token (a reload, a second device, a re-join after a cookie loss),
+   * so the map is unbounded without a cap. At the cap the least-recently-used
+   * token is evicted — an idle tab loses access before an active one.
+   */
+  maxViewersPerSession: 32,
 } as const
 
 /**

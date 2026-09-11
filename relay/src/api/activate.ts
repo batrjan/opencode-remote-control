@@ -1,6 +1,6 @@
 import express from 'express'
 import type { Store } from '../store.js'
-import { activateFailDelayMs } from '../config.js'
+import { activateFailDelayMs, config } from '../config.js'
 
 /**
  * POST /api/activate — exchange an access code for a viewer token.
@@ -27,6 +27,15 @@ export function activateRouter(store: Store) {
         httpOnly: true,
         secure: true,
         sameSite: 'strict',
+        // Without maxAge this was a browser-session cookie: it died on browser
+        // restart while the token stayed valid server-side, so the viewer was
+        // bounced back to the join page for no reason. Match the store's viewer
+        // idle window instead — the next activation issues a fresh cookie, so
+        // the two expire together.
+        maxAge: config.viewerIdleTtlMs,
+        // Explicit: the token is used on /session/* and /api/* alike, so it must
+        // not inherit a path from wherever /api/activate happens to be mounted.
+        path: '/',
       })
       return res.json({ session_id, viewer_token })
     } catch (err) {

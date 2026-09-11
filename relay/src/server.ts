@@ -94,7 +94,12 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
     res.setHeader('Referrer-Policy', 'no-referrer')
     next()
   })
-  app.use(express.json())
+  // NO global express.json(): a single parser cannot serve both sides of this
+  // app. Its 100 KB default is far too loose for the UNAUTHENTICATED public
+  // endpoints (anyone may POST a registration or an activation attempt) and
+  // far too tight for the authenticated proxy, where a viewer legitimately
+  // pastes a file's worth of text into a prompt. Each side mounts its own
+  // parser instead, so nothing is parsed on a route that never reads a body.
   app.use('/health', healthRouter(store))
   // The opencode web UI probes /api/health to detect the server API dialect.
   // Answering {healthy:true} selects the v1 client, which prefixes every
@@ -106,8 +111,12 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   app.get('/api/health', (_req, res) => {
     res.json({ healthy: true })
   })
-  app.use('/api/activate', activateRouter(store))
-  app.use('/api/sessions', skillRouter(store, bridge))
+  // Public, unauthenticated writers: anything a real bridge sends here is a
+  // few hundred bytes (session id, directory, title, access code), so cap the
+  // body well below express's default rather than letting an anonymous caller
+  // make the relay buffer 100 KB per request.
+  app.use('/api/activate', express.json({ limit: PUBLIC_BODY_LIMIT }), activateRouter(store))
+  app.use('/api/sessions', express.json({ limit: PUBLIC_BODY_LIMIT }), skillRouter(store, bridge))
   // The root URL is the viewer entry point; the SPA itself lives at /terminal.
   // Registered before static so express.static does not serve index.html here.
   app.get('/', (_req, res) => res.redirect('/join'))
@@ -125,6 +134,10 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // /<base64(directory)>/session/<id> — the official UI parses the first
   // segment as base64(directory), so a raw session id here would be decoded
   // into a garbage directory and break the whole bootstrap.
+  // NOTE: this and the two routes below use Express 4's inline-regex path
+  // syntax ('/:id(ses_...)'), which Express 5 removed (path-to-regexp 6+
+  // throws on it). These three routes are what pin the project to express ^4;
+  // a v5 upgrade must first rewrite them (e.g. match inside the handler).
   app.get('/:id(ses_[A-Za-z0-9_]+)', (req, res) => {
     const session = store.getSession(req.params.id)
     if (!session) return res.status(404).type('html').send(endedHtml())
@@ -165,8 +178,24 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // everything else falls through to this 404. Because it is registered after
   // every relay route (/api/*, /join, /terminal, /:id), those keep working.
   if (bridge) app.use(proxyAdapter(store, bridge))
+  // Body-size failures as JSON. express's default handler answers an HTML
+  // error page, which every caller here (the bridge's fetch, the viewer's UI)
+  // parses as JSON and reports as an opaque failure instead of "too large".
+  // 'entity.too.large' is raw-body's code for exceeding a parser's limit.
+  app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if ((err as { type?: unknown } | null)?.type !== 'entity.too.large') return next(err)
+    if (res.headersSent) return next(err)
+    return res.status(413).json({ error: 'payload too large' })
+  })
   return app
 }
+
+/**
+ * Body cap for the unauthenticated public API (/api/activate, /api/sessions).
+ * Kept local rather than in config.ts: it is a property of these two routes,
+ * not a tunable of the relay.
+ */
+const PUBLIC_BODY_LIMIT = '32kb'
 
 /** The official UI's canonical session URL: /<base64(directory)>/session/<id>. */
 function sessionUiUrl(session: { id: string; directory: string }): string {

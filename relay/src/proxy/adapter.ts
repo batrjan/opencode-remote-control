@@ -89,10 +89,12 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   // the owner's other worktrees, disclosing unrelated project paths. The UI
   // boots without it.
 
+  // '/api/reference' has no bare twin ('/reference' is not an opencode path),
+  // so it is listed in its /api spelling. Everything else is listed BARE:
+  // mountPaths() already registers each bare template at both '/x' and
+  // '/api/x', so an explicit '/api/agent' (or '/api/command', '/api/skill')
+  // only registered a second, unreachable handler behind the first.
   ['GET', '/api/reference'],
-  ['GET', '/api/agent'],
-  ['GET', '/api/command'],
-  ['GET', '/api/skill'],
   ['GET', '/skill'],
   ['GET', '/pty'],
   ['GET', '/pty/shells'],
@@ -138,6 +140,33 @@ const SESSION_ID_RE = /^ses_[A-Za-z0-9_]+$/
  * event arrives). They get a longer proxy timeout than normal requests. */
 const LONG_POLL_PREFIXES = ['/permission/request', '/question']
 const LONG_POLL_TIMEOUT_MS = 120_000
+
+/**
+ * Body cap for proxied POSTs. A viewer's prompt legitimately carries pasted
+ * code, a stack trace or a whole file, which express's 100 KB default turned
+ * into a 413 mid-conversation. Only viewer-authenticated traffic gets this
+ * headroom — the parser is mounted behind the viewer check, on this router's
+ * own POST paths only (see below), so an anonymous request can never make the
+ * relay buffer 25 MB. Kept local: it is a property of the proxy surface, not
+ * a relay-wide tunable.
+ */
+const PROXY_BODY_LIMIT = '25mb'
+
+/**
+ * Max concurrent SSE streams one session may hold open. Each stream costs a
+ * bridge subscription plus a heartbeat timer and lives until the client hangs
+ * up, so an authenticated viewer looping fetch('/event') could pin relay
+ * memory and CPU for everyone. A real viewer opens two per tab (/event and
+ * /global/event), so 64 is generous for a shared session and still bounded.
+ */
+const MAX_STREAMS_PER_SESSION = 64
+
+/**
+ * Cap on the ancestry cache (see ancestryOk). Sessions are never removed from
+ * it when their share is deleted, so without a bound it grows for the life of
+ * the process.
+ */
+const ANCESTRY_CACHE_MAX = 10_000
 
 export function proxyAdapter(store: Store, bridge: BridgeClient) {
   const router = express.Router()
@@ -351,6 +380,22 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   const ancestryOk = new Set<string>()
 
   /**
+   * Remember a verified ancestry, evicting the oldest entry when full (a Set
+   * iterates in insertion order, so the first key is the oldest). Losing a
+   * positive is harmless: the next read simply walks the parent chain again
+   * and re-caches it. The cache is an optimisation, never the authority on
+   * what a viewer may read.
+   */
+  function rememberAncestry(key: string): void {
+    while (ancestryOk.size >= ANCESTRY_CACHE_MAX) {
+      const oldest = ancestryOk.values().next().value
+      if (oldest === undefined) break
+      ancestryOk.delete(oldest)
+    }
+    ancestryOk.add(key)
+  }
+
+  /**
    * Which session id this request may actually read: the bound one, unless the
    * caller asked for a session that DESCENDS from it (a subagent, or a nested
    * subagent) on a child-readable route. Resolved by walking the requested
@@ -387,7 +432,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       }
       if (parentID === undefined) return session.id // reached a root that is not ours
       if (parentID === session.id) {
-        ancestryOk.add(`${session.id}\u0000${requested}`)
+        rememberAncestry(`${session.id}\u0000${requested}`)
         return requested
       }
       current = parentID
@@ -414,6 +459,20 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   function mountPaths(template: string): string[] {
     return template.startsWith('/api/') ? [template] : [template, `/api${template}`]
   }
+
+  /**
+   * Parse JSON bodies ONLY on this router's own POST paths, and only once the
+   * caller has proven it holds a viewer token. Order is the point: the 401 is
+   * answered before a single byte of the body is buffered, so the generous
+   * PROXY_BODY_LIMIT is reachable by authenticated viewers only. (The app has
+   * no global parser — see server.ts.)
+   */
+  const parseProxyBody = express.json({ limit: PROXY_BODY_LIMIT })
+  const postPaths = ALLOWED_ROUTES.filter(([m]) => m === 'POST').flatMap(([, t]) => mountPaths(t))
+  router.post(postPaths, (req, res, next) => {
+    if (!requireViewer(req, res)) return
+    parseProxyBody(req, res, next)
+  })
 
   for (const [method, template] of ALLOWED_ROUTES) {
     const handler = (req: Request, res: Response) => {
@@ -496,8 +555,24 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // reachable, so on a flaky link the viewer's stream would sit silent —
     // long enough for proxies to close it and with no way to tell a quiet
     // session from a dead one. Emit our own on the same envelope.
+    // The stream is also where the viewer's credentials are RE-checked. Auth
+    // happens once, at open, and an SSE connection then lives for hours — so
+    // every revocation the relay has (the idle TTL, the per-session LRU
+    // eviction, deleting the share) used to stop the viewer's HTTP requests
+    // while its live feed kept running. Worst case: ending a share and
+    // re-sharing the same opencode session reuses the session id, and a viewer
+    // revoked by the first share silently received the second one's events
+    // without ever seeing the new code. Re-validating on the beat closes the
+    // stream within one heartbeat. It also slides last_used, which is correct:
+    // a viewer holding an open stream is present, not idle.
+    const viewerToken = extractViewerToken(req)
     const heartbeat = setInterval(() => {
       if (res.writableEnded) return
+      if (!viewerToken || !store.verifyViewer(session.id, viewerToken)) {
+        clearInterval(heartbeat)
+        res.end()
+        return
+      }
       res.write(`data: ${envelope(JSON.stringify(heartbeatEvent()))}\n\n`)
     }, sseHeartbeatMs())
     heartbeat.unref?.()
@@ -521,16 +596,65 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     req.on('close', unsubscribe)
   }
 
+  /** Live SSE streams per session id — the counter behind MAX_STREAMS_PER_SESSION. */
+  const streamCount = new Map<string, number>()
+
+  /**
+   * Take one of the session's stream slots, open the stream, and give the
+   * slot back exactly once when the request or the response closes.
+   *
+   * Both 'close' events are wired because neither alone covers every exit: a
+   * client that hangs up mid-stream fires the request's, a socket error or a
+   * stream that never got past writeHead fires the response's. The release is
+   * idempotent, so firing both (the normal case) still frees exactly one slot.
+   */
+  function openEventStream(req: Request, res: Response, session: Session, global: boolean): void {
+    const open = streamCount.get(session.id) ?? 0
+    if (open >= MAX_STREAMS_PER_SESSION) {
+      res.status(429).json({ error: 'too many event streams' })
+      return
+    }
+    streamCount.set(session.id, open + 1)
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      const left = (streamCount.get(session.id) ?? 1) - 1
+      if (left > 0) streamCount.set(session.id, left)
+      else streamCount.delete(session.id)
+    }
+    res.on('close', release)
+    req.on('close', release)
+    // A connection can already be dead by the time this handler runs: express
+    // walks its stack first (express.static stats the filesystem on every
+    // request before falling through to this router), and a client that hangs
+    // up in that gap has ALREADY fired 'close' on both req and res — so
+    // neither listener above will ever run. The slot, the bridge subscription
+    // and the heartbeat timer would then leak for the life of the process, and
+    // 64 such aborts wedge the session at 429 permanently. Check explicitly,
+    // and do it BEFORE sseEvents so the doomed subscription is never created.
+    if (req.closed || res.closed) {
+      release()
+      return
+    }
+    try {
+      sseEvents(req, res, session, global)
+    } catch (err) {
+      release()
+      throw err
+    }
+  }
+
   router.get('/event', (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
-    sseEvents(req, res, session, false)
+    openEventStream(req, res, session, false)
   })
 
   router.get('/global/event', (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
-    sseEvents(req, res, session, true)
+    openEventStream(req, res, session, true)
   })
 
   return router

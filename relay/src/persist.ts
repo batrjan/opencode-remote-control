@@ -32,6 +32,25 @@ export interface PersistedViewer {
   hash: string
   salt: string
   created_at: number
+  /**
+   * Last time this token authenticated — the store's sliding idle window.
+   * OPTIONAL, and STATE_VERSION deliberately stays 1: a version bump makes
+   * load() discard the whole file, which on the deploy that shipped this
+   * change would silently drop every live share. A file written by an older
+   * relay simply has no last_used, and restore() falls back to created_at.
+   */
+  last_used?: number
+  /**
+   * Unsalted sha256 of the viewer token — the key this viewer occupies in the
+   * store's O(1) lookup index, persisted because the plaintext token is never
+   * stored and the digest cannot be recomputed from the salted hash. Safe to
+   * write: a viewer token is 32 random bytes, so this digest is no more
+   * invertible than the salted hash sitting next to it, and it is never a
+   * credential on its own (the salted comparison still gates every match).
+   * Optional for the same backward-compatibility reason as last_used; a
+   * viewer restored without it is re-indexed on its first successful use.
+   */
+  index?: string
 }
 
 export interface PersistedSession {

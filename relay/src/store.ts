@@ -6,6 +6,21 @@ import { STATE_VERSION } from './persist.js'
 export interface ViewerToken {
   salt: string
   created_at: number
+  /**
+   * Last successful authentication. The viewer window SLIDES on this: a token
+   * in active use stays alive, one left idle past config.viewerIdleTtlMs stops
+   * authenticating and is pruned.
+   */
+  last_used: number
+  /**
+   * The key this viewer occupies in the store-level lookup index (an unsalted
+   * sha256 of the token, see viewerIndexKey). Held on the record so removing
+   * the viewer — eviction, expiry, session delete — can drop its index entry
+   * without the plaintext token, which the store never keeps. Undefined only
+   * for a viewer restored from a state file written before the index existed;
+   * it is filled in on that token's first successful authentication.
+   */
+  index?: string
 }
 
 export interface Session {
@@ -21,7 +36,7 @@ export interface Session {
   status: 'active' | 'closed'
   /** IP that registered the session — used for the public-registration cap. */
   created_by_ip: string
-  viewers: Map<string, ViewerToken> // salted hash -> { salt, created_at }
+  viewers: Map<string, ViewerToken> // salted hash -> { salt, created_at, last_used, index }
 }
 
 interface IpAttempts {
@@ -41,6 +56,21 @@ export class Store {
   private ipAttempts: Map<string, IpAttempts> = new Map()
   private sessionFails: Map<string, { count: number; windowStart: number }> = new Map()
   private registrations: Map<string, { count: number; windowStart: number }> = new Map()
+  /**
+   * viewerIndexKey(token) -> session id. Viewer auth used to be a linear scan
+   * over EVERY session x EVERY viewer (a SHA-256 + timingSafeEqual each) on
+   * every proxied request; this makes the lookup O(1). It is a LOOKUP index,
+   * never an authorization: a hit only says which session to ask, and the
+   * per-token salted hash still decides the match.
+   */
+  private viewerIndex: Map<string, string> = new Map()
+  /**
+   * How many live viewer records carry no index entry (restored from a state
+   * file written before the index existed). While this is zero — the steady
+   * state — an unknown token can be rejected from the index alone, so garbage
+   * tokens never trigger the fallback scan.
+   */
+  private unindexedViewers = 0
   /** Called after anything that changes the session set (see setChangeListener). */
   private onChange: (() => void) | null = null
 
@@ -57,6 +87,11 @@ export class Store {
    * skill works out of the box — abuse is contained by these caps and by the
    * fact that deleting a session requires its bridge_token, not the public
    * path. Throws 'rate limited'.
+   *
+   * Checking does NOT consume a slot: callers commit with
+   * commitRegistration(ip) once a session actually exists, so a request that
+   * creates nothing (a duplicate id -> 409) no longer burns the caller's
+   * hourly quota.
    */
   checkRegistrationLimit(ip: string): void {
     const now = Date.now()
@@ -74,6 +109,20 @@ export class Store {
     }
     if (active >= config.maxActiveSessionsPerIp) {
       throw new Error('rate limited')
+    }
+  }
+
+  /**
+   * Consume one registration slot for `ip`. Call only after the session was
+   * really created — see checkRegistrationLimit. Re-resolves the window so a
+   * commit that lands after the hour rolled over starts a fresh one.
+   */
+  commitRegistration(ip: string): void {
+    const now = Date.now()
+    let rec = this.registrations.get(ip)
+    if (!rec || now - rec.windowStart >= config.registrationWindowMs) {
+      rec = { count: 0, windowStart: now }
+      this.registrations.set(ip, rec)
     }
     rec.count += 1
   }
@@ -139,10 +188,7 @@ export class Store {
     const session = this.sessions.get(session_id)
     const codeMatches =
       session !== undefined &&
-      timingSafeEqual(
-        Buffer.from(saltedHash(normalizedCode, session.code_salt)),
-        Buffer.from(session.code_hash),
-      )
+      safeEqual(saltedHash(normalizedCode, session.code_salt), session.code_hash)
     if (!codeMatches) {
       const fails = (this.codeFails.get(attemptKey) ?? 0) + 1
       this.setBounded(this.codeFails, attemptKey, fails)
@@ -160,9 +206,23 @@ export class Store {
     this.sessionFails.delete(session_id)
     const viewer_token = generateToken()
     const salt = newSalt()
-    session.viewers.set(saltedHash(viewer_token, salt), { salt, created_at: Date.now() })
+    const issuedAt = Date.now()
+    // Make room before minting: drop anything already idle-expired, then evict
+    // down to one slot below the cap so the new token fits.
+    this.pruneExpiredViewers(session, issuedAt)
+    this.evictViewers(session, config.maxViewersPerSession - 1)
+    const index = viewerIndexKey(viewer_token)
+    session.viewers.set(saltedHash(viewer_token, salt), {
+      salt,
+      created_at: issuedAt,
+      last_used: issuedAt,
+      index,
+    })
+    this.viewerIndex.set(index, session.id)
+    // last_seen must move BEFORE changed(): the listener persists a snapshot
+    // synchronously, so the old order wrote the stale timestamp to disk.
+    session.last_seen = issuedAt
     this.changed()
-    session.last_seen = Date.now()
     return { session_id: session.id, viewer_token }
   }
 
@@ -170,35 +230,130 @@ export class Store {
   verifyBridgeToken(session_id: string, bridge_token: string): boolean {
     const session = this.sessions.get(session_id)
     if (!session) return false
-    const candidate = saltedHash(bridge_token, session.bridge_token_salt)
-    return timingSafeEqual(Buffer.from(candidate), Buffer.from(session.bridge_token_hash))
+    return safeEqual(saltedHash(bridge_token, session.bridge_token_salt), session.bridge_token_hash)
   }
 
   /**
    * Resolve the session a viewer token belongs to. The proxy adapter uses
    * this for forced session binding: the URL :id is always replaced by the
-   * token's session. O(sessions × viewers) with constant-time compares —
-   * same trade-off as findSessionByCode.
+   * token's session. The index answers in O(1); the salted comparison in
+   * matchViewer() is still what authenticates.
    */
   getSessionByViewerToken(viewer_token: string): Session | undefined {
-    for (const session of this.sessions.values()) {
-      for (const [hash, { salt }] of session.viewers) {
-        const candidate = saltedHash(viewer_token, salt)
-        if (timingSafeEqual(Buffer.from(candidate), Buffer.from(hash))) return session
-      }
+    const key = viewerIndexKey(viewer_token)
+    const indexed = this.viewerIndex.get(key)
+    if (indexed === undefined) return this.scanForViewer(viewer_token, key)
+    const session = this.sessions.get(indexed)
+    if (!session) {
+      // Nothing should leave an entry pointing at a dead session, but a stale
+      // one must never authenticate — and must not linger either.
+      this.viewerIndex.delete(key)
+      return undefined
     }
-    return undefined
+    return this.matchViewer(session, viewer_token, key) ? session : undefined
   }
 
   /** Check whether a viewer token belongs to a session. */
   verifyViewer(session_id: string, viewer_token: string): boolean {
     const session = this.sessions.get(session_id)
     if (!session) return false
-    for (const [hash, { salt }] of session.viewers) {
-      const candidate = saltedHash(viewer_token, salt)
-      if (timingSafeEqual(Buffer.from(candidate), Buffer.from(hash))) return true
+    const key = viewerIndexKey(viewer_token)
+    const indexed = this.viewerIndex.get(key)
+    // Indexed against a different session: it cannot also belong to this one.
+    if (indexed !== undefined && indexed !== session_id) return false
+    if (indexed === undefined && this.unindexedViewers === 0) return false
+    return this.matchViewer(session, viewer_token, key)
+  }
+
+  /**
+   * Constant-time check of `token` against one session's viewers, refreshing
+   * the sliding idle window on success. The index only says WHICH session to
+   * ask — this salted comparison is the credential check, so a forged or
+   * stale index entry can never authenticate on its own.
+   */
+  private matchViewer(session: Session, token: string, key: string): boolean {
+    const now = Date.now()
+    this.pruneExpiredViewers(session, now)
+    for (const [hash, viewer] of session.viewers) {
+      if (!safeEqual(saltedHash(token, viewer.salt), hash)) continue
+      viewer.last_used = now
+      if (viewer.index === undefined) {
+        // First use since a restore that could not carry the index key.
+        viewer.index = key
+        this.viewerIndex.set(key, session.id)
+        this.unindexedViewers = Math.max(0, this.unindexedViewers - 1)
+      }
+      // Re-insert so Map order tracks RECENCY, not creation: Maps iterate in
+      // insertion order, so evictViewers() can then simply drop the first
+      // (coldest) entry and needs no separate LRU bookkeeping.
+      session.viewers.delete(hash)
+      session.viewers.set(hash, viewer)
+      return true
     }
     return false
+  }
+
+  /**
+   * Fallback for viewers restored from a state file written before the index
+   * existed: their index key was never persisted and cannot be derived from a
+   * salted hash, so they are found by scan once and indexed on the way out.
+   * Skipped entirely when no such viewer is left, which is what keeps an
+   * unknown token O(1) — the case an attacker controls.
+   */
+  private scanForViewer(token: string, key: string): Session | undefined {
+    if (this.unindexedViewers === 0) return undefined
+    for (const session of this.sessions.values()) {
+      if (this.matchViewer(session, token, key)) return session
+    }
+    return undefined
+  }
+
+  /**
+   * Drop viewers whose sliding idle window has elapsed. Called on every lookup
+   * of a session and on activation, so expiry needs no sweeper of its own.
+   * Deliberately does NOT mark the store dirty: this runs on the request path,
+   * and restore() applies the same expiry to whatever the last snapshot held,
+   * so an expired viewer can never come back from disk anyway.
+   */
+  private pruneExpiredViewers(session: Session, now: number): void {
+    for (const [hash, viewer] of session.viewers) {
+      if (now - viewer.last_used > config.viewerIdleTtlMs) {
+        session.viewers.delete(hash)
+        this.dropIndexEntry(session.id, viewer)
+      }
+    }
+  }
+
+  /**
+   * Evict least-recently-used viewers until the session holds at most `max`.
+   * Recency IS insertion order here (matchViewer re-inserts on every use), so
+   * the first key is always the coldest token.
+   */
+  private evictViewers(session: Session, max: number): void {
+    while (session.viewers.size > max) {
+      const oldest = session.viewers.entries().next()
+      if (oldest.done) return
+      const [hash, viewer] = oldest.value
+      session.viewers.delete(hash)
+      this.dropIndexEntry(session.id, viewer)
+    }
+  }
+
+  /** Remove a departing viewer's lookup entry (see viewerIndex). */
+  private dropIndexEntry(session_id: string, viewer: ViewerToken): void {
+    if (viewer.index === undefined) {
+      this.unindexedViewers = Math.max(0, this.unindexedViewers - 1)
+      return
+    }
+    // Only drop an entry that still points here: never delete another
+    // session's lookup key on the (practically impossible) digest collision.
+    if (this.viewerIndex.get(viewer.index) === session_id) this.viewerIndex.delete(viewer.index)
+  }
+
+  /** Forget a session's viewers, index entries included. */
+  private dropViewers(session: Session): void {
+    for (const viewer of session.viewers.values()) this.dropIndexEntry(session.id, viewer)
+    session.viewers.clear()
   }
 
   getSession(session_id: string) {
@@ -207,9 +362,14 @@ export class Store {
 
   /** Remove a session; returns false when it did not exist (for 404 mapping). */
   deleteSession(session_id: string): boolean {
-    const existed = this.sessions.delete(session_id)
-    if (existed) this.changed()
-    return existed
+    const session = this.sessions.get(session_id)
+    if (!session) return false
+    // Revoke the viewer tokens with the session: a leftover index entry would
+    // outlive what it points at.
+    this.dropViewers(session)
+    this.sessions.delete(session_id)
+    this.changed()
+    return true
   }
 
   /** Accepts a plaintext code + session (hashed internally before lookup). */
@@ -233,6 +393,7 @@ export class Store {
     const removed: string[] = []
     for (const [id, session] of this.sessions) {
       if (now - session.last_seen > maxIdleMs) {
+        this.dropViewers(session) // same revocation as deleteSession
         this.sessions.delete(id)
         removed.push(id)
       }
@@ -287,10 +448,14 @@ export class Store {
         last_seen: s.last_seen,
         status: s.status,
         created_by_ip: s.created_by_ip,
+        // Insertion order is recency order (see matchViewer), and restore()
+        // preserves it, so the LRU eviction order survives a restart too.
         viewers: Array.from(s.viewers.entries()).map(([hash, v]) => ({
           hash,
           salt: v.salt,
           created_at: v.created_at,
+          last_used: v.last_used,
+          ...(v.index === undefined ? {} : { index: v.index }),
         })),
       })),
     }
@@ -318,9 +483,25 @@ export class Store {
       }
       const viewers = new Map<string, ViewerToken>()
       for (const v of Array.isArray(s.viewers) ? s.viewers : []) {
-        if (v && typeof v.hash === 'string' && typeof v.salt === 'string') {
-          viewers.set(v.hash, { salt: v.salt, created_at: v.created_at ?? now })
-        }
+        if (!v || typeof v.hash !== 'string' || typeof v.salt !== 'string') continue
+        // last_used falls back to created_at (a file written before the field
+        // existed) and then to now, so an upgrade never makes every restored
+        // viewer look instantly idle.
+        const last_used =
+          typeof v.last_used === 'number'
+            ? v.last_used
+            : typeof v.created_at === 'number'
+              ? v.created_at
+              : now
+        // A viewer already past its idle window is dropped rather than
+        // resurrected — same policy as the idle sessions skipped above.
+        if (now - last_used > config.viewerIdleTtlMs) continue
+        viewers.set(v.hash, {
+          salt: v.salt,
+          created_at: v.created_at ?? now,
+          last_used,
+          index: typeof v.index === 'string' && v.index ? v.index : undefined,
+        })
       }
       this.sessions.set(s.id, {
         id: s.id,
@@ -340,6 +521,13 @@ export class Store {
         created_by_ip: typeof s.created_by_ip === 'string' ? s.created_by_ip : '',
         viewers,
       })
+      // Rebuild the lookup index for this session. No stale entry can point at
+      // s.id: ids already present are skipped above, and deleteSession /
+      // reapOrphans drop their entries with the session.
+      for (const v of viewers.values()) {
+        if (v.index === undefined) this.unindexedViewers += 1
+        else this.viewerIndex.set(v.index, s.id)
+      }
       restored += 1
     }
     return restored
@@ -391,13 +579,51 @@ export class Store {
 
 }
 
+/**
+ * Codes are generated from an alphabet that EXCLUDES 'O' and 'I' precisely
+ * because they are confusable with '0' and '1'. A viewer types what they see
+ * on the sharer's screen, so fold the confusable letters onto the digits the
+ * generator can actually emit — otherwise excluding them made a misread code
+ * unrecoverable ("invalid code") instead of harmless. This runs before the
+ * code is hashed, so it applies to every comparison; the generator never emits
+ * O or I, so the create side is unaffected.
+ */
 function normalizeCode(code: string): string {
-  return code.trim().toUpperCase()
+  return code.trim().toUpperCase().replaceAll('O', '0').replaceAll('I', '1')
+}
+
+/**
+ * timingSafeEqual THROWS on a length mismatch, and a stored hash can be legally
+ * EMPTY: a session restored from a plaintext state file has had its code hash
+ * stripped, and a hand-edited file can hold anything. Treat differing lengths
+ * as "no match" — they cannot be equal anyway, and the length of a hex digest
+ * is not a secret, so nothing timing-sensitive leaks.
+ */
+function safeEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a)
+  const right = Buffer.from(b)
+  if (left.length !== right.length) return false
+  return timingSafeEqual(left, right)
+}
+
+function sha256Hex(input: string): string {
+  return createHash('sha256').update(input).digest('hex')
 }
 
 /** Hash used only for rate-limit/counter keys (not a stored secret). */
 function hashAttempt(input: string): string {
-  return createHash('sha256').update(input).digest('hex')
+  return sha256Hex(input)
+}
+
+/**
+ * Lookup key for the viewer index: a deterministic, UNSALTED digest of the
+ * token. Unsalted is required (a salted hash cannot be looked up without
+ * already knowing which salt to use) and safe here: a viewer token is 32
+ * random bytes, so the digest is not brute-forceable and reveals nothing the
+ * salted hash does not. It selects a candidate session; it never authorizes.
+ */
+function viewerIndexKey(token: string): string {
+  return sha256Hex(token)
 }
 
 /** Salted SHA-256 for all stored secrets (codes, tokens). */
