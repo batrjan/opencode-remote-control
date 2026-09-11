@@ -178,6 +178,14 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // everything else falls through to this 404. Because it is registered after
   // every relay route (/api/*, /join, /terminal, /:id), those keep working.
   if (bridge) app.use(proxyAdapter(store, bridge))
+  // Nothing matched. express's own finalhandler answers an HTML page reading
+  // "Cannot PUT /config", which is both the wrong content type for an API and
+  // a free framework fingerprint — every other error this relay produces is
+  // JSON. Reached by an unallowlisted method or path (the allowlist mounts
+  // GET /config, so a PUT falls through here), and by a missing asset.
+  app.use((_req, res) => {
+    res.status(404).json({ error: 'not found' })
+  })
   // Body-size failures as JSON. express's default handler answers an HTML
   // error page, which every caller here (the bridge's fetch, the viewer's UI)
   // parses as JSON and reports as an opaque failure instead of "too large".

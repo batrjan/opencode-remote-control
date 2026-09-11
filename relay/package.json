@@ -22,7 +22,7 @@
     "@types/ws": "^8.18.1",
     "supertest": "^7.0.0",
     "typescript": "^5.6.0",
-    "vitest": "^2.1.0"
+    "vitest": "^3.2.7"
   },
   "overrides": {
     "qs": "^6.16.0"

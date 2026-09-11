@@ -108,3 +108,28 @@ test('public registration rejects oversized fields instead of storing them', asy
     expect(res.body.error).toBe('field too long')
   }
 })
+
+/**
+ * Unmatched requests must look like the rest of the API.
+ *
+ * The proxy allowlist mounts GET /config but not PUT /config, so a PUT fell
+ * past every route into express's finalhandler — which answers an HTML page
+ * reading "Cannot PUT /config". Wrong content type for a JSON API, and a free
+ * statement of which framework is running. Found by probing the live relay.
+ */
+test('an unmatched method or path answers JSON, not express HTML', async () => {
+  const store = new Store()
+  const app = createApp(store)
+  for (const [method, path] of [
+    ['put', '/config'],
+    ['patch', '/config'],
+    ['delete', '/session/ses_whatever'],
+    ['get', '/definitely-not-a-route'],
+  ] as const) {
+    const res = await (request(app) as unknown as Record<string, (p: string) => request.Test>)[method](path)
+    expect(res.status).toBe(404)
+    expect(res.headers['content-type']).toContain('application/json')
+    expect(res.body).toEqual({ error: 'not found' })
+    expect(res.text).not.toContain('Cannot')
+  }
+})
