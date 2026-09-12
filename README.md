@@ -51,7 +51,7 @@ would let sit at your keyboard, and stop the share when they are done.
 | What protects the share | Detail |
 | ----------------------- | ------ |
 | Access code | 6 characters from a 34-symbol alphabet (`A–Z0–9` minus `O` and `I`) ≈ 30 bits. Small enough that it only holds up because guessing is throttled. |
-| Per-IP activation limits | 5 attempts per minute and 50 per hour, per client address — which is only the real client if `RELAY_TRUST_PROXY` matches the deployment (see [DEPLOY.md](DEPLOY.md)). |
+| Per-IP limits on wrong codes | 5 failed attempts per minute and 50 per hour, per client address — which is only the real client if `RELAY_TRUST_PROXY` matches the deployment (see [DEPLOY.md](DEPLOY.md)). Only *misses* are charged: a correct code costs nothing, so a team sharing one office NAT can all join without the sixth person being told "too many attempts". |
 | Per-session lockout | 20 failed activations against one session within 15 minutes lock activation for that session regardless of source IP — the defense against grinding a known session URL from many addresses. A specific wrong code is refused outright after 10 tries. |
 | Wrong-code delay | Every rejected code is answered after a ~1 s delay (`ACTIVATE_FAIL_DELAY_MS`), so each guess costs real time. |
 | Forced session binding | The proxy routes only allowlisted paths and rewrites the `:id` in every one of them to the token's own session, so a viewer can never reach another share (subagent sessions of the shared one stay readable — they belong to it). The bridge re-checks each forwarded path against its own allowlist before touching OpenCode. |

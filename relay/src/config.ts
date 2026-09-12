@@ -15,7 +15,11 @@ export const config = {
   codeAlphabet: Array.from('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
     .filter((c) => !(EXCLUDED_FROM_CODE_ALPHABET as readonly string[]).includes(c))
     .join(''),
-  /** Per-IP activation attempt limits (sliding window evaluated lazily). */
+  /**
+   * Per-IP limits on FAILED activations (sliding window, evaluated lazily).
+   * Only misses are charged — see Store.failActivation: a correct code is not
+   * grinding, and charging it locked out everyone sharing an office NAT.
+   */
   ipLimitPerMinute: 5,
   ipLimitPerHour: 50,
   ipWindowMs: { minute: 60_000, hour: 3_600_000 },

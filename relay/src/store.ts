@@ -167,7 +167,14 @@ export class Store {
    * error shape for missing/blocked codes and wrong sessions, per spec).
    */
   activate(code: string, session_id: string, ip: string) {
-    this.checkIpLimit(ip)
+    // NOTE the order: the per-IP budget is checked on the FAILURE paths below,
+    // not here. Gating the whole call on it refused a CORRECT code from an
+    // address that had recently failed — and because this keys on the client
+    // address, "the address" is a whole office behind one NAT: one colleague
+    // mistyping five times locked out everyone else holding a good code. A
+    // caller who presents the right code is not grinding, so nothing about
+    // them needs throttling. Wrong guesses still cost exactly what they did.
+    //
     // Per-session failure cap: after N failed activations against one session
     // (any code), that session is locked out for a window. This is the real
     // brute-force brake — the per-attempt-key counter below only stops
@@ -184,7 +191,12 @@ export class Store {
     }
     const normalizedCode = normalizeCode(code)
     const attemptKey = hashAttempt(`${session_id}:${normalizedCode}`)
-    if (this.blockedCodes.has(attemptKey)) throw new Error('invalid code')
+    if (this.blockedCodes.has(attemptKey)) {
+      // Charged like any other miss: this path short-circuits before the hash
+      // compare, so leaving it free would let an attacker spam a code they
+      // already know is blocked without ever touching their budget.
+      this.failActivation(ip)
+    }
     const session = this.sessions.get(session_id)
     const codeMatches =
       session !== undefined &&
@@ -200,7 +212,7 @@ export class Store {
       }
       rec.count += 1
       this.setBounded(this.sessionFails, session_id, rec)
-      throw new Error('invalid code')
+      this.failActivation(ip)
     }
     // Successful activation clears the session's failure window.
     this.sessionFails.delete(session_id)
@@ -555,7 +567,48 @@ export class Store {
     set.add(value)
   }
 
-  private checkIpLimit(ip: string): void {
+  /**
+   * Reject one activation attempt: charge the address, then throw.
+   *
+   * ONLY failures are charged, and that is the whole point of this limit: the
+   * budget exists to throttle code GRINDING, and grinding is made of wrong
+   * guesses. A correct code is not an attack signal — it is proof the caller
+   * already had the secret.
+   *
+   * Charging successes too had a cost paid entirely by legitimate users,
+   * because this keys on the client ADDRESS: a team behind one office NAT, or
+   * one corporate VPN, shares a single bucket, so the sixth colleague to join
+   * the same share within a minute was told "too many attempts" while holding
+   * a perfectly good code. Measured against the live relay — five accepted,
+   * the sixth refused 429 with the right code in hand.
+   *
+   * Nothing about the brute-force defence moves: five wrong guesses a minute
+   * and fifty an hour per address still applies, a specific wrong code is
+   * still blocked after ten tries, and the per-session lockout (20 failures in
+   * 15 minutes, address-independent) is still what actually stops an attacker
+   * spreading the grind across many addresses.
+   *
+   * Over budget answers 'rate limited', under budget 'invalid code' — the same
+   * two outcomes a grinding client saw before. The check runs BEFORE the
+   * charge so an address that is already cut off cannot keep pushing its own
+   * window forward.
+   */
+  private failActivation(ip: string): never {
+    const rec = this.ipWindow(ip)
+    if (rec.minuteCount >= config.ipLimitPerMinute || rec.hourCount >= config.ipLimitPerHour) {
+      throw new Error('rate limited')
+    }
+    rec.minuteCount += 1
+    rec.hourCount += 1
+    throw new Error('invalid code')
+  }
+
+  /**
+   * The per-IP activation window, rolled forward to `now`. Creating the record
+   * on read is deliberate: an address that never fails never costs anything
+   * beyond one bounded map entry.
+   */
+  private ipWindow(ip: string): IpAttempts {
     const now = Date.now()
     let rec = this.ipAttempts.get(ip)
     if (!rec) {
@@ -570,12 +623,10 @@ export class Store {
       rec.hourCount = 0
       rec.hourStart = now
     }
-    if (rec.minuteCount >= config.ipLimitPerMinute || rec.hourCount >= config.ipLimitPerHour) {
-      throw new Error('rate limited')
-    }
-    rec.minuteCount += 1
-    rec.hourCount += 1
+    return rec
   }
+
+
 
 }
 
