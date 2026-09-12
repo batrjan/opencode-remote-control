@@ -28,7 +28,7 @@ test('a viewer token idle past the TTL stops authenticating and is pruned', () =
   vi.useFakeTimers()
   const store = new Store()
   const { access_code } = store.createSession('s_exp', '/work', 'title', '1.1.1.1')
-  const { viewer_token } = store.activate(access_code, 's_exp', '2.2.2.2')
+  const { viewer_token } = store.activate(access_code, 's_exp')
   expect(store.verifyViewer('s_exp', viewer_token)).toBe(true)
 
   vi.setSystemTime(Date.now() + config.viewerIdleTtlMs + 1000)
@@ -42,7 +42,7 @@ test('a viewer token in active use survives far past the idle window (sliding re
   vi.useFakeTimers()
   const store = new Store()
   const { access_code } = store.createSession('s_slide', '/work', 'title', '1.1.1.1')
-  const { viewer_token } = store.activate(access_code, 's_slide', '2.2.2.2')
+  const { viewer_token } = store.activate(access_code, 's_slide')
 
   // Four hops of just under the TTL each: the window slides on every use, so
   // a viewer who keeps watching is never logged out mid-session.
@@ -61,7 +61,7 @@ test('a seat nobody is sitting in is reclaimed at the cap', () => {
   const { access_code } = store.createSession('s_cap', '/work', 'title', '1.1.1.1')
   const tokens: string[] = []
   for (let i = 0; i < config.maxViewersPerSession; i++) {
-    tokens.push(store.activate(access_code, 's_cap', `ip_${i}`).viewer_token)
+    tokens.push(store.activate(access_code, 's_cap').viewer_token)
   }
   expect(store.getSession('s_cap')?.viewers.size).toBe(config.maxViewersPerSession)
 
@@ -69,7 +69,7 @@ test('a seat nobody is sitting in is reclaimed at the cap', () => {
   vi.setSystemTime(Date.now() + config.viewerActiveWindowMs + 1000)
   // ...except the oldest token, which is used and therefore present again.
   expect(store.verifyViewer('s_cap', tokens[0]!)).toBe(true)
-  const extra = store.activate(access_code, 's_cap', 'ip_extra').viewer_token
+  const extra = store.activate(access_code, 's_cap').viewer_token
 
   expect(store.getSession('s_cap')?.viewers.size).toBe(config.maxViewersPerSession)
   // tokens[1] was the coldest idle seat, so it is the one that went.
@@ -92,13 +92,13 @@ test('a full session refuses a new viewer instead of taking a present one\'s sea
   const { access_code } = store.createSession('s_full', '/work', 'title', '1.1.1.1')
   const tokens: string[] = []
   for (let i = 0; i < config.maxViewersPerSession; i++) {
-    tokens.push(store.activate(access_code, 's_full', `ip_${i}`).viewer_token)
+    tokens.push(store.activate(access_code, 's_full').viewer_token)
   }
 
   // Every seat was taken seconds ago, so every seat is occupied by somebody
   // present. The next join is refused — with its own error, because the code
   // was correct and the caller deserves to know that.
-  expect(() => store.activate(access_code, 's_full', 'ip_attacker')).toThrow('session full')
+  expect(() => store.activate(access_code, 's_full')).toThrow('session full')
 
   // And nobody lost their seat to the attempt.
   expect(store.getSession('s_full')?.viewers.size).toBe(config.maxViewersPerSession)
@@ -117,29 +117,29 @@ test('the per-session mint budget bounds how fast tokens can be minted', () => {
     for (const v of s.viewers.values()) v.last_used = Date.now() - config.viewerActiveWindowMs - 1000
   }
   for (let i = 0; i < config.activationsPerSessionWindow; i++) {
-    expect(store.activate(access_code, 's_mint', `ip_${i}`).viewer_token).toBeTruthy()
+    expect(store.activate(access_code, 's_mint').viewer_token).toBeTruthy()
     freeTheSeats()
   }
   // The budget is spent — with a seat free and a valid code in hand.
-  expect(() => store.activate(access_code, 's_mint', 'ip_over')).toThrow('rate limited')
+  expect(() => store.activate(access_code, 's_mint')).toThrow('rate limited')
 
   // It is a window, not a lifetime cap: it refills.
   vi.setSystemTime(Date.now() + config.activationSessionWindowMs + 1000)
   freeTheSeats()
-  expect(store.activate(access_code, 's_mint', 'ip_after').viewer_token).toBeTruthy()
+  expect(store.activate(access_code, 's_mint').viewer_token).toBeTruthy()
 })
 
 test('re-sharing a session id does not inherit the old share mint budget', () => {
   const store = new Store()
   const first = store.createSession('s_reshare', '/work', 'title', '1.1.1.1')
-  store.activate(first.access_code, 's_reshare', 'ip_a')
+  store.activate(first.access_code, 's_reshare')
   expect(store.deleteSession('s_reshare')).toBe(true)
 
   // opencode reuses the session id when the same session is shared again; the
   // new share must start with a clean counter and a clean viewer list.
   const second = store.createSession('s_reshare', '/work', 'title', '1.1.1.1')
   for (let i = 0; i < config.activationsPerSessionWindow; i++) {
-    expect(store.activate(second.access_code, 's_reshare', `ip_${i}`).viewer_token).toBeTruthy()
+    expect(store.activate(second.access_code, 's_reshare').viewer_token).toBeTruthy()
     // keep seats reclaimable
     const s = store.getSession('s_reshare')!
     for (const v of s.viewers.values()) v.last_used = Date.now() - config.viewerActiveWindowMs - 1000
@@ -149,7 +149,7 @@ test('re-sharing a session id does not inherit the old share mint budget', () =>
 test('deleteSession leaves no lookup entry that can authenticate', () => {
   const store = new Store()
   const first = store.createSession('s_del', '/work', 'title', '1.1.1.1')
-  const { viewer_token } = store.activate(first.access_code, 's_del', '2.2.2.2')
+  const { viewer_token } = store.activate(first.access_code, 's_del')
   expect(store.getSessionByViewerToken(viewer_token)?.id).toBe('s_del')
 
   expect(store.deleteSession('s_del')).toBe(true)
@@ -159,14 +159,14 @@ test('deleteSession leaves no lookup entry that can authenticate', () => {
   const second = store.createSession('s_del', '/work', 'title', '1.1.1.1')
   expect(store.getSessionByViewerToken(viewer_token)).toBeUndefined()
   expect(store.verifyViewer('s_del', viewer_token)).toBe(false)
-  const fresh = store.activate(second.access_code, 's_del', '3.3.3.3')
+  const fresh = store.activate(second.access_code, 's_del')
   expect(store.getSessionByViewerToken(fresh.viewer_token)?.id).toBe('s_del')
 })
 
 test('reapOrphans revokes the reaped session viewer tokens too', () => {
   const store = new Store()
   const { access_code } = store.createSession('s_reap', '/work', 'title', '1.1.1.1')
-  const { viewer_token } = store.activate(access_code, 's_reap', '2.2.2.2')
+  const { viewer_token } = store.activate(access_code, 's_reap')
   expect(store.getSessionByViewerToken(viewer_token)?.id).toBe('s_reap')
 
   expect(store.reapOrphans(-1)).toEqual(['s_reap'])
@@ -186,7 +186,7 @@ test('a code typed with the letters O or I still activates (the alphabet has nei
     if (/[01]/.test(access_code)) typed = access_code.replaceAll('0', 'O').replaceAll('1', 'I')
   }
   expect(typed).toBeDefined()
-  expect(store.activate(typed!, id, 'viewer-ip')).toEqual({
+  expect(store.activate(typed!, id)).toEqual({
     session_id: id,
     viewer_token: expect.any(String),
   })
@@ -215,13 +215,13 @@ test('activate on a restored plaintext session (code hash stripped) fails cleanl
 
   const b = new Store()
   expect(b.restore(state)).toBe(1)
-  expect(() => b.activate(created.access_code, 's_pt', '2.2.2.2')).toThrow('invalid code')
+  expect(() => b.activate(created.access_code, 's_pt')).toThrow('invalid code')
 })
 
 test('last_used round-trips through snapshot/restore', () => {
   const a = new Store()
   const created = a.createSession('s_rt', '/work', 'title', '1.1.1.1')
-  const { viewer_token } = a.activate(created.access_code, 's_rt', '2.2.2.2')
+  const { viewer_token } = a.activate(created.access_code, 's_rt')
 
   const state = a.snapshot()
   expect(typeof state.sessions[0]!.viewers[0]!.last_used).toBe('number')
@@ -251,7 +251,7 @@ test('last_used round-trips through snapshot/restore', () => {
 test('a viewer restored from a pre-index state file still authenticates, and is re-indexed', () => {
   const a = new Store()
   const created = a.createSession('s_legacy', '/work', 'title', '1.1.1.1')
-  const { viewer_token } = a.activate(created.access_code, 's_legacy', '2.2.2.2')
+  const { viewer_token } = a.activate(created.access_code, 's_legacy')
   const state = a.snapshot()
   // An older relay persisted neither field; the index key cannot be derived
   // from a salted hash, so such a viewer is found by scan once, then indexed.

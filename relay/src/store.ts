@@ -39,13 +39,6 @@ export interface Session {
   viewers: Map<string, ViewerToken> // salted hash -> { salt, created_at, last_used, index }
 }
 
-interface IpAttempts {
-  minuteCount: number
-  minuteStart: number
-  hourCount: number
-  hourStart: number
-}
-
 /** Minimum last_seen advance before it is worth re-persisting. */
 const LAST_SEEN_PERSIST_THROTTLE_MS = 60_000
 
@@ -53,7 +46,6 @@ export class Store {
   private sessions: Map<string, Session> = new Map()
   private codeFails: Map<string, number> = new Map()
   private blockedCodes: Set<string> = new Set() // attempt-key hashes, never secrets
-  private ipAttempts: Map<string, IpAttempts> = new Map()
   private sessionFails: Map<string, { count: number; windowStart: number }> = new Map()
   /** Successful activations per session in the current window — see config. */
   private sessionActivations: Map<string, { count: number; windowStart: number }> = new Map()
@@ -77,7 +69,7 @@ export class Store {
   private onChange: (() => void) | null = null
 
   /**
-   * @param maxTrackingEntries cap for codeFails/blockedCodes/ipAttempts
+   * @param maxTrackingEntries cap for codeFails/blockedCodes/sessionFails
    * (memory safety under brute force); oldest entry evicted when full.
    * Tests pass a small value to exercise eviction.
    */
@@ -168,7 +160,7 @@ export class Store {
    * the viewer URL path). Throws 'rate limited' or 'invalid code' (single
    * error shape for missing/blocked codes and wrong sessions, per spec).
    */
-  activate(code: string, session_id: string, ip: string) {
+  activate(code: string, session_id: string) {
     // NOTE the order: the per-IP budget is checked on the FAILURE paths below,
     // not here. Gating the whole call on it refused a CORRECT code from an
     // address that had recently failed — and because this keys on the client
@@ -197,7 +189,7 @@ export class Store {
       // Charged like any other miss: this path short-circuits before the hash
       // compare, so leaving it free would let an attacker spam a code they
       // already know is blocked without ever touching their budget.
-      this.failActivation(ip)
+      this.failActivation()
     }
     const session = this.sessions.get(session_id)
     const codeMatches =
@@ -214,7 +206,7 @@ export class Store {
       }
       rec.count += 1
       this.setBounded(this.sessionFails, session_id, rec)
-      this.failActivation(ip)
+      this.failActivation()
     }
     // The code was right. From here on nothing that fails is an oracle: only a
     // caller who already holds the code can reach these branches.
@@ -607,63 +599,18 @@ export class Store {
   }
 
   /**
-   * Reject one activation attempt: charge the address, then throw.
+   * Reject one activation attempt.
    *
-   * ONLY failures are charged, and that is the whole point of this limit: the
-   * budget exists to throttle code GRINDING, and grinding is made of wrong
-   * guesses. A correct code is not an attack signal — it is proof the caller
-   * already had the secret.
-   *
-   * Charging successes too had a cost paid entirely by legitimate users,
-   * because this keys on the client ADDRESS: a team behind one office NAT, or
-   * one corporate VPN, shares a single bucket, so the sixth colleague to join
-   * the same share within a minute was told "too many attempts" while holding
-   * a perfectly good code. Measured against the live relay — five accepted,
-   * the sixth refused 429 with the right code in hand.
-   *
-   * Nothing about the brute-force defence moves: five wrong guesses a minute
-   * and fifty an hour per address still applies, a specific wrong code is
-   * still blocked after ten tries, and the per-session lockout (20 failures in
-   * 15 minutes, address-independent) is still what actually stops an attacker
-   * spreading the grind across many addresses.
-   *
-   * Over budget answers 'rate limited', under budget 'invalid code' — the same
-   * two outcomes a grinding client saw before. The check runs BEFORE the
-   * charge so an address that is already cut off cannot keep pushing its own
-   * window forward.
+   * A single outcome now: there is no per-address budget to charge, so every
+   * rejected guess looks the same to the caller. What actually throttles a
+   * grind is the per-SESSION consecutive-failure lock, applied at the top of
+   * activate() — counted per session precisely because an attacker can change
+   * address for free but cannot change which share they are attacking.
    */
-  private failActivation(ip: string): never {
-    const rec = this.ipWindow(ip)
-    if (rec.minuteCount >= config.ipLimitPerMinute || rec.hourCount >= config.ipLimitPerHour) {
-      throw new Error('rate limited')
-    }
-    rec.minuteCount += 1
-    rec.hourCount += 1
+  private failActivation(): never {
     throw new Error('invalid code')
   }
 
-  /**
-   * The per-IP activation window, rolled forward to `now`. Creating the record
-   * on read is deliberate: an address that never fails never costs anything
-   * beyond one bounded map entry.
-   */
-  private ipWindow(ip: string): IpAttempts {
-    const now = Date.now()
-    let rec = this.ipAttempts.get(ip)
-    if (!rec) {
-      rec = { minuteCount: 0, minuteStart: now, hourCount: 0, hourStart: now }
-      this.setBounded(this.ipAttempts, ip, rec)
-    }
-    if (now - rec.minuteStart >= config.ipWindowMs.minute) {
-      rec.minuteCount = 0
-      rec.minuteStart = now
-    }
-    if (now - rec.hourStart >= config.ipWindowMs.hour) {
-      rec.hourCount = 0
-      rec.hourStart = now
-    }
-    return rec
-  }
 
 
 

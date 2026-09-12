@@ -44,7 +44,7 @@ afterEach(() => {
 test('a snapshot round-trips every credential check', () => {
   const a = new Store()
   const created = a.createSession('ses_p1', '/work', 'title', '1.2.3.4')
-  const { viewer_token } = a.activate(created.access_code, 'ses_p1', '5.6.7.8')
+  const { viewer_token } = a.activate(created.access_code, 'ses_p1')
 
   const b = new Store()
   expect(b.restore(a.snapshot())).toBe(1)
@@ -57,7 +57,7 @@ test('a snapshot round-trips every credential check', () => {
   expect(b.getSessionByViewerToken(viewer_token)?.id).toBe('ses_p1')
   // A full in-memory snapshot carries the code, so the code still works after
   // restore (this is the encrypted-on-disk path; plaintext strips it below).
-  const activated = b.activate(created.access_code, 'ses_p1', '0.0.0.0')
+  const activated = b.activate(created.access_code, 'ses_p1')
   expect(activated.session_id).toBe('ses_p1')
 })
 
@@ -81,7 +81,7 @@ test('ENCRYPTED file: a live share AND its unused code survive a restart', () =>
   // Restore with the key → the code still activates a fresh viewer.
   const b = new Store()
   expect(b.restore(new FileStateStore(file, 0).load())).toBe(1)
-  const activated = b.activate(created.access_code, 'ses_enc', '9.9.9.9')
+  const activated = b.activate(created.access_code, 'ses_enc')
   expect(activated.session_id).toBe('ses_enc')
   expect(b.verifyViewer('ses_enc', activated.viewer_token)).toBe(true)
 })
@@ -105,7 +105,7 @@ test('ENCRYPTED file is unreadable without the key (a stolen volume copy is usel
 test('PLAINTEXT file (no key): stores no code hash, code salt or owner IP', () => {
   const store = new Store()
   const created = store.createSession('ses_pt', '/work', 'title', '1.2.3.4')
-  const { viewer_token } = store.activate(created.access_code, 'ses_pt', '5.6.7.8')
+  const { viewer_token } = store.activate(created.access_code, 'ses_pt')
   const write = new FileStateStore(file, 0, null)
   expect(write.encrypted).toBe(false)
   write.schedule(() => store.snapshot())
@@ -126,7 +126,7 @@ test('PLAINTEXT file (no key): stores no code hash, code salt or owner IP', () =
   const b = new Store()
   b.restore(new FileStateStore(file, 0, null).load())
   expect(b.verifyViewer('ses_pt', viewer_token)).toBe(true)
-  expect(() => b.activate(created.access_code, 'ses_pt', '9.9.9.9')).toThrow()
+  expect(() => b.activate(created.access_code, 'ses_pt')).toThrow()
 })
 
 test('stateKey accepts hex, 32-byte base64, or folds any secret to 32 bytes', () => {

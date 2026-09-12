@@ -18,11 +18,12 @@ export function activateRouter(store: Store) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
       return res.status(400).json({ error: 'invalid code' })
     }
-    // trust proxy is enabled in server.ts, so req.ip is the real client IP
-    // (first X-Forwarded-For hop) rather than the nginx peer.
+    // Kept for the log line only: activation itself is no longer throttled per
+    // address (see config.ts) — the brake is the per-session consecutive-failure
+    // lock. `trust proxy` still matters for registration, which does key on it.
     const ip = req.ip ?? 'unknown'
     try {
-      const { session_id, viewer_token } = store.activate(code, sessionId, ip)
+      const { session_id, viewer_token } = store.activate(code, sessionId)
       res.cookie('viewer_token', viewer_token, {
         httpOnly: true,
         secure: true,

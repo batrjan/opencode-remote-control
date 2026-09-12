@@ -30,48 +30,65 @@ test('trustProxy reads the deployment setting, defaulting to loopback', () => {
   expect(trustProxy()).toBe('loopback')
 })
 
-async function failedActivations(app: ReturnType<typeof createApp>, ips: string[]): Promise<number[]> {
+/**
+ * Registrations, not activations, are what `req.ip` now governs: the per-address
+ * limit on wrong codes is gone (an address is free to change, so it throttled
+ * colleagues behind one NAT and not the attacker it was aimed at — the brake is
+ * the per-session consecutive-failure lock instead). Registration still keys on
+ * the address, so `trust proxy` is still security-relevant and still tested:
+ * get it wrong and either every client collapses into the proxy's own address,
+ * or a client spoofs its way past the cap with a forged header.
+ */
+/** Unique across every call, so a repeat run never collides on a session id. */
+let probeSeq = 0
+
+async function registrations(app: ReturnType<typeof createApp>, ips: string[]): Promise<number[]> {
   const statuses: number[] = []
   for (const ip of ips) {
     const res = await request(app)
-      .post('/api/activate')
+      .post('/api/sessions')
       .set('X-Forwarded-For', ip)
-      .send({ code: 'AAAAAA', session_id: 'ses_none' })
+      .send({ session_id: `ses_probe_${probeSeq++}`, directory: '/work', title: 't' })
     statuses.push(res.status)
   }
   return statuses
 }
 
+/** One more than an address is allowed to hold active at once. */
+const OVER_CAP = config.maxActiveSessionsPerIp + 1
+
 test('per-IP limits key on the client behind a trusted proxy, not on the proxy', async () => {
   // supertest's peer is 127.0.0.1 — a trusted (loopback) proxy — so the
   // forwarded address is the client. Distinct clients never trip each other.
   const app = createApp(new Store())
-  const distinct = Array.from({ length: config.ipLimitPerMinute + 1 }, (_, i) => `203.0.113.${i + 1}`)
-  expect(await failedActivations(app, distinct)).toEqual(distinct.map(() => 400))
-  // ...while one client grinding codes is still cut off at the limit.
-  const same = Array.from({ length: config.ipLimitPerMinute + 1 }, () => '198.51.100.7')
-  const statuses = await failedActivations(app, same)
-  expect(statuses.slice(0, config.ipLimitPerMinute)).toEqual(same.slice(0, config.ipLimitPerMinute).map(() => 400))
-  expect(statuses[config.ipLimitPerMinute]).toBe(429)
+  const distinct = Array.from({ length: OVER_CAP }, (_, i) => `203.0.113.${i + 1}`)
+  expect(await registrations(app, distinct)).toEqual(distinct.map(() => 201))
+  // ...while one client past its cap is cut off.
+  const same = Array.from({ length: OVER_CAP }, () => '198.51.100.7')
+  const statuses = await registrations(app, same)
+  expect(statuses.slice(0, config.maxActiveSessionsPerIp)).toEqual(
+    Array.from({ length: config.maxActiveSessionsPerIp }, () => 201),
+  )
+  expect(statuses[config.maxActiveSessionsPerIp]).toBe(429)
 })
 
 test('a client-supplied X-Forwarded-For prefix cannot forge a new identity', async () => {
   // nginx APPENDS the real address: "spoofed, real". Express must take the
-  // right-most untrusted hop, so five different spoofed prefixes from one
-  // real client still count against that client.
+  // right-most untrusted hop, so different spoofed prefixes from one real
+  // client still count against that client.
   const app = createApp(new Store())
-  const spoofed = Array.from({ length: config.ipLimitPerMinute + 1 }, (_, i) => `10.0.0.${i + 1}, 198.51.100.9`)
-  const statuses = await failedActivations(app, spoofed)
-  expect(statuses[config.ipLimitPerMinute]).toBe(429)
+  const spoofed = Array.from({ length: OVER_CAP }, (_, i) => `10.0.0.${i + 1}, 198.51.100.9`)
+  const statuses = await registrations(app, spoofed)
+  expect(statuses[config.maxActiveSessionsPerIp]).toBe(429)
 })
 
 test('RELAY_TRUST_PROXY=false ignores the header entirely (direct exposure)', async () => {
   process.env.RELAY_TRUST_PROXY = 'false'
   const app = createApp(new Store())
-  const distinct = Array.from({ length: config.ipLimitPerMinute + 1 }, (_, i) => `203.0.113.${i + 1}`)
-  const statuses = await failedActivations(app, distinct)
-  // Every request is the same peer now, so the limit trips.
-  expect(statuses[config.ipLimitPerMinute]).toBe(429)
+  const distinct = Array.from({ length: OVER_CAP }, (_, i) => `203.0.113.${i + 1}`)
+  const statuses = await registrations(app, distinct)
+  // Every request is the same peer now, so the cap trips.
+  expect(statuses[config.maxActiveSessionsPerIp]).toBe(429)
 })
 
 test('responses carry hardening headers and no server fingerprint', async () => {

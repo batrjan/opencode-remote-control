@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest'
+import { expect, test, vi, afterEach } from 'vitest'
 import request from 'supertest'
 import { createApp } from '../src/server'
 import { Store } from '../src/store'
@@ -6,18 +6,30 @@ import { config } from '../src/config'
 
 process.env.ACTIVATE_FAIL_DELAY_MS = '0'
 
+afterEach(() => {
+  vi.useRealTimers()
+})
+
 /**
- * Who pays for the per-address activation budget.
+ * What stops someone guessing an access code.
  *
- * The limit exists to throttle code GRINDING, and grinding is made of wrong
- * guesses — so wrong guesses are what it charges for. It used to charge every
- * attempt, including correct ones, and the whole cost of that landed on
- * legitimate users: the limit keys on the client ADDRESS, and one address is
- * a whole office behind a NAT. The sixth colleague to enter the same share's
- * code within a minute was told "too many attempts" while holding a perfectly
- * good code. Measured against the live relay before this changed.
+ * There is deliberately no per-ADDRESS limit on activation attempts. An address
+ * costs nothing to change, so it throttled the wrong people — a team behind one
+ * office NAT shares a single bucket, and the sixth colleague to enter a
+ * perfectly good code was told "too many attempts" — while a determined
+ * attacker simply spread the grind across addresses and never noticed it.
  *
- * These tests pin both halves: the office gets in, the grinder does not.
+ * The brake is per SESSION and consecutive: five failures in a row against one
+ * share lock activation for that share for 15 minutes, regardless of where the
+ * attempts came from. An attacker cannot escape it by changing address, because
+ * they cannot change which share they are attacking.
+ *
+ * The cost lands on accidents rather than attackers, and it is real: while
+ * locked, activation is refused for EVERYONE, correct code included. That is
+ * not an oversight — admitting a correct code during a lockout would let a
+ * distributed attacker keep guessing at full speed and win on a lucky try,
+ * which is the whole thing the lockout prevents. Counting consecutively is what
+ * keeps it tolerable: one person's typo is forgotten the moment anyone gets in.
  */
 
 const OFFICE = '198.51.100.20'
@@ -37,87 +49,93 @@ test('a whole office behind one address can join the same share', async () => {
   const app = createApp(new Store())
   const { access_code } = await share(app, 'ses_office')
 
-  // Four times the old per-minute ceiling, every one of them a correct code,
-  // all from a single address — a team opening the link their colleague sent.
-  const joins = config.ipLimitPerMinute * 4
+  // Far more joins from one address than any per-address limit would have
+  // allowed, every one of them a correct code: a team opening the link a
+  // colleague sent. Nothing throttles a caller who knows the code.
+  const joins = 20
   const tokens = new Set<string>()
   for (let i = 0; i < joins; i++) {
     const res = await activate(app, 'ses_office', access_code, OFFICE)
     expect(res.status).toBe(200)
     tokens.add(res.body.viewer_token)
   }
-  // Distinct viewers, not one token handed out repeatedly.
   expect(tokens.size).toBe(joins)
 })
 
-test('a grinder on the same address is still cut off at the limit', async () => {
+test('five wrong codes in a row lock the share, whatever address they come from', async () => {
   const app = createApp(new Store())
-  await share(app, 'ses_grind')
+  const { access_code } = await share(app, 'ses_grind')
 
+  // Every guess from a different address — the spread that used to defeat a
+  // per-address limit entirely. It buys nothing here.
   const statuses: number[] = []
-  for (let i = 0; i <= config.ipLimitPerMinute; i++) {
-    // A DIFFERENT wrong code each time, so the per-code block (10 tries) does
-    // not fire first and the address budget is what answers.
-    const res = await activate(app, 'ses_grind', `ZZZZ${String(i).padStart(2, '0')}`, '203.0.113.44')
-    statuses.push(res.status)
+  for (let i = 0; i < config.sessionFailLockThreshold; i++) {
+    statuses.push((await activate(app, 'ses_grind', `ZZZZ${String(i).padStart(2, '0')}`, `203.0.113.${i + 1}`)).status)
   }
-  expect(statuses.slice(0, config.ipLimitPerMinute)).toEqual(
-    Array.from({ length: config.ipLimitPerMinute }, () => 400),
-  )
-  expect(statuses[config.ipLimitPerMinute]).toBe(429)
+  expect(statuses).toEqual(Array.from({ length: config.sessionFailLockThreshold }, () => 400))
+
+  // Locked: the next guess is refused without being evaluated...
+  expect((await activate(app, 'ses_grind', 'ZZZZ99', '203.0.113.99')).status).toBe(429)
+  // ...and so is the correct code, from an address that never failed. This is
+  // the deliberate cost: admitting it would reopen the door the lock just shut.
+  expect((await activate(app, 'ses_grind', access_code, '198.51.100.77')).status).toBe(429)
 })
 
-test("one colleague's typos do not lock out everyone else on the address", async () => {
+test('the count is consecutive: anyone getting in resets it', async () => {
   const app = createApp(new Store())
-  const { access_code } = await share(app, 'ses_typos')
+  const { access_code } = await share(app, 'ses_reset')
 
-  // Somebody burns the entire per-minute budget on wrong codes...
-  for (let i = 0; i < config.ipLimitPerMinute; i++) {
-    expect((await activate(app, 'ses_typos', `WRONG${i}`, OFFICE)).status).toBe(400)
+  // Four wrong — one short of the lock.
+  for (let i = 0; i < config.sessionFailLockThreshold - 1; i++) {
+    expect((await activate(app, 'ses_reset', `NO${i}`, OFFICE)).status).toBe(400)
   }
-  // ...and the next wrong guess from that address is refused, as it should be.
-  expect((await activate(app, 'ses_typos', 'WRONGX', OFFICE)).status).toBe(429)
-  // But a colleague with the RIGHT code is not collateral damage.
-  const good = await activate(app, 'ses_typos', access_code, OFFICE)
-  expect(good.status).toBe(200)
-  expect(typeof good.body.viewer_token).toBe('string')
+  // Somebody joins successfully, which clears the run.
+  expect((await activate(app, 'ses_reset', access_code, OFFICE)).status).toBe(200)
+  // So four more typos still do not lock the share...
+  for (let i = 0; i < config.sessionFailLockThreshold - 1; i++) {
+    expect((await activate(app, 'ses_reset', `NO2${i}`, OFFICE)).status).toBe(400)
+  }
+  // ...and a colleague with the right code is unaffected.
+  expect((await activate(app, 'ses_reset', access_code, OFFICE)).status).toBe(200)
 })
 
-test('spamming an already-blocked code still costs the address its budget', async () => {
-  // This path short-circuits before the hash compare. Leaving it free would
-  // let an attacker hammer a code they already know is dead without ever
-  // touching their budget.
+test('the lock is per share: grinding one does not touch another', async () => {
   const app = createApp(new Store())
-  await share(app, 'ses_blocked')
-  const ip = '203.0.113.77'
-  const CODE = 'BADBAD'
-
-  // Block the code from spread-out addresses so the block, not the budget, is
-  // what the attacker then runs into.
-  for (let i = 0; i < config.codeFailBlockThreshold; i++) {
-    expect((await activate(app, 'ses_blocked', CODE, `192.0.2.${i + 1}`)).status).toBe(400)
-  }
-  const statuses: number[] = []
-  for (let i = 0; i <= config.ipLimitPerMinute; i++) {
-    statuses.push((await activate(app, 'ses_blocked', CODE, ip)).status)
-  }
-  expect(statuses[config.ipLimitPerMinute]).toBe(429)
-})
-
-test('the per-session lockout is unchanged and still address-independent', async () => {
-  // The defence that actually matters against a distributed grind: it counts
-  // failures per SESSION, so spreading the attempts over many addresses buys
-  // an attacker nothing.
-  const app = createApp(new Store())
-  const { access_code } = await share(app, 'ses_locked')
+  const a = await share(app, 'ses_target')
+  const b = await share(app, 'ses_bystander')
 
   for (let i = 0; i < config.sessionFailLockThreshold; i++) {
-    // Every attempt from its own address, and a fresh wrong code each time.
-    const res = await activate(app, 'ses_locked', `NO${String(i).padStart(4, '0')}`, `203.0.${i + 1}.9`)
-    expect(res.status).toBe(400)
+    expect((await activate(app, 'ses_target', `NO${i}`, OFFICE)).status).toBe(400)
   }
-  // The session is locked now — even the correct code, even from an address
-  // that has never failed, is refused for the lockout window.
-  const res = await activate(app, 'ses_locked', access_code, '198.51.100.200')
-  expect(res.status).toBe(429)
+  expect((await activate(app, 'ses_target', a.access_code, OFFICE)).status).toBe(429)
+  // The share next door is untouched — same address, same moment.
+  expect((await activate(app, 'ses_bystander', b.access_code, OFFICE)).status).toBe(200)
+})
+
+test('the lock lifts on its own after the window', async () => {
+  vi.useFakeTimers()
+  const store = new Store()
+  const { access_code } = store.createSession('ses_window', '/work', 't', OFFICE)
+
+  for (let i = 0; i < config.sessionFailLockThreshold; i++) {
+    expect(() => store.activate(`NO${i}`, 'ses_window')).toThrow('invalid code')
+  }
+  expect(() => store.activate(access_code, 'ses_window')).toThrow('rate limited')
+
+  // Nothing has to happen for the share to recover: the window simply passes.
+  vi.setSystemTime(Date.now() + config.sessionFailLockMs + 1000)
+  expect(store.activate(access_code, 'ses_window').viewer_token).toBeTruthy()
+})
+
+test('a lockout caps guessing far below what the code space needs', () => {
+  // The number that makes five-in-a-row safe rather than merely tidy: the
+  // lockout admits sessionFailLockThreshold guesses per sessionFailLockMs, and
+  // the code is codeLength characters from codeAlphabet.
+  const perDay = (config.sessionFailLockThreshold * 86_400_000) / config.sessionFailLockMs
+  const space = Math.pow(config.codeAlphabet.length, config.codeLength)
+  const yearsToHalf = space / 2 / perDay / 365
+  expect(perDay).toBeLessThanOrEqual(500)
+  // ~4,400 years to an even chance. Not "millions", which is what this
+  // assertion exists to stop anyone (including a future comment) from claiming.
+  expect(yearsToHalf).toBeGreaterThan(1_000)
 })

@@ -15,23 +15,52 @@ export const config = {
   codeAlphabet: Array.from('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
     .filter((c) => !(EXCLUDED_FROM_CODE_ALPHABET as readonly string[]).includes(c))
     .join(''),
+  // NOTE: there is deliberately no per-address limit on activation attempts.
+  // An address is cheap to change, so it throttles the careless and not the
+  // determined, while the people it does reach are colleagues sharing one
+  // office NAT. The brake that matters is sessionFailLockThreshold below,
+  // which counts per SESSION and therefore cannot be spread across addresses.
+  // req.ip still governs REGISTRATION (registrationsPerWindow,
+  // maxActiveSessionsPerIp), so `trust proxy` remains security-relevant.
   /**
-   * Per-IP limits on FAILED activations (sliding window, evaluated lazily).
-   * Only misses are charged — see Store.failActivation: a correct code is not
-   * grinding, and charging it locked out everyone sharing an office NAT.
+   * Repeats of one specific wrong code against one session before that exact
+   * guess is refused outright, without even reaching the hash compare.
+   *
+   * Below sessionFailLockThreshold on purpose. The session lock fires after 5
+   * consecutive failures of ANY code, so a threshold of 10 here could never be
+   * reached inside a single lock window — the mechanism would have been dead
+   * code wearing the appearance of a defence. Three is enough: one attempt
+   * already proved the guess wrong, so repeating it is either a stuck client
+   * or noise, and answering it from a set lookup costs nothing.
    */
-  ipLimitPerMinute: 5,
-  ipLimitPerHour: 50,
-  ipWindowMs: { minute: 60_000, hour: 3_600_000 },
-  /** Global failed-attempt threshold per code before the code is blocked. */
-  codeFailBlockThreshold: 10,
+  codeFailBlockThreshold: 3,
   /**
-   * Per-session brute-force brake: after this many failed activations against
-   * one session (any code) within sessionFailLockMs, activation for that
-   * session is temporarily locked. This is the effective defense against
-   * grinding a known session's code across many IPs.
+   * Per-session brute-force brake, and the one that actually matters.
+   *
+   * Counted per SESSION and CONSECUTIVELY: any successful activation clears
+   * it, so reaching the threshold means nobody got the code right this many
+   * times running — which is what guessing looks like. Deliberately not keyed
+   * on the client address: an address is cheap to change and a determined
+   * attacker spreads the grind across many, so a per-address limit alone is a
+   * speed bump, not a defence.
+   *
+   * Five is generous against the only threat here. The lockout caps an
+   * attacker at 5 guesses per 15 minutes — 480 a day against a 6-character
+   * code from a 34-symbol alphabet (34^6 ~ 1.5e9), which is roughly 4,400
+   * years to an even chance of hitting one. Lowering it from 20 costs nothing
+   * in strength and cuts the exposure window fourfold. (The arithmetic is
+   * asserted in relay/test/activation-budget.test.ts so the numbers here
+   * cannot quietly drift apart from the constants below.)
+   *
+   * The cost is borne by accidents, not attackers: while locked, activation is
+   * refused for EVERYONE, correct code included. That is not an oversight —
+   * letting a correct code through during a lockout would let a distributed
+   * attacker keep guessing at full speed and simply win on a lucky try, which
+   * is exactly what the lockout exists to prevent. Being consecutive is what
+   * keeps this tolerable: one person's typo is forgotten the moment anyone
+   * gets in.
    */
-  sessionFailLockThreshold: 20,
+  sessionFailLockThreshold: 5,
   sessionFailLockMs: 15 * 60_000, // 15 minutes
   /** Token entropy (bytes) for bridge/viewer tokens. */
   tokenBytes: 32,

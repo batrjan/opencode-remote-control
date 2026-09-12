@@ -1,35 +1,42 @@
 import { expect, test } from 'vitest'
 import { Store } from '../src/store'
+import { config } from '../src/config'
 
 test('create session and activate code', () => {
   const store = new Store()
   const { access_code } = store.createSession('sess1', '/path', 'title', 'test-ip')
-  expect(store.activate(access_code, 'sess1', 'client1')).toEqual({ session_id: 'sess1', viewer_token: expect.any(String) })
+  expect(store.activate(access_code, 'sess1')).toEqual({ session_id: 'sess1', viewer_token: expect.any(String) })
 })
 
 test('a valid code for one session does not activate another', () => {
   const store = new Store()
   const { access_code } = store.createSession('sessA', '/path', 'title', 'test-ip')
   store.createSession('sessB', '/path', 'title', 'test-ip')
-  expect(() => store.activate(access_code, 'sessB', 'client_x')).toThrow('invalid code')
-  expect(store.activate(access_code, 'sessA', 'client_x')).toEqual({ session_id: 'sessA', viewer_token: expect.any(String) })
+  expect(() => store.activate(access_code, 'sessB')).toThrow('invalid code')
+  expect(store.activate(access_code, 'sessA')).toEqual({ session_id: 'sessA', viewer_token: expect.any(String) })
 })
 
 test('activation normalizes input to uppercase', () => {
   const store = new Store()
   const { access_code } = store.createSession('sess3', '/path', 'title', 'test-ip')
   const lowercased = access_code.toLowerCase()
-  expect(store.activate(lowercased, 'sess3', 'client_lc')).toEqual({ session_id: 'sess3', viewer_token: expect.any(String) })
+  expect(store.activate(lowercased, 'sess3')).toEqual({ session_id: 'sess3', viewer_token: expect.any(String) })
 })
 
-test('rate limit per code blocks after threshold, using distinct IPs', () => {
+test('one specific wrong code is blocked after a few repeats', () => {
   const store = new Store()
   const { access_code } = store.createSession('sess2', '/path', 'title', 'test-ip')
-  for (let i = 0; i < 11; i++) {
-    expect(() => store.activate('BAD', 'sess2', `client_${i}`)).toThrow()
+  // Deliberately fewer than sessionFailLockThreshold: the per-code block has to
+  // be reachable BEFORE the session lock swallows everything, or it is not a
+  // mechanism at all.
+  expect(config.codeFailBlockThreshold).toBeLessThan(config.sessionFailLockThreshold)
+  for (let i = 0; i < config.codeFailBlockThreshold; i++) {
+    expect(() => store.activate('BAD', 'sess2')).toThrow('invalid code')
   }
-  expect(store.isCodeBlocked('sess2', access_code)).toBe(false)
   expect(store.isCodeBlocked('sess2', 'BAD')).toBe(true)
+  // Only that guess: the real code is untouched, and still works.
+  expect(store.isCodeBlocked('sess2', access_code)).toBe(false)
+  expect(store.activate(access_code, 'sess2').viewer_token).toBeTruthy()
 })
 
 test('createSession rejects a duplicate session id', () => {
@@ -58,13 +65,13 @@ test('blockedCodes evicts the oldest entry when the cap is reached', () => {
   const store = new Store(2)
   for (const sess of ['sessA', 'sessB']) {
     for (let i = 0; i < 10; i++) {
-      expect(() => store.activate('AAAAAA', sess, `ip_${sess}_${i}`)).toThrow('invalid code')
+      expect(() => store.activate('AAAAAA', sess)).toThrow('invalid code')
     }
   }
   expect(store.isCodeBlocked('sessA', 'AAAAAA')).toBe(true)
   expect(store.isCodeBlocked('sessB', 'AAAAAA')).toBe(true)
   for (let i = 0; i < 10; i++) {
-    expect(() => store.activate('CCCCCC', 'sessC', `ip_c_${i}`)).toThrow('invalid code')
+    expect(() => store.activate('CCCCCC', 'sessC')).toThrow('invalid code')
   }
   expect(store.isCodeBlocked('sessC', 'CCCCCC')).toBe(true)
   expect(store.isCodeBlocked('sessA', 'AAAAAA')).toBe(false) // evicted (oldest)
@@ -72,26 +79,37 @@ test('blockedCodes evicts the oldest entry when the cap is reached', () => {
 
 test('codeFails evicts the oldest counter when the cap is reached', () => {
   const store = new Store(2)
-  // 5 fails each on A and B (below the block threshold of 10).
-  for (let i = 0; i < 5; i++) expect(() => store.activate('AAAAAA', 'sessA', `ip_a_${i}`)).toThrow()
-  for (let i = 0; i < 5; i++) expect(() => store.activate('BBBBBB', 'sessB', `ip_b_${i}`)).toThrow()
-  // First fail on C evicts A's counter; 5 more fails on A restart it at 1..5.
-  for (let i = 0; i < 6; i++) expect(() => store.activate('CCCCCC', 'sessC', `ip_c_${i}`)).toThrow()
-  for (let i = 0; i < 5; i++) expect(() => store.activate('AAAAAA', 'sessA', `ip_a2_${i}`)).toThrow()
-  // Had A's counter survived, A would now be at 10 fails and blocked.
+  // Two fails each on A and B — one short of the block threshold, and well
+  // short of the per-session lock, so neither fires and the counters just sit
+  // there filling the two-entry map.
+  const below = config.codeFailBlockThreshold - 1
+  for (let i = 0; i < below; i++) expect(() => store.activate('AAAAAA', 'sessA')).toThrow()
+  for (let i = 0; i < below; i++) expect(() => store.activate('BBBBBB', 'sessB')).toThrow()
+  // A fail on C evicts A's counter (insertion order, oldest first)...
+  expect(() => store.activate('CCCCCC', 'sessC')).toThrow()
+  // ...so A starts from zero again and stays under the threshold.
+  for (let i = 0; i < below; i++) expect(() => store.activate('AAAAAA', 'sessA')).toThrow()
+  // Had A's counter survived, A would be at 2 x below >= the threshold by now.
   expect(store.isCodeBlocked('sessA', 'AAAAAA')).toBe(false)
 })
 
-test('ipAttempts evicts the oldest record when the cap is reached', () => {
+test('sessionFails evicts the oldest record when the cap is reached', () => {
+  // The lockout counters live in a bounded map so a flood of attempts against
+  // invented session ids cannot grow memory without limit. Eviction costs a
+  // lockout, never a stored secret — the trade this cap deliberately makes.
   const store = new Store(2)
-  // ip1 exhausts its per-minute allowance.
-  for (let i = 0; i < 5; i++) expect(() => store.activate('ZZZZZZ', 'sessX', 'ip1')).toThrow('invalid code')
-  expect(() => store.activate('ZZZZZZ', 'sessX', 'ip1')).toThrow('rate limited')
-  // Two more IPs push ip1's record out of the bounded map.
-  expect(() => store.activate('ZZZZZZ', 'sessX', 'ip2')).toThrow('invalid code')
-  expect(() => store.activate('ZZZZZZ', 'sessX', 'ip3')).toThrow('invalid code')
-  // ip1's window is gone, so it is allowed again (and fails the code check).
-  expect(() => store.activate('ZZZZZZ', 'sessX', 'ip1')).toThrow('invalid code')
+  const lockOut = (id: string) => {
+    for (let i = 0; i < config.sessionFailLockThreshold; i++) {
+      expect(() => store.activate(`NO${i}`, id)).toThrow('invalid code')
+    }
+    expect(() => store.activate('ANY', id)).toThrow('rate limited')
+  }
+  lockOut('sessA')
+  // Two more sessions push sessA's record out of the two-entry map...
+  lockOut('sessB')
+  lockOut('sessC')
+  // ...so sessA is no longer locked and its attempts are evaluated again.
+  expect(() => store.activate('ZZZZZZ', 'sessA')).toThrow('invalid code')
 })
 
 test('per-session brute-force lockout: many failed codes against one session lock it temporarily', () => {
@@ -103,7 +121,7 @@ test('per-session brute-force lockout: many failed codes against one session loc
     expect(() => store.activate(`WRONG${i}`.slice(0, 6).padEnd(6, 'X'), 'sessB', `ip_bf_${i}`)).toThrow()
   }
   // The 21st attempt — even with the CORRECT code — is rate limited.
-  expect(() => store.activate(access_code, 'sessB', 'ip_legit')).toThrow('rate limited')
+  expect(() => store.activate(access_code, 'sessB')).toThrow('rate limited')
 })
 
 test('reapOrphans deletes idle sessions and keeps active ones', () => {
