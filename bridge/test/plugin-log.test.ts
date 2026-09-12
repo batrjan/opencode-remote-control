@@ -15,9 +15,9 @@ const NOISE = [
 ].join('\n')
 
 test('returns the URL and CODE lines even when server logs come first', () => {
-  const log = `${NOISE}\nhttps://relay.example/ses_abc\nCODE: XG8BTS\n`
+  const log = `${NOISE}\nhttps://relay.example/ses_abc\nCODE: ZZZ999\n`
   expect(parseBridgeLog(log)).toEqual({
-    ready: 'https://relay.example/ses_abc\nCODE: XG8BTS',
+    ready: 'https://relay.example/ses_abc\nCODE: ZZZ999',
     failure: undefined,
   })
 })

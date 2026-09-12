@@ -25,7 +25,7 @@
                                     │ WSS
                                     ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Relay-сервер (138.201.204.56)                │
+│                Relay-сервер (opencode.b4tr.net)                 │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │  Docker container: relay (Node.js + TypeScript)         │    │
 │  │  - API: POST /api/sessions, DELETE /api/sessions/:id    │    │

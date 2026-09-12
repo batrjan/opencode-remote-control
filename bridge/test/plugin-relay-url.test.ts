@@ -91,7 +91,7 @@ function withTempHome(run: (home: string, log: string) => void) {
 
 function writeLog(file: string) {
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-  writeFileSync(file, 'https://relay.example/ses_abc\nCODE: NQQS6K\n', { mode: 0o600 })
+  writeFileSync(file, 'https://relay.example/ses_abc\nCODE: ZZZ999\n', { mode: 0o600 })
 }
 
 test('clearLog wipes the access code out of an existing log', () => {
