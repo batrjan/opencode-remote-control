@@ -117,11 +117,37 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // make the relay buffer 100 KB per request.
   app.use('/api/activate', express.json({ limit: PUBLIC_BODY_LIMIT }), activateRouter(store))
   app.use('/api/sessions', express.json({ limit: PUBLIC_BODY_LIMIT }), skillRouter(store, bridge))
+  /**
+   * Send a viewer who lands here back to their own share, if we can tell which
+   * one it is.
+   *
+   * The bare code-entry page is a DEAD END for someone who already has a
+   * viewer cookie: it renders with no session id, which disables the input,
+   * because a code alone must never be accepted (see joinHtml). So a viewer
+   * bounced to the root — by the UI losing its footing, by a stale bookmark,
+   * by typing the host name — was shown a form they could not use, while the
+   * relay was holding the one thing needed to route them home: their cookie
+   * names their session.
+   *
+   * This grants nothing: the token already authorises exactly this session,
+   * and the redirect is the same one /<session_id> performs. Without a usable
+   * cookie there is genuinely nothing to route to, and the generic page — with
+   * its "open the full link you were given" — is the honest answer.
+   */
+  const viewerHome = (req: express.Request): string | undefined => {
+    const token = cookieViewerToken(req)
+    const session = token ? store.getSessionByViewerToken(token) : undefined
+    return session ? `/${session.id}` : undefined
+  }
   // The root URL is the viewer entry point; the SPA itself lives at /terminal.
   // Registered before static so express.static does not serve index.html here.
-  app.get('/', (_req, res) => res.redirect('/join'))
+  app.get('/', (req, res) => res.redirect(viewerHome(req) ?? '/join'))
   app.use(express.static(PUBLIC_DIR))
-  app.get('/join', (_req, res) => res.type('html').send(joinHtml(undefined)))
+  app.get('/join', (req, res) => {
+    const home = viewerHome(req)
+    if (home) return res.redirect(home)
+    return res.type('html').send(joinHtml(undefined))
+  })
   app.get('/terminal', (_req, res) => res.type('html').send(terminalHtml()))
   // Session-bound viewer entry: /<session_id>. Without a valid viewer cookie
   // it serves the code-entry page (with the session id embedded); with one it
