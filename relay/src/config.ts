@@ -72,10 +72,37 @@ export const config = {
   /**
    * Max concurrent viewer tokens one session may hold. Every activation mints
    * a fresh token (a reload, a second device, a re-join after a cookie loss),
-   * so the map is unbounded without a cap. At the cap the least-recently-used
-   * token is evicted — an idle tab loses access before an active one.
+   * so the map is unbounded without a cap. At the cap an IDLE token is
+   * evicted to make room — see viewerActiveWindowMs for why only an idle one.
    */
   maxViewersPerSession: 32,
+  /**
+   * How recently a viewer must have been seen to count as present.
+   *
+   * Eviction at the cap used to take the least-recently-used token whatever it
+   * was, which meant anyone holding the access code could mint tokens until
+   * every existing viewer had been pushed out — they gained nothing they did
+   * not already have, but they could silently drop everyone else. A viewer
+   * seen inside this window is now never displaced: the join is refused
+   * instead, so a share that is genuinely full says so rather than quietly
+   * taking someone's seat. Only seats nobody is sitting in get reclaimed.
+   */
+  viewerActiveWindowMs: 5 * 60_000,
+  /**
+   * Successful activations one SESSION may accept per window.
+   *
+   * Separate from the per-address limit on wrong codes: this one bounds how
+   * fast viewer tokens can be minted at all, by anyone, including someone
+   * holding a perfectly valid code. Sized well above a real team — the viewer
+   * cap is 32, so this is every seat filled twice over inside ten minutes —
+   * because the point is to stop a machine churning tokens, not to ration
+   * colleagues. It cannot by itself stop a determined code-holder from
+   * occupying seats (32 people joining and one attacker minting 32 tokens are
+   * indistinguishable by volume); viewerActiveWindowMs is what protects the
+   * people already in.
+   */
+  activationsPerSessionWindow: 64,
+  activationSessionWindowMs: 10 * 60_000,
 } as const
 
 /**

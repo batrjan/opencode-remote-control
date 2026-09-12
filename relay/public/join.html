@@ -153,11 +153,16 @@
           }
           const body = await res.json().catch(() => ({}))
           error.textContent =
-            res.status === 429
-              ? 'Too many attempts. Try again later.'
-              : body.error === 'invalid code'
-                ? 'Invalid or expired code.'
-                : 'Something went wrong. Try again.'
+            // A full share is not a rejected code: the code was right, every
+            // seat is simply taken. Saying "too many attempts" here would send
+            // someone off to re-check a code that is perfectly good.
+            body.error === 'session full'
+              ? 'This session already has the maximum number of viewers. Ask the owner to free a seat.'
+              : res.status === 429
+                ? 'Too many attempts. Try again later.'
+                : body.error === 'invalid code'
+                  ? 'Invalid or expired code.'
+                  : 'Something went wrong. Try again.'
         } catch {
           error.textContent = 'Network error. Check your connection.'
         } finally {

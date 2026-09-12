@@ -55,7 +55,8 @@ test('a viewer token in active use survives far past the idle window (sliding re
   expect(store.verifyViewer('s_slide', viewer_token)).toBe(false)
 })
 
-test('exceeding maxViewersPerSession evicts the least-recently-used token', () => {
+test('a seat nobody is sitting in is reclaimed at the cap', () => {
+  vi.useFakeTimers()
   const store = new Store()
   const { access_code } = store.createSession('s_cap', '/work', 'title', '1.1.1.1')
   const tokens: string[] = []
@@ -64,17 +65,85 @@ test('exceeding maxViewersPerSession evicts the least-recently-used token', () =
   }
   expect(store.getSession('s_cap')?.viewers.size).toBe(config.maxViewersPerSession)
 
-  // Use the oldest token — that must take it out of the eviction line.
+  // Everyone goes quiet long enough to count as gone...
+  vi.setSystemTime(Date.now() + config.viewerActiveWindowMs + 1000)
+  // ...except the oldest token, which is used and therefore present again.
   expect(store.verifyViewer('s_cap', tokens[0]!)).toBe(true)
   const extra = store.activate(access_code, 's_cap', 'ip_extra').viewer_token
 
   expect(store.getSession('s_cap')?.viewers.size).toBe(config.maxViewersPerSession)
-  // tokens[1] was the coldest, so it is the one that went.
+  // tokens[1] was the coldest idle seat, so it is the one that went.
   expect(store.verifyViewer('s_cap', tokens[1]!)).toBe(false)
   expect(store.getSessionByViewerToken(tokens[1]!)).toBeUndefined()
   // The refreshed oldest and the brand-new token both still work.
   expect(store.verifyViewer('s_cap', tokens[0]!)).toBe(true)
   expect(store.getSessionByViewerToken(extra)?.id).toBe('s_cap')
+})
+
+/**
+ * The half that matters for abuse: at the cap, a viewer who is still PRESENT
+ * is never displaced. Eviction used to take the least-recently-used token
+ * whatever it was, so anyone holding the access code could mint tokens until
+ * every existing viewer had been pushed out — no access they lacked, but a
+ * silent eviction of everyone else.
+ */
+test('a full session refuses a new viewer instead of taking a present one\'s seat', () => {
+  const store = new Store()
+  const { access_code } = store.createSession('s_full', '/work', 'title', '1.1.1.1')
+  const tokens: string[] = []
+  for (let i = 0; i < config.maxViewersPerSession; i++) {
+    tokens.push(store.activate(access_code, 's_full', `ip_${i}`).viewer_token)
+  }
+
+  // Every seat was taken seconds ago, so every seat is occupied by somebody
+  // present. The next join is refused — with its own error, because the code
+  // was correct and the caller deserves to know that.
+  expect(() => store.activate(access_code, 's_full', 'ip_attacker')).toThrow('session full')
+
+  // And nobody lost their seat to the attempt.
+  expect(store.getSession('s_full')?.viewers.size).toBe(config.maxViewersPerSession)
+  for (const t of tokens) expect(store.verifyViewer('s_full', t)).toBe(true)
+})
+
+test('the per-session mint budget bounds how fast tokens can be minted', () => {
+  vi.useFakeTimers()
+  const store = new Store()
+  const { access_code } = store.createSession('s_mint', '/work', 'title', '1.1.1.1')
+  // Age the existing viewers instead of moving the clock: seats must stay
+  // reclaimable so the CAP is never what refuses, while the mint window —
+  // which the clock would also reset — keeps running.
+  const freeTheSeats = () => {
+    const s = store.getSession('s_mint')!
+    for (const v of s.viewers.values()) v.last_used = Date.now() - config.viewerActiveWindowMs - 1000
+  }
+  for (let i = 0; i < config.activationsPerSessionWindow; i++) {
+    expect(store.activate(access_code, 's_mint', `ip_${i}`).viewer_token).toBeTruthy()
+    freeTheSeats()
+  }
+  // The budget is spent — with a seat free and a valid code in hand.
+  expect(() => store.activate(access_code, 's_mint', 'ip_over')).toThrow('rate limited')
+
+  // It is a window, not a lifetime cap: it refills.
+  vi.setSystemTime(Date.now() + config.activationSessionWindowMs + 1000)
+  freeTheSeats()
+  expect(store.activate(access_code, 's_mint', 'ip_after').viewer_token).toBeTruthy()
+})
+
+test('re-sharing a session id does not inherit the old share mint budget', () => {
+  const store = new Store()
+  const first = store.createSession('s_reshare', '/work', 'title', '1.1.1.1')
+  store.activate(first.access_code, 's_reshare', 'ip_a')
+  expect(store.deleteSession('s_reshare')).toBe(true)
+
+  // opencode reuses the session id when the same session is shared again; the
+  // new share must start with a clean counter and a clean viewer list.
+  const second = store.createSession('s_reshare', '/work', 'title', '1.1.1.1')
+  for (let i = 0; i < config.activationsPerSessionWindow; i++) {
+    expect(store.activate(second.access_code, 's_reshare', `ip_${i}`).viewer_token).toBeTruthy()
+    // keep seats reclaimable
+    const s = store.getSession('s_reshare')!
+    for (const v of s.viewers.values()) v.last_used = Date.now() - config.viewerActiveWindowMs - 1000
+  }
 })
 
 test('deleteSession leaves no lookup entry that can authenticate', () => {

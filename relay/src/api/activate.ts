@@ -43,6 +43,15 @@ export function activateRouter(store: Store) {
         console.warn(`[activate] rate limited ip=${ip}`)
         return res.status(429).json({ error: 'rate limited' })
       }
+      // Distinct from every other rejection, and safe to be distinct: this one
+      // is only ever reached AFTER the code matched, so it tells an attacker
+      // nothing they did not already know. Telling the caller the share is
+      // full — rather than "invalid code" — is the difference between a person
+      // retrying a code that is fine and a person asking the owner for a seat.
+      if (err instanceof Error && err.message === 'session full') {
+        console.warn(`[activate] session at viewer capacity ip=${ip}`)
+        return res.status(429).json({ error: 'session full' })
+      }
       // Never log the attempted code (could be a typo'd real one); the IP is
       // the signal needed for abuse monitoring.
       console.warn(`[activate] rejected code attempt from ip=${ip}`)

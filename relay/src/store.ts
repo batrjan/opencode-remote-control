@@ -55,6 +55,8 @@ export class Store {
   private blockedCodes: Set<string> = new Set() // attempt-key hashes, never secrets
   private ipAttempts: Map<string, IpAttempts> = new Map()
   private sessionFails: Map<string, { count: number; windowStart: number }> = new Map()
+  /** Successful activations per session in the current window — see config. */
+  private sessionActivations: Map<string, { count: number; windowStart: number }> = new Map()
   private registrations: Map<string, { count: number; windowStart: number }> = new Map()
   /**
    * viewerIndexKey(token) -> session id. Viewer auth used to be a linear scan
@@ -214,15 +216,34 @@ export class Store {
       this.setBounded(this.sessionFails, session_id, rec)
       this.failActivation(ip)
     }
+    // The code was right. From here on nothing that fails is an oracle: only a
+    // caller who already holds the code can reach these branches.
+    //
+    // Per-session mint rate. The per-address budget above only counts misses,
+    // so it says nothing about a caller who keeps presenting a VALID code —
+    // this is the bound on how fast tokens can be minted at all.
+    const activations = this.sessionActivations.get(session_id) ?? { count: 0, windowStart: now }
+    if (now - activations.windowStart >= config.activationSessionWindowMs) {
+      activations.count = 0
+      activations.windowStart = now
+    }
+    if (activations.count >= config.activationsPerSessionWindow) {
+      throw new Error('rate limited')
+    }
     // Successful activation clears the session's failure window.
     this.sessionFails.delete(session_id)
+    const issuedAt = Date.now()
+    // Make room before minting: drop anything already idle-expired, then
+    // reclaim a seat nobody is sitting in. If every seat is occupied by
+    // somebody still present, refuse this join rather than take theirs.
+    this.pruneExpiredViewers(session, issuedAt)
+    if (!this.evictViewers(session, config.maxViewersPerSession - 1, issuedAt)) {
+      throw new Error('session full')
+    }
+    activations.count += 1
+    this.setBounded(this.sessionActivations, session_id, activations)
     const viewer_token = generateToken()
     const salt = newSalt()
-    const issuedAt = Date.now()
-    // Make room before minting: drop anything already idle-expired, then evict
-    // down to one slot below the cap so the new token fits.
-    this.pruneExpiredViewers(session, issuedAt)
-    this.evictViewers(session, config.maxViewersPerSession - 1)
     const index = viewerIndexKey(viewer_token)
     session.viewers.set(saltedHash(viewer_token, salt), {
       salt,
@@ -341,14 +362,27 @@ export class Store {
    * Recency IS insertion order here (matchViewer re-inserts on every use), so
    * the first key is always the coldest token.
    */
-  private evictViewers(session: Session, max: number): void {
+  /**
+   * Reclaim seats down to `max`, but only ones nobody is sitting in.
+   *
+   * Map order is recency (a successful match re-inserts), so the front of the
+   * map is the least recently used — the right candidate. The guard is what
+   * changed: a viewer seen inside config.viewerActiveWindowMs is present, and
+   * a present viewer is never displaced to make room for a new one. Anyone
+   * holding the access code could otherwise mint tokens until every existing
+   * viewer had been pushed out: no access they lacked, but a silent eviction
+   * of everyone else. Returns whether there is now room.
+   */
+  private evictViewers(session: Session, max: number, now: number): boolean {
     while (session.viewers.size > max) {
       const oldest = session.viewers.entries().next()
-      if (oldest.done) return
+      if (oldest.done) break
       const [hash, viewer] = oldest.value
+      if (now - viewer.last_used <= config.viewerActiveWindowMs) return false
       session.viewers.delete(hash)
       this.dropIndexEntry(session.id, viewer)
     }
+    return session.viewers.size <= max
   }
 
   /** Remove a departing viewer's lookup entry (see viewerIndex). */
@@ -379,6 +413,10 @@ export class Store {
     // Revoke the viewer tokens with the session: a leftover index entry would
     // outlive what it points at.
     this.dropViewers(session)
+    // ...and its mint counter. An opencode session id is reused when the same
+    // session is shared again, so a surviving counter would charge the new
+    // share for the old one's joins.
+    this.sessionActivations.delete(session_id)
     this.sessions.delete(session_id)
     this.changed()
     return true
@@ -406,6 +444,7 @@ export class Store {
     for (const [id, session] of this.sessions) {
       if (now - session.last_seen > maxIdleMs) {
         this.dropViewers(session) // same revocation as deleteSession
+        this.sessionActivations.delete(id)
         this.sessions.delete(id)
         removed.push(id)
       }
