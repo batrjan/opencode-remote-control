@@ -423,6 +423,10 @@ export class Store {
     return this.sessions.size
   }
 
+  sessionIds(): string[] {
+    return [...this.sessions.keys()]
+  }
+
   /**
    * Reap orphaned sessions: a session whose bridge never connected (or
    * disconnected long ago) and that has been idle longer than `maxIdleMs`

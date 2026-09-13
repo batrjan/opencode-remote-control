@@ -354,6 +354,11 @@ export async function startServer(port: number = config.port): Promise<http.Serv
   // session API needs it to disconnect a bridge when its session is deleted.
   const server = http.createServer()
   const bridge = new BridgeClient(server, store)
+  // Every session in the store here was restored from the state file, and its
+  // bridge is re-dialling on a backoff that the downtime has stretched to
+  // seconds. Viewers reconnecting to this process refetch meanwhile; their
+  // GETs must wait for that dial like after any other drop, not fail at once.
+  for (const id of store.sessionIds()) bridge.expectReconnect(id)
   const app = createApp(store, bridge)
   server.on('request', app)
   server.on('close', () => bridge.close())

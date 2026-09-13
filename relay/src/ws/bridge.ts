@@ -329,6 +329,21 @@ export class BridgeClient {
     }
   }
 
+  /**
+   * Treat this session's bridge as re-dialling, as if the relay had seen its
+   * link drop. For sessions restored from a previous relay process: their
+   * bridges were connected to that process and are dialling this one, but the
+   * drop was recorded in memory that did not survive the restart. Without it,
+   * every viewer GET in the seconds before the bridge's next dial failed at
+   * once with 502 "bridge not connected" instead of waiting for it. It also
+   * makes that dial a re-dial, so open viewers are caught up on what opencode
+   * emitted while no relay was listening. A bridge that never returns costs a
+   * GET the same bounded wait as after a live drop, for the same 60 s.
+   */
+  expectReconnect(session_id: string): void {
+    if (!this.isConnected(session_id)) this.markDropped(session_id)
+  }
+
   /** Record a lost link. Bounded: stale entries are pruned once the map grows. */
   private markDropped(session_id: string): void {
     const now = Date.now()
