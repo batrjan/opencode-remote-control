@@ -7104,6 +7104,10 @@ function wsHandshakeTimeoutMs() {
   const v = Number(process.env.REMOTE_CONTROL_WS_HANDSHAKE_TIMEOUT_MS);
   return Number.isFinite(v) && v > 0 ? v : 15e3;
 }
+function relayDeleteTimeoutMs() {
+  const v = Number(process.env.REMOTE_CONTROL_RELAY_DELETE_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : 5e3;
+}
 function reconnectBaseMs() {
   return Number(process.env.REMOTE_CONTROL_RECONNECT_BASE_MS ?? 1e3);
 }
@@ -7398,11 +7402,18 @@ var RelayClient = class {
     if (!res.ok) throw new Error(`relay createSession failed: ${res.status}`);
     return await res.json();
   }
-  /** End a session on the relay. Requires the session's own bridge_token. */
-  async deleteSession(sessionId, bridgeToken) {
+  /**
+   * End a session on the relay. Requires the session's own bridge_token.
+   *
+   * Bounded by `timeoutMs` (rejects with a TimeoutError): every caller runs it
+   * while shutting a share down, and a relay that never answers must not be
+   * able to hold that shutdown open.
+   */
+  async deleteSession(sessionId, bridgeToken, timeoutMs = relayDeleteTimeoutMs()) {
     const res = await fetch(`${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
       method: "DELETE",
-      headers: { ...this.headers(), "x-bridge-token": bridgeToken }
+      headers: { ...this.headers(), "x-bridge-token": bridgeToken },
+      signal: AbortSignal.timeout(timeoutMs)
     });
     return res.status;
   }
@@ -8212,13 +8223,25 @@ async function stopBridge(relayUrl, sessionId, apiKey) {
   if (!state) {
     return;
   }
-  const status = await new RelayClient(relayUrl, apiKey).deleteSession(sessionId, state.bridge_token);
-  if (status !== 204 && status !== 404) {
-    throw new Error(`relay deleteSession failed: ${status}`);
+  let relayFailure;
+  try {
+    const status = await new RelayClient(relayUrl, apiKey).deleteSession(sessionId, state.bridge_token);
+    if (status !== 204 && status !== 404) relayFailure = `relay answered ${status}`;
+  } catch (err) {
+    relayFailure = describeRelayError(err);
   }
   clearSessionState(sessionId);
   terminateBridgeProcess(state.pid, state.started_at);
   terminateSpawnedServer(state.server_pid, state.started_at);
+  if (relayFailure === void 0) return;
+  return `Remote control stopped on this machine, but the relay could not be told (${relayFailure}). The bridge is gone, so the share cannot reconnect; the relay expires the session on its own.`;
+}
+function describeRelayError(err) {
+  if (err instanceof Error && err.name === "TimeoutError") {
+    return `relay did not answer within ${Math.round(relayDeleteTimeoutMs() / 1e3)} s`;
+  }
+  const code = err?.cause?.code;
+  return `relay unreachable: ${typeof code === "string" ? code : errorMessage(err)}`;
 }
 var SERVE_COMMAND_RE = /(^|[/\\])opencode(\.exe)?\s+serve(\s|$)/;
 function terminateSpawnedServer(pid, startedAt, inspect = describeProcess) {
@@ -8393,8 +8416,8 @@ program2.command("stop").description("End a remote-control session on the relay"
     return;
   }
   try {
-    await stopBridge(opts.relay, sessionId, opts.apiKey);
-    console.log("Remote control stopped.");
+    const warning = await stopBridge(opts.relay, sessionId, opts.apiKey);
+    console.log(warning ?? "Remote control stopped.");
   } catch (err) {
     console.error(`bridge stop failed: ${errorMessage(err)}`);
     process.exitCode = 1;

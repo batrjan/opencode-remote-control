@@ -49,6 +49,20 @@ export function wsHandshakeTimeoutMs(): number {
   return Number.isFinite(v) && v > 0 ? v : 15_000
 }
 
+/**
+ * Deadline for the relay DELETE that ends a session. The request used to carry
+ * none: against a relay that accepts the connection and never answers (a
+ * wedged upstream, a black-holed network) `stop` was still waiting after 25 s,
+ * and the plugin only gave up when its 15 s wait for the CLI killed it, with
+ * nothing torn down. The request is a few hundred bytes, which even a
+ * 0.7 Mbit/s uplink moves in well under a second; the deadline leaves `stop`
+ * room inside that 15 s to take the share down locally and say what happened.
+ */
+export function relayDeleteTimeoutMs(): number {
+  const v = Number(process.env.REMOTE_CONTROL_RELAY_DELETE_TIMEOUT_MS)
+  return Number.isFinite(v) && v > 0 ? v : 5_000
+}
+
 /** First reconnect delay; doubles per attempt up to reconnectMaxMs. */
 export function reconnectBaseMs(): number {
   return Number(process.env.REMOTE_CONTROL_RECONNECT_BASE_MS ?? 1_000)

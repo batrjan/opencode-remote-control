@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { realpathSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { Command } from 'commander'
-import { config, opencodeAuthHeader, watchdogIntervalMs } from './config.js'
+import { config, opencodeAuthHeader, relayDeleteTimeoutMs, watchdogIntervalMs } from './config.js'
 import { detectOpenCodePort, ensureOpenCodeServer } from './detect.js'
 import { OpencodeClient } from './opencode.js'
 import { RelayClient, RelayWSClient } from './relay.js'
@@ -150,7 +150,9 @@ export async function startBridge(
     try {
       await relay.deleteSession(session_id, bridge_token)
     } catch {
-      // Best effort: the relay may itself be unreachable at shutdown.
+      // Best effort: the relay may itself be unreachable at shutdown. The
+      // DELETE is time-bounded, so a relay that never answers cannot keep a
+      // SIGTERM'd bridge alive after its share is already down (ws closed above).
     }
     clearSessionState(session_id)
     resolveClosed()
@@ -187,11 +189,18 @@ export async function startBridge(
   return { session_id, access_code, viewer_url, closed, stop }
 }
 
+/**
+ * End a share: delete the relay session, then take the share down on this
+ * machine (state file, bridge process, the server it spawned).
+ *
+ * Resolves with nothing when the relay confirmed, and with a warning to show
+ * the owner when it could not be told — the local teardown happens either way.
+ */
 export async function stopBridge(
   relayUrl: string,
   sessionId: string,
   apiKey?: string,
-): Promise<void> {
+): Promise<string | undefined> {
   // Deleting a session requires its OWN bridge_token (never a shared key) —
   // read it from the state `start` persisted.
   const state = loadSessionState(sessionId)
@@ -200,10 +209,22 @@ export async function stopBridge(
     // delete the session. Treat as already-stopped (idempotent).
     return
   }
-  const status = await new RelayClient(relayUrl, apiKey).deleteSession(sessionId, state.bridge_token)
-  // 404 means the session is already gone — stop stays idempotent.
-  if (status !== 204 && status !== 404) {
-    throw new Error(`relay deleteSession failed: ${status}`)
+  // The relay's answer must not decide whether the share ends here. A failed
+  // or unanswered DELETE used to throw before anything local happened, and
+  // that is exactly when a relay restarts behind nginx (502), is down, or the
+  // owner's network cannot reach it: the bridge treats all of those as a
+  // passing outage and keeps re-dialling, and since the relay persists
+  // sessions, the share came back with it — same access code — while the owner
+  // had been told only that stop failed. Once the bridge and this state file
+  // (the only copies of the bridge_token) are gone, nothing can re-attach the
+  // relay's record to a bridge; it proxies nothing and expires on its own.
+  let relayFailure: string | undefined
+  try {
+    const status = await new RelayClient(relayUrl, apiKey).deleteSession(sessionId, state.bridge_token)
+    // 404 means the session is already gone — stop stays idempotent.
+    if (status !== 204 && status !== 404) relayFailure = `relay answered ${status}`
+  } catch (err) {
+    relayFailure = describeRelayError(err)
   }
   clearSessionState(sessionId)
   terminateBridgeProcess(state.pid, state.started_at)
@@ -214,6 +235,24 @@ export async function stopBridge(
   // it, so a new share can end up bound to a server left over from an old one.
   // Finish the cleanup here, with the same identity check the bridge pid gets.
   terminateSpawnedServer(state.server_pid, state.started_at)
+  if (relayFailure === undefined) return
+  // Not a failure — the share did end, which is what was asked — but not a
+  // clean stop either, and it must not read like one.
+  return (
+    `Remote control stopped on this machine, but the relay could not be told (${relayFailure}). ` +
+    'The bridge is gone, so the share cannot reconnect; the relay expires the session on its own.'
+  )
+}
+
+/** A relay DELETE that threw, in words the owner can act on. */
+function describeRelayError(err: unknown): string {
+  if (err instanceof Error && err.name === 'TimeoutError') {
+    return `relay did not answer within ${Math.round(relayDeleteTimeoutMs() / 1000)} s`
+  }
+  // fetch reports every network failure as "fetch failed"; the errno (refused,
+  // DNS, reset) is on its cause.
+  const code = (err as { cause?: { code?: unknown } } | undefined)?.cause?.code
+  return `relay unreachable: ${typeof code === 'string' ? code : errorMessage(err)}`
 }
 
 /** Command lines that belong to an `opencode serve` the bridge started. */
@@ -517,8 +556,11 @@ program
       return
     }
     try {
-      await stopBridge(opts.relay, sessionId, opts.apiKey)
-      console.log('Remote control stopped.')
+      // A relay that could not be told still exits 0 with its warning on
+      // stdout: the share is down, so the plugin must report it stopped (and
+      // scrub the logged code) rather than "stop failed", with the reason.
+      const warning = await stopBridge(opts.relay, sessionId, opts.apiKey)
+      console.log(warning ?? 'Remote control stopped.')
     } catch (err) {
       console.error(`bridge stop failed: ${errorMessage(err)}`)
       process.exitCode = 1

@@ -53,6 +53,19 @@ function spawnDummyBridge(): ChildProcess {
 
 const spawnedBridgeDirs: string[] = []
 
+/**
+ * A stand-in for the `opencode serve` a bridge spawned — named like one, since
+ * `stop` only signals a recorded server pid whose command line is an
+ * `opencode serve` (the same recycled-pid guard the bridge pid gets).
+ */
+function spawnDummyOpencodeServe(): ChildProcess {
+  const dir = mkdtempSync(path.join(tmpdir(), 'bridge-stop-serve-'))
+  const entry = path.join(dir, 'opencode')
+  writeFileSync(entry, "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000)\n")
+  spawnedBridgeDirs.push(dir)
+  return spawn(process.execPath, [entry, 'serve'], { stdio: 'ignore' })
+}
+
 function alive(pid: number): boolean {
   try {
     process.kill(pid, 0)
@@ -206,3 +219,77 @@ test('stop never signals a live process that is not a bridge (recycled pid)', as
   stranger.kill()
   await waitForExit(stranger)
 })
+
+/**
+ * `stop` while the relay cannot be told. `stop` used to put every bit of local
+ * teardown behind a successful relay DELETE: a relay restarting behind nginx
+ * (502), a relay that is down or unreachable from the owner's network (refused)
+ * or one that accepts the connection and never answers made it fail — or hang
+ * with no bound at all — before it cleared the state file or signalled a single
+ * process. The bridge meanwhile treats all of that as a transient outage and
+ * keeps re-dialling; the relay persists sessions, so once it was back the share
+ * came back with it, same access code, with the owner told only "stop failed".
+ *
+ * The owner asked to stop: the share has to end on this machine whatever the
+ * relay says. Once the bridge and the state file (the only copies of the
+ * bridge_token) are gone, nothing can re-attach the relay's record to a bridge.
+ */
+async function relayStandin(kind: '502' | 'refused' | 'hang'): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = createServer((_req, res) => {
+    if (kind === 'hang') return // accept, read the request, never answer
+    res.writeHead(502, { 'Content-Type': 'text/html' })
+    res.end('<html><body><h1>502 Bad Gateway</h1></body></html>')
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+  const close = async () => {
+    server.closeAllConnections()
+    await new Promise((resolve) => server.close(resolve))
+  }
+  // Connection refused: a port that was just bound and released again.
+  if (kind === 'refused') await close()
+  return { url, close: kind === 'refused' ? async () => {} : close }
+}
+
+for (const [outage, kind, reason] of [
+  ['the relay answers 502 (restarting behind nginx)', '502', /502/],
+  ['the relay refuses the connection (down / unreachable)', 'refused', /unreachable/],
+  ['the relay accepts the connection and never answers', 'hang', /did not answer/],
+] as const) {
+  test(`stop ends the share on this machine when ${outage}`, async () => {
+    const relayDown = await relayStandin(kind)
+    const bridge = spawnDummyBridge()
+    const server = spawnDummyOpencodeServe()
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    const id = `sess-relay-down-${kind}`
+    saveSessionState({
+      session_id: id,
+      access_code: 'XXXXXX',
+      bridge_token: 'token-the-relay-never-sees',
+      relay: relayDown.url,
+      started_at: Date.now(),
+      pid: bridge.pid,
+      server_pid: server.pid,
+    })
+    try {
+      const outcome = await Promise.race([
+        stopBridge(relayDown.url, id).then(
+          (warning) => ({ warning }),
+          (err: Error) => ({ error: err.message }),
+        ),
+        new Promise((resolve) => setTimeout(() => resolve('still pending after 8 s'), 8_000)),
+      ])
+      // Settles, and does not fail: the share did end, which is what was asked.
+      expect(outcome).toEqual({ warning: expect.stringMatching(reason) })
+      // ...but it must not pass for a clean stop: the relay was never told.
+      expect((outcome as { warning: string }).warning).toMatch(/relay could not be told/)
+      expect(await waitForExit(bridge)).toBe(true)
+      expect(await waitForExit(server)).toBe(true)
+      expect(loadSessionState(id)).toBeUndefined()
+    } finally {
+      for (const child of [bridge, server]) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      clearSessionState(id)
+      await relayDown.close()
+    }
+  }, 20_000)
+}

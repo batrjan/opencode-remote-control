@@ -2,7 +2,14 @@ import type { Socket } from 'node:net'
 import { gzip } from 'node:zlib'
 import WebSocket from 'ws'
 import type { OpencodeClient } from './opencode.js'
-import { backoffDelay, eventHighWaterBytes, eventRetryMs, wsHandshakeTimeoutMs, wsPingIntervalMs } from './config.js'
+import {
+  backoffDelay,
+  eventHighWaterBytes,
+  eventRetryMs,
+  relayDeleteTimeoutMs,
+  wsHandshakeTimeoutMs,
+  wsPingIntervalMs,
+} from './config.js'
 
 /**
  * Client for the public relay's bridge-facing session API.
@@ -63,11 +70,18 @@ export class RelayClient {
     return (await res.json()) as RelaySession
   }
 
-  /** End a session on the relay. Requires the session's own bridge_token. */
-  async deleteSession(sessionId: string, bridgeToken: string): Promise<number> {
+  /**
+   * End a session on the relay. Requires the session's own bridge_token.
+   *
+   * Bounded by `timeoutMs` (rejects with a TimeoutError): every caller runs it
+   * while shutting a share down, and a relay that never answers must not be
+   * able to hold that shutdown open.
+   */
+  async deleteSession(sessionId: string, bridgeToken: string, timeoutMs = relayDeleteTimeoutMs()): Promise<number> {
     const res = await fetch(`${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
       method: 'DELETE',
       headers: { ...this.headers(), 'x-bridge-token': bridgeToken },
+      signal: AbortSignal.timeout(timeoutMs),
     })
     return res.status
   }

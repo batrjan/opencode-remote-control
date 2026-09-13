@@ -53,7 +53,8 @@ beforeEach(async () => {
     if (req.url === '/health') return res.end('{}')
     const id = /^\/api\/sessions\/([^/?]+)$/.exec(req.url ?? '')?.[1]
     if (req.method === 'DELETE') {
-      res.statusCode = 204
+      // ses_down: the relay is restarting behind nginx.
+      res.statusCode = id === 'ses_down' ? 502 : 204
       return res.end()
     }
     if (req.method === 'GET' && (id === 'ses_A' || id === 'ses_B')) {
@@ -163,4 +164,31 @@ test('stop in a session that is not shared stops nothing and does not claim it d
   expect(existsSync(stateFile('ses_B'))).toBe(true)
   expect(text).not.toContain('Remote control stopped.')
   expect(text).toContain('ses_C is not shared from this machine')
+}, 30_000)
+
+test('stop while the relay cannot be told still ends the share, scrubs the code and says what happened', async () => {
+  // A relay restarting behind nginx answers 502. `stop` used to exit 1 before
+  // touching anything local: the plugin showed "stop failed", kept the log
+  // with the access code, and the bridge re-dialled until the relay was back —
+  // the same share, same code, live again. The local share must end regardless,
+  // and the owner must hear that the relay was not reached rather than a plain
+  // "stopped".
+  writeFileSync(
+    stateFile('ses_down'),
+    JSON.stringify({ session_id: 'ses_down', access_code: 'X', bridge_token: 'tok-ses_down', relay: '', started_at: Date.now() }),
+    { mode: 0o600 },
+  )
+  const log = path.join(home, ...STATE_DIR, 'bridge.log')
+  writeFileSync(log, 'https://relay.invalid/ses_down\nCODE: XXXXXX\n', { mode: 0o600 })
+
+  const text = await serverCommand('remote-control/stop', 'ses_down')
+
+  expect(seen).toContain('DELETE /api/sessions/ses_down')
+  expect(text).not.toContain('failed:')
+  expect(text).toContain('Remote control stopped on this machine')
+  expect(text).toContain('relay could not be told')
+  expect(text).toContain('502')
+  expect(existsSync(stateFile('ses_down'))).toBe(false)
+  expect(existsSync(log)).toBe(false)
+  expect(existsSync(stateFile('ses_A'))).toBe(true)
 }, 30_000)
