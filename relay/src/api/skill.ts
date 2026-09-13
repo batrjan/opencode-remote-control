@@ -16,8 +16,12 @@ import type { BridgeClient } from '../ws/bridge.js'
  *
  * The optional BridgeClient disconnects the session's bridge on DELETE.
  */
-/** Upper bounds for public registration fields (bytes of UTF-16 units). */
-const MAX_SESSION_ID = 128
+/**
+ * Upper bounds for public registration fields (bytes of UTF-16 units).
+ * MAX_SESSION_ID is exported because activation enforces it too: no session
+ * can exist with a longer id, so activate refuses one before recording it.
+ */
+export const MAX_SESSION_ID = 128
 const MAX_DIRECTORY = 4096
 const MAX_TITLE = 1024
 

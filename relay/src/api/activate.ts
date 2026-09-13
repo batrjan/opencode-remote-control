@@ -1,6 +1,7 @@
 import express from 'express'
 import type { Store } from '../store.js'
 import { activateFailDelayMs, config } from '../config.js'
+import { MAX_SESSION_ID } from './skill.js'
 
 /**
  * POST /api/activate — exchange an access code for a viewer token.
@@ -16,6 +17,16 @@ export function activateRouter(store: Store) {
       return res.status(400).json({ error: 'invalid code' })
     }
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      return res.status(400).json({ error: 'invalid code' })
+    }
+    // A wrong guess is recorded against the session it names, keyed by the raw
+    // id (store.activate's per-session failure lock) — so an unbounded id let
+    // an anonymous caller pin ~32 KB of heap per request (the public body cap)
+    // by naming a different made-up session each time, up to the tracking
+    // maps' 100k-entry cap: gigabytes. Registration refuses ids past this
+    // bound, so no session that could ever be activated has one; refuse it
+    // before anything is remembered, with the same answer as any bad attempt.
+    if (sessionId.length > MAX_SESSION_ID) {
       return res.status(400).json({ error: 'invalid code' })
     }
     // Kept for the log line only: activation itself is no longer throttled per
