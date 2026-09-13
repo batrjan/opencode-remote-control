@@ -136,6 +136,12 @@ Stop sharing with `/remote-control/stop`; check with `/remote-control/status`.
 The bridge also stops on its own when OpenCode quits (watchdog) or on SIGINT/SIGTERM;
 every stop path deletes the relay session, revokes the code, terminates the bridge
 process recorded in its state file and the `opencode serve` it may have spawned.
+The watchdog follows the OpenCode process the share was started from (the plugin
+passes its pid as `--owner-pid`), not just the server the bridge talks to — so a
+share started with `opencode run "/remote-control/start"` ends when that `run`
+exits. For a share that should outlive a single command, start it from a long-running
+client (the TUI, the desktop app, `opencode web`) or run the bridge's `start` by hand,
+without `--owner-pid`.
 
 ### Surviving a bad network
 

@@ -7090,11 +7090,15 @@ var config = {
   healthTimeoutMs: 1500,
   /** Public relay the bridge registers sessions with (overridable via CLI). */
   defaultRelayUrl: "https://opencode.b4tr.net",
-  /** Watchdog interval for polling the local opencode server while running. */
+  /** Watchdog interval for polling the local opencode server (and the owner process) while running. */
   watchdogIntervalMs: 1e4
 };
 function wsPingIntervalMs() {
   return Number(process.env.REMOTE_CONTROL_WS_PING_INTERVAL_MS ?? 2e4);
+}
+function watchdogIntervalMs() {
+  const v = Number(process.env.REMOTE_CONTROL_WATCHDOG_INTERVAL_MS);
+  return Number.isFinite(v) && v > 0 ? v : config.watchdogIntervalMs;
 }
 function reconnectBaseMs() {
   return Number(process.env.REMOTE_CONTROL_RECONNECT_BASE_MS ?? 1e3);
@@ -8043,11 +8047,18 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     resolveClosed();
   };
   ws.onFatal = () => void stop();
+  const ownerPid = opts.ownerPid;
+  const ownerIsParent = ownerPid !== void 0 && ownerPid === process.ppid;
+  const ownerGone = () => {
+    if (ownerPid === void 0) return false;
+    if (ownerIsParent && process.ppid !== ownerPid) return true;
+    return !pidAlive(ownerPid);
+  };
   const watchdog = setInterval(() => {
     void (async () => {
-      if (!await opencodeHealthy(opencodeUrl)) await stop();
+      if (ownerGone() || !await opencodeHealthy(opencodeUrl)) await stop();
     })();
-  }, opts.healthIntervalMs ?? config.watchdogIntervalMs);
+  }, opts.healthIntervalMs ?? watchdogIntervalMs());
   watchdog.unref();
   return { session_id, access_code, viewer_url, closed, stop };
 }
@@ -8167,6 +8178,14 @@ async function fetchSession(opencode, sessionId) {
     return void 0;
   }
 }
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
 async function opencodeHealthy(opencodeUrl) {
   try {
     const res = await fetch(`${opencodeUrl}${config.healthPath}`, {
@@ -8186,16 +8205,22 @@ function resolveSessionId(flag) {
 }
 var program2 = new Command();
 program2.name("bridge").description("OpenCode remote-control bridge");
-program2.command("start").description("Register this session with the relay and serve proxy requests until stopped").option("--relay <url>", "relay base URL", config.defaultRelayUrl).option("--api-key <key>", "relay API key (optional; the public relay does not need it)").option("--port <port>", "opencode port (auto-detected when omitted)").option("--session-id <id>", "opencode session id (newest session when omitted)").action(async (opts) => {
+program2.command("start").description("Register this session with the relay and serve proxy requests until stopped").option("--relay <url>", "relay base URL", config.defaultRelayUrl).option("--api-key <key>", "relay API key (optional; the public relay does not need it)").option("--port <port>", "opencode port (auto-detected when omitted)").option("--session-id <id>", "opencode session id (newest session when omitted)").option("--owner-pid <pid>", "stop sharing when this process (the OpenCode that started the share) exits").action(async (opts) => {
   const port = opts.port === void 0 ? void 0 : Number(opts.port);
   if (port !== void 0 && !Number.isInteger(port)) {
     console.error("error: --port must be an integer");
     process.exitCode = 1;
     return;
   }
+  const ownerPid = opts.ownerPid === void 0 ? void 0 : Number(opts.ownerPid);
+  if (ownerPid !== void 0 && !(Number.isInteger(ownerPid) && ownerPid > 0)) {
+    console.error("error: --owner-pid must be a positive integer");
+    process.exitCode = 1;
+    return;
+  }
   let handle;
   try {
-    handle = await startBridge(opts.relay, opts.apiKey, { port, sessionId: opts.sessionId });
+    handle = await startBridge(opts.relay, opts.apiKey, { port, sessionId: opts.sessionId, ownerPid });
   } catch (err) {
     console.error(`bridge start failed: ${errorMessage(err)}`);
     process.exitCode = 1;

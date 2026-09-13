@@ -144,6 +144,12 @@ function startBridge(sessionID) {
     if (!bin) return reject(new Error("bridge not found — install the plugin from git (see package README)"))
     const args = [bin, "start", "--relay", relayUrl()]
     if (sessionID) args.push("--session-id", sessionID)
+    // This process IS the OpenCode the share was started from (TUI, desktop or
+    // web server, `opencode run`). The bridge is detached below, so no signal
+    // reaches it when OpenCode quits — and on the TUI path the server its
+    // watchdog polls is an `opencode serve` of its own, which never goes away
+    // while the bridge runs. Without the pid the share outlived OpenCode.
+    args.push("--owner-pid", String(process.pid))
     const LOG = logPath()
     let out
     try {

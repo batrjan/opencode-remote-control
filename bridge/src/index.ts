@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { realpathSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { Command } from 'commander'
-import { config, opencodeAuthHeader } from './config.js'
+import { config, opencodeAuthHeader, watchdogIntervalMs } from './config.js'
 import { detectOpenCodePort, ensureOpenCodeServer } from './detect.js'
 import { OpencodeClient } from './opencode.js'
 import { RelayClient, RelayWSClient } from './relay.js'
@@ -12,7 +12,8 @@ import { saveSessionState, loadSessionState, clearSessionState, latestSessionSta
 /**
  * Bridge CLI and lifecycle: `start` registers the current opencode session
  * with the relay, connects the WS bridge, forwards SSE events, and watches
- * the local opencode server (exits when it dies); `stop` deletes the relay
+ * the local opencode server and, with --owner-pid, the OpenCode process that
+ * started the share (exits when either is gone); `stop` deletes the relay
  * session; `status` probes relay + opencode + session presence.
  *
  * The module doubles as a library (startBridge/stopBridge) for tests; the
@@ -30,6 +31,12 @@ export interface StartBridgeOptions {
   healthIntervalMs?: number
   /** Server spawner — test hook; defaults to ensureOpenCodeServer(). */
   serverSpawner?: () => Promise<{ port: number; spawned?: import('node:child_process').ChildProcess }>
+  /**
+   * PID of the OpenCode process the share was started from (the plugin passes
+   * its own). The bridge shuts down once that process is gone. Omitted for a
+   * bridge started by hand, which then lives until stopped or opencode dies.
+   */
+  ownerPid?: number
 }
 
 export interface BridgeHandle {
@@ -152,13 +159,29 @@ export async function startBridge(
   // elsewhere, or credentials revoked) — there is nothing left to reconnect
   // to, so shut down instead of retrying forever.
   ws.onFatal = () => void stop()
-  // Watchdog: opencode gone (process exited / port closed) → notify the
-  // relay (revokes code + tokens) and shut down.
+  // The share belongs to the OpenCode process it was started from, not to the
+  // server we talk to. On the TUI path that server is our own `opencode serve`,
+  // and the plugin starts us detached, so quitting the TUI signalled neither:
+  // bridge and server kept each other alive, the relay kept seeing pings, and
+  // the code and every viewer token stayed valid indefinitely. While the owner
+  // is our parent, a changed ppid (re-parented to init or a subreaper) is proof
+  // it is gone that a recycled pid cannot fake; otherwise (a `node` shim in
+  // between, Windows, where ppid never changes) fall back to asking the OS
+  // whether the pid still exists.
+  const ownerPid = opts.ownerPid
+  const ownerIsParent = ownerPid !== undefined && ownerPid === process.ppid
+  const ownerGone = (): boolean => {
+    if (ownerPid === undefined) return false
+    if (ownerIsParent && process.ppid !== ownerPid) return true
+    return !pidAlive(ownerPid)
+  }
+  // Watchdog: owner gone, or opencode gone (process exited / port closed) →
+  // notify the relay (revokes code + tokens) and shut down.
   const watchdog = setInterval(() => {
     void (async () => {
-      if (!(await opencodeHealthy(opencodeUrl))) await stop()
+      if (ownerGone() || !(await opencodeHealthy(opencodeUrl))) await stop()
     })()
-  }, opts.healthIntervalMs ?? config.watchdogIntervalMs)
+  }, opts.healthIntervalMs ?? watchdogIntervalMs())
   watchdog.unref() // never keep the process alive just for the watchdog
 
   return { session_id, access_code, viewer_url, closed, stop }
@@ -390,6 +413,16 @@ async function fetchSession(
   }
 }
 
+/** Whether a pid still exists. EPERM means it does, it just is not ours to signal. */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
 async function opencodeHealthy(opencodeUrl: string): Promise<boolean> {
   try {
     const res = await fetch(`${opencodeUrl}${config.healthPath}`, {
@@ -424,16 +457,25 @@ program
   .option('--api-key <key>', 'relay API key (optional; the public relay does not need it)')
   .option('--port <port>', 'opencode port (auto-detected when omitted)')
   .option('--session-id <id>', 'opencode session id (newest session when omitted)')
-  .action(async (opts: { relay: string; apiKey?: string; port?: string; sessionId?: string }) => {
+  .option('--owner-pid <pid>', 'stop sharing when this process (the OpenCode that started the share) exits')
+  .action(async (opts: { relay: string; apiKey?: string; port?: string; sessionId?: string; ownerPid?: string }) => {
     const port = opts.port === undefined ? undefined : Number(opts.port)
     if (port !== undefined && !Number.isInteger(port)) {
       console.error('error: --port must be an integer')
       process.exitCode = 1
       return
     }
+    const ownerPid = opts.ownerPid === undefined ? undefined : Number(opts.ownerPid)
+    // Positive only: kill(0, 0) and kill(-1, 0) address process groups and
+    // always succeed, so such an owner would never be seen to exit.
+    if (ownerPid !== undefined && !(Number.isInteger(ownerPid) && ownerPid > 0)) {
+      console.error('error: --owner-pid must be a positive integer')
+      process.exitCode = 1
+      return
+    }
     let handle: BridgeHandle
     try {
-      handle = await startBridge(opts.relay, opts.apiKey, { port, sessionId: opts.sessionId })
+      handle = await startBridge(opts.relay, opts.apiKey, { port, sessionId: opts.sessionId, ownerPid })
     } catch (err) {
       console.error(`bridge start failed: ${errorMessage(err)}`)
       process.exitCode = 1

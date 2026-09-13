@@ -10,7 +10,7 @@ export const config = {
   healthTimeoutMs: 1500,
   /** Public relay the bridge registers sessions with (overridable via CLI). */
   defaultRelayUrl: 'https://opencode.b4tr.net',
-  /** Watchdog interval for polling the local opencode server while running. */
+  /** Watchdog interval for polling the local opencode server (and the owner process) while running. */
   watchdogIntervalMs: 10_000,
 } as const
 
@@ -24,6 +24,16 @@ export const config = {
  */
 export function wsPingIntervalMs(): number {
   return Number(process.env.REMOTE_CONTROL_WS_PING_INTERVAL_MS ?? 20_000)
+}
+
+/**
+ * Watchdog poll interval (opencode health + owner process). Defaults to
+ * config.watchdogIntervalMs; the env override exists so a test that drives the
+ * real bundle through the plugin does not wait ten seconds per tick.
+ */
+export function watchdogIntervalMs(): number {
+  const v = Number(process.env.REMOTE_CONTROL_WATCHDOG_INTERVAL_MS)
+  return Number.isFinite(v) && v > 0 ? v : config.watchdogIntervalMs
 }
 
 /** First reconnect delay; doubles per attempt up to reconnectMaxMs. */
