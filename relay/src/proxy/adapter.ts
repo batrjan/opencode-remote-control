@@ -85,8 +85,9 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   // and the composer stayed blocked until the owner answered locally.
   // SECURITY: both take only an instance-global request id and upstream does
   // not check which session it belongs to, so the bridge refuses ids that are
-  // not pending questions of the bound session. The list (GET /question) is
-  // instance-wide too and gets a filtered handler below, like /permission.
+  // not pending questions of the bound session or one of its subagents. The
+  // list (GET /question) is instance-wide too and gets a filtered handler
+  // below, like /permission.
   ['POST', '/question/:requestID/reply'],
   ['POST', '/question/:requestID/reject'],
   // Resource/reference APIs the UI bootstrap resolves
@@ -112,14 +113,15 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   // proxied verbatim — GET /permission upstream lists pending requests from
   // ALL sessions of the owner, and permission request IDs are instance-global,
   // so a viewer could approve a prompt belonging to another session. We expose
-  // GET /permission but FILTER the response to the viewer's own session (see
-  // the handler below). The reply route stays session-scoped
-  // (/session/:id/permissions/:permissionID) and is additionally guarded
-  // bridge-side (refuses requestIDs not owned by the bound session).
+  // GET /permission but FILTER the response to the viewer's own session and
+  // its subagents (see the handler below). The reply route stays session-scoped
+  // (/session/:id/permissions/:permissionID, ':id' a subagent's own id when it
+  // raised the prompt) and is additionally guarded bridge-side (refuses
+  // requestIDs not owned by the bound session or one of its subagents).
 ]
 
 /**
- * Read routes where a SUBAGENT session of the bound one may be read as itself.
+ * Routes where a SUBAGENT session of the bound one may be addressed as itself.
  *
  * Every ':id' is normally rewritten to the viewer's session, which is what
  * keeps a viewer inside its own share. For a child session that rewrite was
@@ -128,12 +130,21 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
  * under each child's title. Children belong to the shared session, so reading
  * them is in scope — anything that is not a child still collapses to the bound
  * session.
+ *
+ * The session detail and the permission answer are here for the prompts a
+ * subagent raises. Its permission requests carry the CHILD's id, and the web UI
+ * shows them in the parent's dock only by walking the session tree, which it
+ * builds from session details that name their parent. It answers them as
+ * POST /session/<child>/permissions/<id>. Collapsed to the parent, the detail
+ * hid the child from that tree, and the bridge refused the answer.
  */
-const CHILD_READABLE_ROUTES = new Set([
+const SUBAGENT_ROUTES = new Set([
+  '/session/:id',
   '/session/:id/message',
   '/session/:id/message/:messageID',
   '/session/:id/todo',
   '/session/:id/diff',
+  '/session/:id/permissions/:permissionID',
 ])
 
 /** Max ancestor hops walked when deciding if a session descends from the
@@ -189,7 +200,7 @@ const MAX_STREAMS_PER_SESSION = 64
 /**
  * Cap on the ancestry cache (see ancestryOk). Sessions are never removed from
  * it when their share is deleted, so without a bound it grows for the life of
- * the process.
+ * the process. The event filter reads its subagents from the same cache.
  */
 const ANCESTRY_CACHE_MAX = 10_000
 
@@ -433,9 +444,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   })
 
   // GET /permission — pending permission requests, FILTERED to the viewer's
-  // own session. Upstream returns every pending request on the instance
-  // (all of the owner's sessions); a viewer must only ever see (and thus be
-  // able to reason about) its own. The list endpoint is read-only.
+  // own session and its subagents (see sessionsInShare). Upstream returns
+  // every pending request on the instance (all of the owner's sessions); a
+  // viewer must only ever see (and thus be able to reason about) its own. The
+  // list endpoint is read-only.
   // It carries the session's directory like every other route: opencode holds
   // pending permissions per directory instance, and a bare /permission lists
   // the server's own one — empty whenever the share lives elsewhere (the
@@ -452,13 +464,16 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           config.proxyTimeoutMs,
         )
         let body = out.body
+        let all: unknown
         try {
-          const all = JSON.parse(out.body) as Array<Record<string, unknown>>
-          if (Array.isArray(all)) {
-            body = JSON.stringify(all.filter((p) => p.sessionID === session.id))
-          }
+          all = JSON.parse(out.body)
         } catch {
-          // upstream not a JSON array — pass through verbatim
+          // upstream not JSON — pass through verbatim
+        }
+        if (Array.isArray(all)) {
+          const pending = all as Array<Record<string, unknown> | null>
+          const inShare = await sessionsInShare(session, pending.map((p) => p?.sessionID))
+          body = JSON.stringify(pending.filter((p) => inShare.has(p?.sessionID as string)))
         }
         res.status(out.status).type(out.contentType ?? 'application/json').send(body)
       } catch (err) {
@@ -468,12 +483,12 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   })
 
   // GET /question — pending agent questions, FILTERED to the viewer's own
-  // session. Upstream lists every pending question on the instance, so the
-  // raw list showed a viewer the question text of the owner's OTHER sessions
-  // in the same project. The UI only reads it at bootstrap to restore the
-  // question dock. Like /permission it keeps the directory query: questions
-  // are held by the instance of the directory, the same one the dock's reply
-  // is sent to.
+  // session and its subagents. Upstream lists every pending question on the
+  // instance, so the raw list showed a viewer the question text of the owner's
+  // OTHER sessions in the same project. The UI only reads it at bootstrap to
+  // restore the question dock. Like /permission it keeps the directory query:
+  // questions are held by the instance of the directory, the same one the
+  // dock's reply is sent to.
   router.get(['/question', '/api/question'], (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
@@ -485,13 +500,16 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           config.proxyTimeoutMs,
         )
         let body = out.body
+        let all: unknown
         try {
-          const all = JSON.parse(out.body) as Array<Record<string, unknown> | null>
-          if (Array.isArray(all)) {
-            body = JSON.stringify(all.filter((q) => q?.sessionID === session.id))
-          }
+          all = JSON.parse(out.body)
         } catch {
-          // upstream not a JSON array — pass through verbatim
+          // upstream not JSON — pass through verbatim
+        }
+        if (Array.isArray(all)) {
+          const pending = all as Array<Record<string, unknown> | null>
+          const inShare = await sessionsInShare(session, pending.map((q) => q?.sessionID))
+          body = JSON.stringify(pending.filter((q) => inShare.has(q?.sessionID as string)))
         }
         res.status(out.status).type(out.contentType ?? 'application/json').send(body)
       } catch (err) {
@@ -501,7 +519,8 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   })
 
   // GET /session/status — global status map, filtered to the viewer's
-  // session only (other sessions' statuses are not the viewer's business).
+  // session and its subagents (other sessions' statuses are not the viewer's
+  // business; a subagent's is what its parent is waiting on).
   // Statuses are per directory instance too: without the session's directory
   // upstream answers {} for a share outside the server's own folder, and a
   // busy session looked idle to the viewer.
@@ -516,11 +535,16 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           config.proxyTimeoutMs,
         )
         let body = out.body
+        let all: unknown
         try {
-          const all = JSON.parse(out.body) as Record<string, unknown>
-          body = JSON.stringify({ [session.id]: all[session.id] })
+          all = JSON.parse(out.body)
         } catch {
           // upstream not JSON — pass through verbatim
+        }
+        if (all && typeof all === 'object' && !Array.isArray(all)) {
+          const statuses = Object.entries(all)
+          const inShare = await sessionsInShare(session, statuses.map(([id]) => id))
+          body = JSON.stringify(Object.fromEntries(statuses.filter(([id]) => inShare.has(id))))
         }
         res.status(out.status).type(out.contentType ?? 'application/json').send(body)
       } catch (err) {
@@ -530,20 +554,27 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   })
 
   // A session's parent never changes once created, so a positive ancestry
-  // result is cached forever safely (keyed bound->requested). Negatives are
+  // result is cached forever safely (keyed bound->descendant). Negatives are
   // NOT cached: a subagent may spawn after the first miss, and re-checking is
   // cheap. This is what makes a freshly-spawned child and a nested grandchild
   // read correctly instead of showing the parent transcript under their title.
+  // Keyed per share, so what one bridge reports about its sessions can never
+  // widen what another share's viewers are shown.
   const ancestryOk = new Set<string>()
 
   /**
    * Remember a verified ancestry, evicting the oldest entry when full (a Set
    * iterates in insertion order, so the first key is the oldest). Losing a
-   * positive is harmless: the next read simply walks the parent chain again
-   * and re-caches it. The cache is an optimisation, never the authority on
-   * what a viewer may read.
+   * positive is harmless for requests: the next one simply walks the parent
+   * chain again and re-caches it. The cache is an optimisation, never the
+   * authority on what a viewer may read. A key seen again moves to the newest
+   * end, so a subagent that keeps working is not the one evicted.
    */
   function rememberAncestry(key: string): void {
+    if (ancestryOk.delete(key)) {
+      ancestryOk.add(key)
+      return
+    }
     while (ancestryOk.size >= ANCESTRY_CACHE_MAX) {
       const oldest = ancestryOk.values().next().value
       if (oldest === undefined) break
@@ -553,48 +584,93 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   }
 
   /**
-   * Which session id this request may actually read: the bound one, unless the
-   * caller asked for a session that DESCENDS from it (a subagent, or a nested
-   * subagent) on a child-readable route. Resolved by walking the requested
-   * session's parent chain up to the bound session — never a list membership,
-   * so timing and nesting cannot make a real descendant look foreign, and a
-   * foreign session can never look like a descendant.
+   * The subagents of one share known so far, for the live event filter. It
+   * cannot ask upstream (it must decide each event in order, at once), so it
+   * learns a subagent from the child's own session.created / session.updated on
+   * the share's event stream, and from every chain a request has walked.
    */
-  async function readableSessionId(session: Session, requested: string, template: string): Promise<string> {
-    if (requested === session.id) return session.id
-    if (!CHILD_READABLE_ROUTES.has(template)) return session.id
+  function subagentsOf(bound: string): SubagentIndex {
+    return {
+      has: (id) => ancestryOk.has(`${bound}\u0000${id}`),
+      add: (id) => rememberAncestry(`${bound}\u0000${id}`),
+    }
+  }
+
+  /**
+   * Whether `requested` DESCENDS from the viewer's session (a subagent, or a
+   * nested subagent). Resolved by walking the requested session's parent chain
+   * up to the bound session — never a list membership, so timing and nesting
+   * cannot make a real descendant look foreign, and a foreign session can never
+   * look like a descendant. Anything that cannot be verified is not one.
+   */
+  async function descendsFromShare(session: Session, requested: string): Promise<boolean> {
     // Only a well-formed session id may ever flow into an upstream path. This
     // is the value the caller controls, so anything that is not exactly a
-    // session id (encoded slashes, query smuggling, traversal) collapses to
-    // the bound session instead of being interpolated raw.
-    if (!SESSION_ID_RE.test(requested)) return session.id
-    if (ancestryOk.has(`${session.id}\u0000${requested}`)) return requested
+    // session id (encoded slashes, query smuggling, traversal) is refused
+    // instead of being interpolated raw.
+    if (requested === session.id || !SESSION_ID_RE.test(requested)) return false
+    const subagents = subagentsOf(session.id)
+    if (subagents.has(requested)) return true
+    const chain: string[] = []
     let current = requested
     for (let hop = 0; hop < MAX_ANCESTRY_DEPTH; hop++) {
       let parentID: string | undefined
-      if (!SESSION_ID_RE.test(current)) return session.id
+      if (!SESSION_ID_RE.test(current) || chain.includes(current)) return false
+      chain.push(current)
       try {
         const out = await bridge.request(
           session.id,
-          { method: 'GET', path: `/session/${encodeURIComponent(current)}` },
+          // In the session's directory, like every other proxied request.
+          { method: 'GET', path: `/session/${encodeURIComponent(current)}${queryForSession('', session)}` },
           config.proxyTimeoutMs,
         )
-        if (out.status !== 200) return session.id
+        if (out.status !== 200) return false
         const detail = JSON.parse(out.body) as { id?: unknown; parentID?: unknown }
         // A session whose own id does not echo back is not a real session.
-        if (detail?.id !== current) return session.id
+        if (detail?.id !== current) return false
         parentID = typeof detail?.parentID === 'string' ? detail.parentID : undefined
       } catch {
-        return session.id // cannot verify -> strict binding
+        return false // cannot verify -> strict binding
       }
-      if (parentID === undefined) return session.id // reached a root that is not ours
-      if (parentID === session.id) {
-        rememberAncestry(`${session.id}\u0000${requested}`)
-        return requested
+      if (parentID === undefined) return false // reached a root that is not ours
+      // Every session on a chain that reaches the share is a descendant.
+      if (parentID === session.id || subagents.has(parentID)) {
+        for (const id of chain) subagents.add(id)
+        return true
       }
       current = parentID
     }
-    return session.id // chain too deep -> refuse rather than guess
+    return false // chain too deep -> refuse rather than guess
+  }
+
+  /**
+   * Which session id this request may actually address: the bound one, unless
+   * the caller asked for one of its subagents on a route that allows it (see
+   * SUBAGENT_ROUTES).
+   */
+  async function readableSessionId(session: Session, requested: string, template: string): Promise<string> {
+    if (!SUBAGENT_ROUTES.has(template)) return session.id
+    return (await descendsFromShare(session, requested)) ? requested : session.id
+  }
+
+  /**
+   * The ids among `ids` that are the viewer's session or one of its subagents.
+   *
+   * The pending-request lists and the status map keep a subagent's entries: a
+   * task-tool subagent runs in a child session, the permission or question it
+   * needs carries the CHILD's id, and while it is pending the parent waits on
+   * it. Kept to the bound id alone, a reload showed the parent spinning and no
+   * prompt. Other sessions of the owner still never appear.
+   */
+  async function sessionsInShare(session: Session, ids: unknown[]): Promise<Set<string>> {
+    const candidates = new Set(ids.filter((id): id is string => typeof id === 'string'))
+    const inShare = new Set<string>()
+    await Promise.all(
+      [...candidates].map(async (id) => {
+        if (id === session.id || (await descendsFromShare(session, id))) inShare.add(id)
+      }),
+    )
+    return inShare
   }
 
   /**
@@ -635,34 +711,29 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     const handler = (req: Request, res: Response) => {
       const session = requireViewer(req, res)
       if (!session) return
-      // STRICT isolation: the viewer can only ever reach its OWN session.
-      // The URL :id is ALWAYS replaced with the viewer's session, even for
-      // reads — except a subagent session of that very session on the
-      // child-readable routes (see CHILD_READABLE_ROUTES). See the parentID
-      // sanitization below for why this does not loop the parent-chain walk.
-      let path = template.replaceAll(':id', session.id)
-      if (typeof req.params.permissionID === 'string') {
-        path = path.replaceAll(':permissionID', encodeURIComponent(req.params.permissionID))
-      }
-      if (typeof req.params.messageID === 'string') {
-        path = path.replaceAll(':messageID', encodeURIComponent(req.params.messageID))
-      }
-      if (typeof req.params.requestID === 'string') {
-        path = path.replaceAll(':requestID', encodeURIComponent(req.params.requestID))
-      }
-      // Sanitize session-detail reads: strip parentID so the UI never walks
-      // a parent chain (which would loop under forced :id binding).
-      const sanitize = template === '/session/:id' && method === 'GET'
       void (async () => {
-        // Re-point the path at a child session when the caller asked for one
-        // of this share's own subagents on a child-readable route.
-        if (CHILD_READABLE_ROUTES.has(template) && typeof req.params.id === 'string') {
-          const readable = await readableSessionId(session, req.params.id, template)
-          if (readable !== session.id) path = template.replaceAll(':id', readable)
-          if (typeof req.params.messageID === 'string') {
-            path = path.replaceAll(':messageID', encodeURIComponent(req.params.messageID))
-          }
+        // STRICT isolation: the viewer can only ever reach its OWN session.
+        // The URL :id is ALWAYS replaced with the viewer's session, even for
+        // reads — except a subagent session of that very session on the
+        // routes that allow one (see SUBAGENT_ROUTES). See the parentID
+        // sanitization below for why this does not loop the parent-chain walk.
+        const target =
+          typeof req.params.id === 'string' ? await readableSessionId(session, req.params.id, template) : session.id
+        let path = template.replaceAll(':id', target)
+        if (typeof req.params.permissionID === 'string') {
+          path = path.replaceAll(':permissionID', encodeURIComponent(req.params.permissionID))
         }
+        if (typeof req.params.messageID === 'string') {
+          path = path.replaceAll(':messageID', encodeURIComponent(req.params.messageID))
+        }
+        if (typeof req.params.requestID === 'string') {
+          path = path.replaceAll(':requestID', encodeURIComponent(req.params.requestID))
+        }
+        // Sanitize the bound session's detail: strip parentID so the UI never
+        // walks a parent chain (which would loop under forced :id binding). A
+        // subagent keeps its parentID — that link is how the UI puts it in the
+        // share's session tree, and the chain ends at the stripped bound session.
+        const sanitize = template === '/session/:id' && method === 'GET' && target === session.id
         if (method === 'POST' && template === PROMPT_ROUTE) {
           await proxyPrompt(res, session, path, queryForSession(queryOf(req), session), req.body)
           return
@@ -736,6 +807,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // stream within one heartbeat. It also slides last_used, which is correct:
     // a viewer holding an open stream is present, not idle.
     const viewerToken = extractViewerToken(req)
+    const subagents = subagentsOf(session.id)
     let unsubscribe: () => void = () => {}
     // Stop feeding the stream BEFORE ending it. The subscription used to be
     // dropped only on the request's 'close', which follows the response's
@@ -783,10 +855,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       if (res.writableEnded || res.destroyed) return
       // The bridge forwards the instance-wide /event stream (filtered by
       // directory upstream, NOT by session). Forward only events that belong
-      // to the viewer's session or carry no session at all (server heartbeats
-      // / status) — otherwise viewers would watch the owner's OTHER sessions
-      // live. Fail closed on unparseable payloads.
-      if (!eventBelongsToSession(data, session.id)) return
+      // to the viewer's session, one of its subagents, or carry no session at
+      // all (server heartbeats / status) — otherwise viewers would watch the
+      // owner's OTHER sessions live. Fail closed on unparseable payloads.
+      if (!eventBelongsToSession(data, session.id, subagents)) return
       send(eventFrame(data))
     })
     const untrack = trackStream(session.id, {
@@ -1103,13 +1175,27 @@ async function backlogAtMost(res: Response, limit: number, ms: number): Promise<
   return !res.writableEnded && !res.destroyed
 }
 
+/** The subagents of one shared session the event filter may let through. */
+export interface SubagentIndex {
+  has(sessionId: string): boolean
+  add(sessionId: string): void
+}
+
 /**
  * Whether an opencode event payload belongs to the given session. Events
  * with no session reference (server.connected, heartbeats, global status) are
- * kept; events carrying a DIFFERENT session id are dropped. Fails closed
- * (drops) when the payload can't be understood.
+ * kept; events carrying a DIFFERENT session id are dropped, unless that id is
+ * a known subagent of the session (`subagents`). Fails closed (drops) when the
+ * payload can't be understood.
+ *
+ * A subagent's permission and question prompts carry the CHILD's session id,
+ * and the web UI shows them in the parent's dock only once the child's own
+ * session.created has put it in the session tree. So a session.created or
+ * session.updated whose info names the shared session, or a known subagent, as
+ * its parent adds that session to `subagents` — and passes. The events come
+ * from the share's own bridge, the same source every ancestry walk asks.
  */
-export function eventBelongsToSession(data: string, sessionId: string): boolean {
+export function eventBelongsToSession(data: string, sessionId: string, subagents?: SubagentIndex): boolean {
   let ev: unknown
   try {
     ev = JSON.parse(data)
@@ -1125,13 +1211,27 @@ export function eventBelongsToSession(data: string, sessionId: string): boolean 
   // for `message.updated`, `info.id` is a MESSAGE id and reading it as a
   // session id dropped every message event (the viewer saw no live updates).
   if (typeof e.type === 'string' && e.type.startsWith('session.')) {
-    for (const candidate of [(props?.info as Record<string, unknown> | undefined)?.id, props?.id, e.id]) {
+    const info = props?.info as Record<string, unknown> | undefined
+    for (const candidate of [info?.id, props?.id, e.id]) {
       if (typeof candidate === 'string' && candidate.startsWith('ses')) mentioned.add(candidate)
+    }
+    if (subagents && (e.type === 'session.created' || e.type === 'session.updated')) {
+      const id = info?.id
+      const parentID = info?.parentID
+      if (
+        typeof id === 'string' &&
+        id !== sessionId &&
+        SESSION_ID_RE.test(id) &&
+        typeof parentID === 'string' &&
+        (parentID === sessionId || subagents.has(parentID))
+      ) {
+        subagents.add(id)
+      }
     }
   }
   // No session mentioned anywhere → global event, safe to forward.
   if (mentioned.size === 0) return true
-  for (const id of mentioned) if (id !== sessionId) return false
+  for (const id of mentioned) if (id !== sessionId && !subagents?.has(id)) return false
   return true
 }
 

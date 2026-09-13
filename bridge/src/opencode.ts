@@ -62,6 +62,17 @@ export class OpencodeClient {
     return res.json()
   }
 
+  /**
+   * One session's detail. `query` picks the instance, as for listPermissions.
+   * Throws unless opencode answers 200 — the ownership guards read a
+   * subagent's parent chain with it and must never guess.
+   */
+  async getSession(id: string, query = '') {
+    const res = await fetch(`${this.url}/session/${encodeURIComponent(id)}${query}`, { headers: this.auth() })
+    if (!res.ok) throw new Error(`getSession failed: ${res.status}`)
+    return res.json()
+  }
+
   async getAgents() {
     const res = await fetch(`${this.url}/agent`, { headers: this.auth() })
     return res.json()

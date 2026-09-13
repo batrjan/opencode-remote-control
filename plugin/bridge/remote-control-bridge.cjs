@@ -7277,6 +7277,16 @@ var OpencodeClient = class {
     if (!res.ok) throw new Error(`listQuestions failed: ${res.status}`);
     return res.json();
   }
+  /**
+   * One session's detail. `query` picks the instance, as for listPermissions.
+   * Throws unless opencode answers 200 — the ownership guards read a
+   * subagent's parent chain with it and must never guess.
+   */
+  async getSession(id, query = "") {
+    const res = await fetch(`${this.url}/session/${encodeURIComponent(id)}${query}`, { headers: this.auth() });
+    if (!res.ok) throw new Error(`getSession failed: ${res.status}`);
+    return res.json();
+  }
   async getAgents() {
     const res = await fetch(`${this.url}/agent`, { headers: this.auth() });
     return res.json();
@@ -7401,7 +7411,8 @@ var RelayClient = class {
 };
 var RELAY_PROXY_ROUTES = [
   // Session detail + messages (relay ALLOWED_ROUTES; ':id' is the viewer's
-  // bound session or one of its subagents on the child-readable routes).
+  // bound session, or one of its subagents on the relay's SUBAGENT_ROUTES —
+  // the detail, the transcript reads and the permission answer).
   ["GET", "/session/:id"],
   ["GET", "/session/:id/message"],
   ["GET", "/session/:id/message/:messageID"],
@@ -7451,7 +7462,8 @@ var RELAY_PROXY_ROUTES = [
   // Question API: the pending list (the relay filters it to the viewer's
   // session) and the question dock's answer / dismiss. opencode has no
   // POST /question. Reply and reject are additionally ownership-checked in
-  // guardRequest: upstream acts on any request id, whatever its session.
+  // guardRequest: upstream acts on any request id, whatever its session, so
+  // only the bound session's and its subagents' questions pass.
   ["GET", "/question"],
   ["POST", "/question/:requestID/reply"],
   ["POST", "/question/:requestID/reject"],
@@ -7486,6 +7498,7 @@ var PROXY_TEMPLATES = (() => {
   return byMethod;
 })();
 var SESSION_ID_RE = /^ses_[A-Za-z0-9_-]+$/;
+var MAX_SUBAGENT_DEPTH = 8;
 var warnedAllowAny = false;
 function allowAnyPath() {
   if (process.env.REMOTE_CONTROL_ALLOW_ANY_PATH !== "1") return false;
@@ -7925,33 +7938,35 @@ var RelayWSClient = class {
    * session, but upstream opencode's permission reply endpoint does NOT
    * check that the permission request belongs to that session — a viewer
    * could approve a prompt raised by ANOTHER session of the owner. Verify
-   * the permission request belongs to the bound session before forwarding.
-   * Question replies and rejections are checked the same way (see
-   * guardQuestion).
+   * the permission request belongs to the bound session, or to one of its
+   * subagents (see sharesTree), before forwarding. Question replies and
+   * rejections are checked the same way (see guardQuestion).
    */
   async guardRequest(method, path3) {
     const pathname = path3.split(/[?#]/)[0];
     if (method !== "POST") return null;
     const question = /^(?:\/api)?\/question\/([^/]+)\/(?:reply|reject)$/.exec(pathname);
     if (question) return this.guardQuestion(decodeURIComponent(question[1]), path3);
-    const m = /^\/session\/[^/]+\/permissions\/([^/]+)$/.exec(pathname);
+    const m = /^(?:\/api)?\/session\/[^/]+\/permissions\/([^/]+)$/.exec(pathname);
     if (!m) return null;
     const permissionID = decodeURIComponent(m[1]);
     if (!this.boundSessionId) return null;
+    const query = queryOfPath(path3);
     try {
-      const pending = await this.opencode.listPermissions(queryOfPath(path3));
+      const pending = await this.opencode.listPermissions(query);
       const list = Array.isArray(pending) ? pending : [];
-      const owned = list.some((p) => {
+      for (const p of list) {
         const rec = p;
-        return (rec.id === permissionID || rec.requestID === permissionID) && rec.sessionID === this.boundSessionId;
-      });
-      return owned ? null : "permission request not found for this session";
+        if (rec?.id !== permissionID && rec?.requestID !== permissionID) continue;
+        if (await this.sharesTree(rec.sessionID, query)) return null;
+      }
+      return "permission request not found for this session";
     } catch {
       return "permission verification unavailable";
     }
   }
   /**
-   * Answer or dismiss only a question of the bound session.
+   * Answer or dismiss only a question of the bound session or its subagents.
    *
    * opencode's POST /question/:requestID/reply and /reject take nothing but
    * the id and act on whichever pending question has it, from any session —
@@ -7964,17 +7979,56 @@ var RelayWSClient = class {
   async guardQuestion(requestID, path3) {
     const notFound = "question request not found for this session";
     if (!this.boundSessionId) return "question verification unavailable";
+    const query = queryOfPath(path3);
     try {
-      const pending = await this.opencode.listQuestions(queryOfPath(path3));
+      const pending = await this.opencode.listQuestions(query);
       if (!Array.isArray(pending)) return notFound;
-      const owned = pending.some((q) => {
+      for (const q of pending) {
         const rec = q;
-        return rec?.id === requestID && rec.sessionID === this.boundSessionId;
-      });
-      return owned ? null : notFound;
+        if (rec?.id !== requestID) continue;
+        if (await this.sharesTree(rec.sessionID, query)) return null;
+      }
+      return notFound;
     } catch {
       return "question verification unavailable";
     }
+  }
+  /**
+   * Whether a pending request of `sessionID` belongs to the share: the bound
+   * session itself, or a subagent of it at any depth.
+   *
+   * The task tool runs a subagent in a child session (parentID = the session
+   * that started it), and the permission or question the subagent needs
+   * carries the CHILD's id — measured on opencode 1.18.30. While it is pending
+   * the parent waits on it, so refusing it (as the guards did when they
+   * compared with the bound id alone) left a viewer-driven share blocked until
+   * the owner answered locally.
+   *
+   * Proven by walking parentID through the local opencode, in the forwarded
+   * request's own instance, up to the bound session. Anything that does not
+   * prove it is not: a detail that cannot be read or does not echo its own id,
+   * a root that is not ours, a loop, or a chain deeper than any real nesting.
+   */
+  async sharesTree(sessionID, query) {
+    const bound = this.boundSessionId;
+    if (!bound || typeof sessionID !== "string") return false;
+    if (sessionID === bound) return true;
+    const seen = /* @__PURE__ */ new Set();
+    let current = sessionID;
+    for (let hop = 0; hop < MAX_SUBAGENT_DEPTH; hop++) {
+      if (!SESSION_ID_RE.test(current) || seen.has(current)) return false;
+      seen.add(current);
+      let detail;
+      try {
+        detail = await this.opencode.getSession(current, query);
+      } catch {
+        return false;
+      }
+      if (detail?.id !== current || typeof detail.parentID !== "string") return false;
+      if (detail.parentID === bound) return true;
+      current = detail.parentID;
+    }
+    return false;
   }
 };
 async function readSseStream(stream, onEvent, waitForRoom = async () => {
