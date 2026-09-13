@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { createWriteStream, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
+import { pipeline } from 'node:stream/promises'
 
 /**
  * Session state that survives a relay restart.
@@ -149,6 +150,61 @@ function isEncrypted(value: unknown): value is EncryptedEnvelope {
   )
 }
 
+/**
+ * Array elements (sessions, claims) a background write encodes per event-loop
+ * turn. A session is at most a few KB of registration fields plus its
+ * viewers, so one turn stays in the low milliseconds however large the state.
+ */
+const ITEMS_PER_TURN = 50
+
+/**
+ * JSON.stringify(state), a piece at a time: its arrays are encoded
+ * ITEMS_PER_TURN elements per event-loop turn. Joined, the pieces are exactly
+ * the text JSON.stringify returns.
+ */
+async function* jsonPieces(state: PersistedState): AsyncGenerator<string> {
+  let separator = '{'
+  for (const [name, value] of Object.entries(state)) {
+    if (value === undefined) continue
+    yield `${separator}${JSON.stringify(name)}:`
+    separator = ','
+    if (!Array.isArray(value)) {
+      yield JSON.stringify(value)
+      continue
+    }
+    yield '['
+    for (let i = 0; i < value.length; i += ITEMS_PER_TURN) {
+      await new Promise((resolve) => setImmediate(resolve))
+      // Encoded as an array and unwrapped, so every element gets exactly the
+      // treatment JSON.stringify gives it inside the whole.
+      yield (i === 0 ? '' : ',') + JSON.stringify(value.slice(i, i + ITEMS_PER_TURN)).slice(1, -1)
+    }
+    yield ']'
+  }
+  yield separator === '{' ? '{}' : '}'
+}
+
+/**
+ * encrypt(), a piece at a time. The tag is known only at the end, so the
+ * envelope lists it after `ct` — an order JSON.parse does not care about.
+ */
+async function* encryptedPieces(pieces: AsyncIterable<string>, key: Buffer): AsyncGenerator<string> {
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', key, iv)
+  yield `{"enc":"aes-256-gcm","iv":"${iv.toString('base64')}","ct":"`
+  // Base64 chunks join into one valid string only when each encodes whole
+  // 3-byte groups: the remainder waits for the next piece.
+  let carry = Buffer.alloc(0)
+  for await (const piece of pieces) {
+    const bytes = Buffer.concat([carry, cipher.update(piece, 'utf8')])
+    const whole = bytes.length - (bytes.length % 3)
+    carry = bytes.subarray(whole)
+    if (whole > 0) yield bytes.subarray(0, whole).toString('base64')
+  }
+  const rest = Buffer.concat([carry, cipher.final()])
+  yield `${rest.toString('base64')}","tag":"${cipher.getAuthTag().toString('base64')}"}`
+}
+
 /** Fields that must never touch a PLAINTEXT state file (kept only when encrypted). */
 function stripSensitive(state: PersistedState): PersistedState {
   return {
@@ -166,12 +222,29 @@ function stripSensitive(state: PersistedState): PersistedState {
  * Writes go to a sibling temp file and are renamed into place, so a crash
  * mid-write can never leave a half-parsed state file — the worst case is the
  * previous snapshot, which is exactly what a restart should fall back to.
+ *
+ * A debounced write runs in the background, a slice of the state per
+ * event-loop turn. Every change rewrites the whole session set, and the write
+ * used to be synchronous — encode, encrypt, writeFileSync, all in one turn —
+ * so the relay served nothing for as long as it took: no viewer request, no
+ * SSE heartbeat, no bridge pong. Public registration can grow the set to
+ * thousands of sessions of a few KB each; at 10,000 that was ~350 ms of
+ * nothing after every change. Only flush(), the shutdown path, still writes
+ * synchronously: nothing may be left in flight when the process exits.
  */
 export class FileStateStore {
   private timer: NodeJS.Timeout | null = null
   private pending: (() => PersistedState) | null = null
   private closed = false
   private readonly key: Buffer | null
+  /** The background write in progress: the snapshot it is writing, and when it is done. */
+  private writing: { snapshot: () => PersistedState; done: Promise<void> } | null = null
+  /**
+   * Bumped by every write that starts, and by close(). A background write
+   * renames its file into place only if nothing bumped it meanwhile, so an
+   * older snapshot never lands over the newer one a flush() wrote.
+   */
+  private generation = 0
 
   constructor(
     private readonly file: string,
@@ -215,27 +288,80 @@ export class FileStateStore {
     }
   }
 
-  /** Queue a write; repeated calls inside the debounce window collapse. */
+  /**
+   * Queue a background write; repeated calls inside the debounce window
+   * collapse, and so do calls while a write is in progress: that write arms
+   * the next one when it is done.
+   */
   schedule(snapshot: () => PersistedState): void {
     if (this.closed) return
     this.pending = snapshot
-    if (this.timer) return
+    if (this.timer || this.writing) return
+    this.arm()
+  }
+
+  private arm(): void {
     this.timer = setTimeout(() => {
       this.timer = null
-      this.flush()
+      this.startWrite()
     }, this.debounceMs)
     this.timer.unref?.()
   }
 
-  /** Write any queued snapshot now (shutdown path). */
-  flush(): void {
+  /** Resolves once no background write is in progress — for a caller about to read the file. */
+  async settled(): Promise<void> {
+    while (this.writing) await this.writing.done
+  }
+
+  private startWrite(): void {
     const snapshot = this.pending
+    if (!snapshot || this.writing) return
+    this.pending = null
+    const generation = ++this.generation
+    const done = this.writeInBackground(snapshot, generation).finally(() => {
+      this.writing = null
+      if (this.pending && !this.closed && !this.timer) this.arm()
+    })
+    this.writing = { snapshot, done }
+  }
+
+  private async writeInBackground(snapshot: () => PersistedState, generation: number): Promise<void> {
+    // Not flush()'s temp file: a flush can run while this one is still open.
+    const tmp = `${this.file}.bg.tmp`
+    try {
+      const state = snapshot()
+      const body = this.key ? encryptedPieces(jsonPieces(state), this.key) : jsonPieces(stripSensitive(state))
+      mkdirSync(path.dirname(this.file), { recursive: true })
+      await pipeline(body, createWriteStream(tmp, { mode: 0o600 }))
+      // Checked and renamed in one synchronous step, so no flush() can slip in
+      // between.
+      if (generation !== this.generation) {
+        rmSync(tmp, { force: true })
+        return
+      }
+      renameSync(tmp, this.file)
+    } catch (err) {
+      console.warn(`[persist] could not write ${this.file}: ${(err as Error).message}`)
+      try {
+        rmSync(tmp, { force: true })
+      } catch {
+        // nothing else to do
+      }
+    }
+  }
+
+  /** Write any queued snapshot now, synchronously (shutdown path). */
+  flush(): void {
+    // A background write in progress has not reached the file yet: redo it
+    // here, or a process exiting right after this flush would lose it.
+    const snapshot = this.pending ?? this.writing?.snapshot ?? null
     this.pending = null
     if (this.timer) {
       clearTimeout(this.timer)
       this.timer = null
     }
     if (!snapshot) return
+    this.generation += 1
     const tmp = `${this.file}.tmp`
     try {
       const state = snapshot()
@@ -262,6 +388,7 @@ export class FileStateStore {
   /** Stop accepting writes (after a final flush by the caller). */
   close(): void {
     this.closed = true
+    this.generation += 1 // a write still in progress lands nothing either
     if (this.timer) {
       clearTimeout(this.timer)
       this.timer = null

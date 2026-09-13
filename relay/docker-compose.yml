@@ -12,6 +12,7 @@
 #   PORT=8080                                                   (optional)
 #   RELAY_IMAGE=relay-local:amd64                               (optional)
 #   RELAY_TRUST_PROXY=loopback, uniquelocal                     (optional)
+#   RELAY_MAX_SESSIONS=2000                                     (optional)
 services:
   relay:
     # The deploy workflow builds this image on the host (see the deploy section of

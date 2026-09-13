@@ -67,8 +67,15 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
     }
     const ip = req.ip ?? 'unknown'
     try {
-      store.checkRegistrationLimit(ip)
-    } catch {
+      store.checkRegistrationLimit(ip, session_id)
+    } catch (err) {
+      // Not the caller's doing, so not a 429: the relay holds all the sessions
+      // it will (config maxSessions). Logged, because the operator is the one
+      // who can tell an attack from a relay that has simply grown busy.
+      if (err instanceof Error && err.message === 'relay full') {
+        console.warn(`[sessions] registration refused: relay holds ${store.sessionCount()} sessions (RELAY_MAX_SESSIONS)`)
+        return res.status(503).json({ error: 'relay full' })
+      }
       return res.status(429).json({ error: 'rate limited' })
     }
     try {

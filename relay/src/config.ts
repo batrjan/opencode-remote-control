@@ -223,6 +223,21 @@ export function sseMaxBufferBytes(): number {
 }
 
 /**
+ * Most sessions the relay holds at once, whoever registered them.
+ *
+ * Registration is public and the other caps are per client address, so on
+ * their own they bounded nothing in total: a pool of addresses (a botnet, a
+ * residential proxy service) could lodge sessions without end, five each. Every
+ * session is up to ~5 KB of registration fields plus its viewers, and all of
+ * it sits in memory and is rewritten to the state file on every change, so the
+ * total has to stop somewhere. Far above what the relay's real shares need; a
+ * refusal is logged, so a relay that is merely busy can be given more.
+ */
+export function maxSessions(): number {
+  return envInt('RELAY_MAX_SESSIONS', 2000)
+}
+
+/**
  * Optional admin key. No longer required for the public session API
  * (registration is public + rate-limited; deletion requires the session's
  * bridge_token). Kept only for backward compatibility with older bridges.

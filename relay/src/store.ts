@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
-import { config } from './config.js'
+import { config, maxSessions } from './config.js'
 import type { PersistedState } from './persist.js'
 import { STATE_VERSION } from './persist.js'
 
@@ -95,8 +95,9 @@ export class Store {
   private lastDirtyAt = 0
 
   /**
-   * @param maxTrackingEntries cap for codeFails/blockedCodes/sessionFails
-   * (memory safety under brute force); oldest entry evicted when full.
+   * @param maxTrackingEntries cap for codeFails/blockedCodes/sessionFails/
+   * registrations (memory safety under brute force); oldest entry evicted
+   * when full.
    * Tests pass a small value to exercise eviction.
    */
   constructor(private maxTrackingEntries: number = config.maxTrackingEntries) {}
@@ -111,16 +112,26 @@ export class Store {
    * Checking does NOT consume a slot: callers commit with
    * commitRegistration(ip) once a session actually exists, so a request that
    * creates nothing (a duplicate id -> 409) no longer burns the caller's
-   * hourly quota.
+   * hourly quota. Nor does it record anything: it used to create the
+   * address's counter up front, so every refused request from a new address
+   * left an entry behind.
+   *
+   * Throws 'relay full' when the relay already holds maxSessions() — see
+   * there. `session_id` exempts a registration for an id that is live
+   * already: that one replaces its session or ends in 409, never grows the
+   * set, and refusing it would keep an owner out of its own share (its bridge
+   * died) until the reaper removed the stale registration a day later.
    */
-  checkRegistrationLimit(ip: string): void {
-    const now = Date.now()
-    let rec = this.registrations.get(ip)
-    if (!rec || now - rec.windowStart >= config.registrationWindowMs) {
-      rec = { count: 0, windowStart: now }
-      this.registrations.set(ip, rec)
+  checkRegistrationLimit(ip: string, session_id?: string): void {
+    if (
+      this.sessions.size >= maxSessions() &&
+      (session_id === undefined || !this.sessions.has(session_id))
+    ) {
+      throw new Error('relay full')
     }
-    if (rec.count >= config.registrationsPerWindow) {
+    const now = Date.now()
+    const rec = this.registrations.get(ip)
+    if (rec && now - rec.windowStart < config.registrationWindowMs && rec.count >= config.registrationsPerWindow) {
       throw new Error('rate limited')
     }
     let active = 0
@@ -134,17 +145,38 @@ export class Store {
 
   /**
    * Consume one registration slot for `ip`. Call only after the session was
-   * really created — see checkRegistrationLimit. Re-resolves the window so a
-   * commit that lands after the hour rolled over starts a fresh one.
+   * really created — see checkRegistrationLimit. A commit that lands after the
+   * hour rolled over starts a fresh window.
+   *
+   * The counters were a plain Map with one entry per address ever seen, never
+   * removed — not when the sessions ended, not when the hour was up — so a
+   * pool of addresses grew it without end. Now a record is inserted only when
+   * its window starts and never moved afterwards, so Map order is windowStart
+   * order and the lapsed ones sit at the front for pruneRegistrations; and it
+   * is capped like the other tracking maps. Evicting one only resets that
+   * address's hourly count; its active-session cap is counted from the
+   * sessions themselves.
    */
   commitRegistration(ip: string): void {
     const now = Date.now()
-    let rec = this.registrations.get(ip)
-    if (!rec || now - rec.windowStart >= config.registrationWindowMs) {
-      rec = { count: 0, windowStart: now }
-      this.registrations.set(ip, rec)
+    this.pruneRegistrations(now)
+    const rec = this.registrations.get(ip)
+    if (rec && now - rec.windowStart < config.registrationWindowMs) {
+      rec.count += 1
+      return
     }
-    rec.count += 1
+    // Replaced rather than reset in place, so the order holds even for a lapsed
+    // record pruning stopped short of (only after the clock stepped back).
+    this.registrations.delete(ip)
+    this.setBounded(this.registrations, ip, { count: 1, windowStart: now })
+  }
+
+  /** Drop registration counters whose window is over; they sit at the front (see commitRegistration). */
+  private pruneRegistrations(now: number): void {
+    for (const [ip, rec] of this.registrations) {
+      if (now - rec.windowStart < config.registrationWindowMs) break
+      this.registrations.delete(ip)
+    }
   }
 
   /**
@@ -546,6 +578,8 @@ export class Store {
         removed.push(id)
       }
     }
+    // Registration counters are otherwise pruned only by the next registration.
+    this.pruneRegistrations(now)
     if (removed.length) this.changed()
     return removed
   }
