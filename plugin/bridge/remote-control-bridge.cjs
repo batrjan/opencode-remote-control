@@ -8264,6 +8264,10 @@ program2.command("stop").description("End a remote-control session on the relay"
     process.exitCode = 1;
     return;
   }
+  if (!loadSessionState(sessionId)) {
+    console.log(`session ${sessionId} is not shared from this machine \u2014 nothing to stop.`);
+    return;
+  }
   try {
     await stopBridge(opts.relay, sessionId, opts.apiKey);
     console.log("Remote control stopped.");

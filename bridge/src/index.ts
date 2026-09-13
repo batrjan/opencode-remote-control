@@ -506,6 +506,16 @@ program
       process.exitCode = 1
       return
     }
+    // stopBridge treats a missing state file as already stopped, which kept
+    // this printing "Remote control stopped." for a session that was never
+    // shared from here. The plugin now passes the session the command was typed
+    // in, so that is exactly what a stop in an unshared session hits while
+    // other shares on this machine stay live — say so instead. Still a clean
+    // exit: there is nothing running that the caller asked to end.
+    if (!loadSessionState(sessionId)) {
+      console.log(`session ${sessionId} is not shared from this machine — nothing to stop.`)
+      return
+    }
     try {
       await stopBridge(opts.relay, sessionId, opts.apiKey)
       console.log('Remote control stopped.')

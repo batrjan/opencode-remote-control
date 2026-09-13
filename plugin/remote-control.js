@@ -15,6 +15,12 @@ export { parseBridgeLog } from "./bridge-runner.js"
 export const id = "remote-control"
 
 export async function tui(api) {
+  // The session the user is looking at. Every action binds to it — start so it
+  // never shares the wrong session, stop/status so they never act on another
+  // share running on this machine. Undefined off a session route (home screen).
+  const currentSessionID = () =>
+    api.route.current.name === "session" ? api.route.current.params.sessionID : undefined
+
   const showStart = async () => {
     if (!bridgeBin()) {
       api.ui.toast({
@@ -27,11 +33,7 @@ export async function tui(api) {
     }
     api.ui.toast({ variant: "info", title: "remote-control", message: "Starting…", duration: 3000 })
     try {
-      // Bind to the CURRENT session (the route the user is on), not an
-      // arbitrary project, so /remote-control/start never shares the
-      // wrong session.
-      const sessionID = api.route.current.name === "session" ? api.route.current.params.sessionID : undefined
-      const out = await runAction("start", sessionID)
+      const out = await runAction("start", currentSessionID())
       api.ui.dialog.replace(() =>
         api.ui.DialogAlert({
           title: "Remote control",
@@ -46,7 +48,7 @@ export async function tui(api) {
 
   const showStop = async () => {
     try {
-      const out = await runAction("stop")
+      const out = await runAction("stop", currentSessionID())
       api.ui.toast({ variant: "success", title: "remote-control", message: out || "Remote control stopped.", duration: 4000 })
     } catch (err) {
       api.ui.toast({ variant: "error", title: "stop failed", message: String(err?.message ?? err), duration: 8000 })
@@ -55,7 +57,7 @@ export async function tui(api) {
 
   const showStatus = async () => {
     try {
-      const out = await runAction("status")
+      const out = await runAction("status", currentSessionID())
       api.ui.dialog.replace(() =>
         api.ui.DialogAlert({
           title: "Remote control status",

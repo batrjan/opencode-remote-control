@@ -219,11 +219,16 @@ function runBridge(args, { timeout = 15_000, allowFailure = false } = {}) {
 
 /** Run one action and return the text to show. */
 export async function runAction(action, sessionID) {
+  // stop/status must name the session the command was typed in, exactly like
+  // start. Without an id the CLI falls back to the share that STARTED LAST, so
+  // with two shares a stop typed in A ended B — and reported success while A's
+  // code and viewers stayed live.
+  const idArgs = sessionID ? ["--session-id", sessionID] : []
   switch (action) {
     case "start":
       return await startBridge(sessionID)
     case "stop": {
-      const out = await runBridge(["stop", "--relay", relayUrl()])
+      const out = await runBridge(["stop", "--relay", relayUrl(), ...idArgs])
       // The share is down, so the URL + access code in the log are spent:
       // scrub them here rather than leaving them in the home directory until
       // some later start truncates the file. Only on success — a stop that
@@ -232,7 +237,7 @@ export async function runAction(action, sessionID) {
       return out || "Remote control stopped."
     }
     case "status":
-      return (await runBridge(["status", "--relay", relayUrl()], { allowFailure: true })) || "no active session"
+      return (await runBridge(["status", "--relay", relayUrl(), ...idArgs], { allowFailure: true })) || "no active session"
     default:
       throw new Error(`unknown action: ${action} (use start, stop or status)`)
   }
