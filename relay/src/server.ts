@@ -27,7 +27,7 @@ let cachedTerminalHtml: string | undefined
  * ROOT (see startServer), so the UI's default server URL is location.origin
  * — exactly how the real opencode web behaves when served by its own server.
  * No bootstrap/localStorage seeding is needed: absolute API paths
- * (/provider, /global/health, /session/...) all land on the root proxy.
+ * (/provider, /global/config, /session/...) all land on the root proxy.
  */
 /**
  * Reset script injected into the UI at serve time. Earlier relay versions
@@ -103,16 +103,22 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
   // pastes a file's worth of text into a prompt. Each side mounts its own
   // parser instead, so nothing is parsed on a route that never reads a body.
   app.use('/health', healthRouter(store))
-  // The opencode web UI probes /api/health to detect the server API dialect.
-  // Answering {healthy:true} selects the v1 client, which prefixes every
-  // request with the configured server URL — the viewer bootstrap points that
-  // at /api/opencode, so all UI traffic flows through the proxy adapter.
-  // (The v2 dialect builds URLs with new URL('/api/...', base) and would
-  // escape the prefix.) Unauthenticated and static: reveals nothing beyond
-  // what /health already exposes.
-  app.get('/api/health', (_req, res) => {
+  // The opencode web UI detects the server API dialect on every page load
+  // (detectServerProtocol): it fetches /global/health with a 5 s abort and,
+  // only if that is not {healthy:true}, falls back to /api/health. Either
+  // answer selects the v1 client, which resolves its requests against the
+  // server URL (location.origin), so all UI traffic lands on the root-mounted
+  // proxy adapter. BOTH are answered here, never proxied: nearly the whole UI
+  // bootstrap (config, providers, projects, the transcript, the event stream)
+  // waits for the probe, and a proxied /global/health put all of it behind a
+  // round trip over the owner's uplink — up to the full 5 s abort while a
+  // bridge re-dials — only to pick the same v1 the fallback picks anyway.
+  // Unauthenticated and static: reveals nothing beyond what /health exposes.
+  const uiHealth = (_req: express.Request, res: express.Response) => {
     res.json({ healthy: true })
-  })
+  }
+  app.get('/global/health', uiHealth)
+  app.get('/api/health', uiHealth)
   // Public, unauthenticated writers: anything a real bridge sends here is a
   // few hundred bytes (session id, directory, title, access code), so cap the
   // body well below express's default rather than letting an anonymous caller

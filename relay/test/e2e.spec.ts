@@ -16,8 +16,10 @@ import { RelayWSClient } from '../../bridge/src/relay'
  * asserting that the served /terminal HTML seeds the UI's default-server
  * the root-mounted proxy (the mechanism the official
  * build uses to choose its API base), that the protocol probe the UI performs
- * (/api/health) selects that base-URL-prefixed dialect, and that the exact
- * requests the UI issues succeed through the proxy with the viewer cookie.
+ * (/global/health, then /api/health — both answered by the relay itself, see
+ * ui-protocol-probe.test.ts) selects that base-URL-prefixed dialect, and that
+ * the exact requests the UI issues succeed through the proxy with the viewer
+ * cookie.
  */
 
 const API_KEY = 'test-relay-key'

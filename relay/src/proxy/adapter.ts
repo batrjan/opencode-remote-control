@@ -9,7 +9,7 @@ import { bridgeReconnectWaitMs, config, promptTimeoutMs, sseHeartbeatMs, sseMaxB
  * HTTP → WS → opencode proxy adapter, mounted at the server ROOT.
  *
  * The official opencode web UI (like the real opencode web) resolves its API
- * calls against `server.url`, and absolute paths (/provider, /global/health,
+ * calls against `server.url`, and absolute paths (/provider, /global/config,
  * /session/...) are fetched from the server root — a `/api/opencode` prefix
  * would be dropped by `new URL('/provider', base)`. Mounting at the root
  * makes `server.url = location.origin` work exactly as upstream intended.
@@ -74,10 +74,11 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   ['GET', '/find'],
   ['GET', '/find/file'],
   ['GET', '/find/symbol'],
-  // Global v2 surface the UI probes at boot. NOTE: /global/event is NOT here
+  // Global v2 surface the UI reads at boot. NOTE: /global/event is NOT here
   // — it is the SSE stream and is fanned out locally from the bridge's
-  // /event subscription (see the sseEvents handlers below).
-  ['GET', '/global/health'],
+  // /event subscription (see the sseEvents handlers below). Nor is
+  // /global/health: it is the UI's protocol probe, answered by the relay
+  // itself (see server.ts) so the bootstrap never waits on the bridge for it.
   ['GET', '/global/config'],
   // Question API: the question dock's two buttons. These are opencode's only
   // question writes — there is no POST /question, which is what used to be

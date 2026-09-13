@@ -218,7 +218,7 @@ instance. Driving a session from the browser works fully either way.
 | allowlisted OpenCode paths at the root (`/session/:id/…`, `/provider`, …) | viewer cookie or `x-viewer-token` | Proxy to the bridged OpenCode; `:id` is always rewritten to the token's session. |
 | `GET /event`, `GET /global/event` | viewer cookie or `x-viewer-token` | Live SSE fan-out of the session's OpenCode events, filtered to the viewer's session. Each stream reproduces OpenCode's own envelope: `/event` sends the bare event, `/global/event` wraps it as `{ directory, payload }` — the web UI reads `payload` and breaks on anything else. |
 | `GET /join`, `GET /terminal` | none                       | Code-entry page and the viewer UI.               |
-| `GET /api/health`         | none                          | Static `{healthy:true}` so the viewer UI selects the base-URL-prefixed API dialect. |
+| `GET /global/health`, `GET /api/health` | none            | Static `{healthy:true}`, answered by the relay itself (never proxied), so the viewer UI's protocol probe selects the base-URL-prefixed API dialect without waiting on the bridge. |
 
 Request sizes are capped per side, because the two sides want opposite things: the
 unauthenticated JSON API (`POST /api/sessions`, `POST /api/activate`) accepts at most

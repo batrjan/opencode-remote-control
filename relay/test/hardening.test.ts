@@ -93,7 +93,7 @@ test('RELAY_TRUST_PROXY=false ignores the header entirely (direct exposure)', as
 
 test('responses carry hardening headers and no server fingerprint', async () => {
   const app = createApp(new Store())
-  for (const path of ['/health', '/join', '/api/health']) {
+  for (const path of ['/health', '/join', '/api/health', '/global/health']) {
     const res = await request(app).get(path)
     expect(res.status, path).toBe(200)
     expect(res.headers['x-powered-by'], path).toBeUndefined()
