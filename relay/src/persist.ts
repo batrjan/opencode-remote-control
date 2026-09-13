@@ -65,13 +65,36 @@ export interface PersistedSession {
   last_seen: number
   status: 'active' | 'closed'
   created_by_ip?: string
+  /**
+   * Salted hash of the owner_key the session was registered with (see
+   * Store.createSession); absent for a registration without one. Kept in a
+   * plaintext file too: the key is a 256-bit HMAC, so unlike the access code
+   * its hash is no credential. Optional for the same reason as last_used.
+   */
+  owner_hash?: string
+  owner_salt?: string
   viewers: PersistedViewer[]
+}
+
+/**
+ * The owner_key hash of a share that ended: its session id stays reserved for
+ * that key until `at` + config.ownerClaimTtlMs. Persisted because a restart
+ * that forgot them would hand every ended share's id to whoever registers it
+ * first, which is what the reservation exists to prevent.
+ */
+export interface PersistedClaim {
+  id: string
+  hash: string
+  salt: string
+  at: number
 }
 
 export interface PersistedState {
   version: 1
   saved_at: number
   sessions: PersistedSession[]
+  /** Optional, STATE_VERSION unchanged: a file from an older relay has none. */
+  claims?: PersistedClaim[]
 }
 
 export const STATE_VERSION = 1

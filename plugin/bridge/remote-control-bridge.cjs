@@ -2270,7 +2270,7 @@ var require_websocket = __commonJS({
     var http = require("http");
     var net = require("net");
     var tls = require("tls");
-    var { randomBytes, createHash } = require("crypto");
+    var { randomBytes: randomBytes2, createHash } = require("crypto");
     var { Duplex, Readable } = require("stream");
     var { URL } = require("url");
     var PerMessageDeflate2 = require_permessage_deflate();
@@ -2808,7 +2808,7 @@ var require_websocket = __commonJS({
         }
       }
       const defaultPort = isSecure ? 443 : 80;
-      const key = randomBytes(16).toString("base64");
+      const key = randomBytes2(16).toString("base64");
       const request = isSecure ? https.request : http.request;
       const protocolSet = /* @__PURE__ */ new Set();
       let perMessageDeflate;
@@ -7438,13 +7438,23 @@ var RelayClient = class {
    * Bounded by `timeoutMs`, answer body included: `start` runs it before
    * anything is printed, and a relay that never answers must fail the start
    * with a reason rather than hold it until the plugin cancels it.
+   *
+   * `ownerKey` (see state.ts ownerKey) proves the id is this install's: the
+   * relay reserves an id for the key it was registered with, and lets the
+   * same key replace its own registration. A relay that predates it ignores
+   * the field.
    */
-  async createSession(sessionId, directory, title, timeoutMs = relayRegisterTimeoutMs()) {
+  async createSession(sessionId, directory, title, ownerKey2, timeoutMs = relayRegisterTimeoutMs()) {
     try {
       const res = await fetch(`${this.url}/api/sessions`, {
         method: "POST",
         headers: this.headers(),
-        body: JSON.stringify({ session_id: sessionId, directory, title }),
+        body: JSON.stringify({
+          session_id: sessionId,
+          directory,
+          title,
+          ...ownerKey2 === void 0 ? {} : { owner_key: ownerKey2 }
+        }),
         signal: AbortSignal.timeout(timeoutMs)
       });
       if (!res.ok) throw new RelayHttpError(res.status, `relay createSession failed: ${res.status}`);
@@ -8137,6 +8147,7 @@ async function readSseStream(stream, onEvent, waitForRoom = async () => {
 }
 
 // src/state.ts
+var import_node_crypto = require("node:crypto");
 var import_node_fs2 = require("node:fs");
 var import_node_os = require("node:os");
 var import_node_path2 = __toESM(require("node:path"), 1);
@@ -8161,6 +8172,42 @@ function clearSessionState(sessionId) {
   try {
     (0, import_node_fs2.unlinkSync)(statePath(sessionId));
   } catch {
+  }
+}
+function ownerKey(sessionId) {
+  return (0, import_node_crypto.createHmac)("sha256", loadOrCreateOwnerSecret()).update(sessionId).digest("base64url");
+}
+var OWNER_SECRET_BYTES = 32;
+function ownerSecretPath() {
+  return import_node_path2.default.join(stateDir(), "owner.key");
+}
+function loadOrCreateOwnerSecret() {
+  const file = ownerSecretPath();
+  const existing = readOwnerSecret(file);
+  if (existing) return existing;
+  (0, import_node_fs2.mkdirSync)(stateDir(), { recursive: true, mode: 448 });
+  const secret = (0, import_node_crypto.randomBytes)(OWNER_SECRET_BYTES);
+  const tmp = `${file}.${process.pid}.${(0, import_node_crypto.randomBytes)(4).toString("hex")}.tmp`;
+  (0, import_node_fs2.writeFileSync)(tmp, secret, { mode: 384 });
+  try {
+    (0, import_node_fs2.linkSync)(tmp, file);
+    return secret;
+  } catch (err) {
+    if (err.code !== "EEXIST") throw err;
+    const raced = readOwnerSecret(file);
+    if (raced) return raced;
+    (0, import_node_fs2.renameSync)(tmp, file);
+    return secret;
+  } finally {
+    (0, import_node_fs2.rmSync)(tmp, { force: true });
+  }
+}
+function readOwnerSecret(file) {
+  try {
+    const secret = (0, import_node_fs2.readFileSync)(file);
+    return secret.length === OWNER_SECRET_BYTES ? secret : void 0;
+  } catch {
+    return void 0;
   }
 }
 function latestSessionState() {
@@ -8221,7 +8268,9 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
       session_id,
       picked?.directory ?? process.cwd(),
       picked?.title ?? "",
-      spawnedServer !== void 0
+      spawnedServer !== void 0,
+      // An explicit id was settled above, before anything was spawned.
+      opts.sessionId === void 0
     ));
     saveSessionState({
       session_id,
@@ -8267,7 +8316,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
       await relay.deleteSession(session_id, bridge_token);
     } catch {
     }
-    clearSessionState(session_id);
+    if (loadSessionState(session_id)?.bridge_token === bridge_token) clearSessionState(session_id);
     resolveClosed(reason);
   };
   ws.onFatal = (err) => void stop(`the relay ended the session (${err.message})`);
@@ -8323,22 +8372,24 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
   watchdog.unref();
   return { session_id, access_code, viewer_url, closed, stop: () => stop() };
 }
-async function registerShare(relay, sessionId, directory, title, endLeftoverServer) {
+async function registerShare(relay, sessionId, directory, title, endLeftoverServer, settleFirst) {
   const isConflict = (err) => err instanceof RelayHttpError && err.status === 409;
+  const key = ownerKey(sessionId);
+  if (settleFirst) await settleEarlierShare(relay, sessionId, endLeftoverServer);
   try {
-    return await relay.createSession(sessionId, directory, title);
+    return await relay.createSession(sessionId, directory, title, key);
   } catch (err) {
     if (!isConflict(err)) throw err;
   }
   if (await settleEarlierShare(relay, sessionId, endLeftoverServer)) {
     try {
-      return await relay.createSession(sessionId, directory, title);
+      return await relay.createSession(sessionId, directory, title, key);
     } catch (err) {
       if (!isConflict(err)) throw err;
     }
   }
   throw new Error(
-    `session ${sessionId} is already registered on the relay (409) by a share this machine has no record of \u2014 end it from where it was started, or wait for the relay to expire it (by default after a day without activity)`
+    `session ${sessionId} is already registered on the relay (409) by a share this machine has no record of \u2014 end it with /remote-control/stop where it was started, or wait for the relay to expire it (by default after a day without activity; an id shared from another install stays reserved for it for 30 days after that share ended)`
   );
 }
 async function settleEarlierShare(relay, sessionId, endLeftoverServer) {

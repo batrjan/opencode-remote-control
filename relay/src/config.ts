@@ -91,6 +91,17 @@ export const config = {
   orphanReapMs: 24 * 3_600_000,
   orphanSweepIntervalMs: 15 * 60_000, // sweep every 15 minutes
   /**
+   * How long an ended share's session id stays reserved for the install that
+   * registered it with an owner_key (see Store.createSession). The id is in
+   * the share link, and the owner registers the same id again whenever they
+   * share that conversation; without the reservation anyone holding an old
+   * link could register it first and hold it with a connected socket. Long
+   * enough to cover a conversation picked up again weeks later; bounded so an
+   * install that lost its key (a new machine, a wiped home) gets its old ids
+   * back eventually. 30 days.
+   */
+  ownerClaimTtlMs: 30 * 24 * 3_600_000,
+  /**
    * Viewer tokens are a SLIDING window: a token that has not been used for
    * this long stops authenticating and is pruned. Without it a viewer kept
    * access for the entire life of the share and the viewer map grew forever.

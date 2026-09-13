@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import type { AddressInfo } from 'node:net'
 import { startServer } from '../../relay/src/server'
 import { RelayClient } from '../src/relay'
@@ -66,7 +69,12 @@ async function closeOpencode(): Promise<void> {
   await new Promise((resolve) => opencode.close(resolve))
 }
 
+// State files and the install's owner.key go to a private HOME, never the real one.
+const savedHome = process.env.HOME
+const home = mkdtempSync(path.join(tmpdir(), 'rc-lifecycle-home-'))
+
 beforeAll(async () => {
+  process.env.HOME = home
   relay = await startServer(0)
   relayUrl = `http://127.0.0.1:${(relay.address() as AddressInfo).port}`
   await listenOpencode()
@@ -76,6 +84,9 @@ afterAll(async () => {
   relay.closeAllConnections()
   await new Promise((resolve) => relay.close(resolve))
   await closeOpencode()
+  if (savedHome === undefined) delete process.env.HOME
+  else process.env.HOME = savedHome
+  rmSync(home, { recursive: true, force: true })
 })
 
 test('start and stop bridge', async () => {

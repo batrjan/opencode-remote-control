@@ -36,7 +36,21 @@ export interface Session {
   status: 'active' | 'closed'
   /** IP that registered the session — used for the public-registration cap. */
   created_by_ip: string
+  /**
+   * Salted hash of the owner_key the registering bridge proved its install
+   * with (see createSession). Undefined for a registration without one.
+   */
+  owner_hash?: string
+  owner_salt?: string
   viewers: Map<string, ViewerToken> // salted hash -> { salt, created_at, last_used, index }
+}
+
+/** An ended share's owner_key hash, reserving its id — see createSession. */
+interface OwnerClaim {
+  hash: string
+  salt: string
+  /** When the share ended; the claim lapses config.ownerClaimTtlMs later. */
+  at: number
 }
 
 /**
@@ -69,6 +83,12 @@ export class Store {
    * tokens never trigger the fallback scan.
    */
   private unindexedViewers = 0
+  /**
+   * session id -> owner_key hash of the share that last held it, for ids no
+   * live session holds. Insertion order is `at` order (recordClaim re-inserts),
+   * so expired claims are always at the front. Bounded like the tracking maps.
+   */
+  private claims: Map<string, OwnerClaim> = new Map()
   /** Called after anything that changes the session set, or activity on it (see setChangeListener). */
   private onChange: (() => void) | null = null
   /** When the store last marked itself dirty — see noteActivity. */
@@ -131,16 +151,50 @@ export class Store {
    * Register a new session. Returns the secrets exactly once; only salted
    * hashes are stored. Throws 'session exists' on a duplicate id — a second
    * registration must never silently overwrite (and hijack) a live session.
+   *
+   * Who may register an id. It is not a secret: it is in the share link, and
+   * the owner registers that same id again whenever they share the
+   * conversation. Keyed on nothing else, a freed id went to whoever asked
+   * first — anyone holding an old link could register it the moment the owner
+   * stopped (or the reaper removed a share whose bridge died), hold it for
+   * good with a connected socket, and leave the owner a 409 with no token to
+   * clear it. `owner_key` is the bridge's proof of which install shared the id
+   * (an HMAC of the id under a secret kept on the owner's machine):
+   * - a live session registered with a key is replaced by a registration with
+   *   the same key — its bridge died without a word, and a restart must not
+   *   wait a day — and refused to anyone else. `replaced` tells the caller to
+   *   drop the old bridge socket; the old code, token and viewers end here;
+   * - an ended one stays reserved for that key (see recordClaim);
+   * - an id never registered with a key behaves as before, so bridges that
+   *   send none keep working. A live session registered without a key cannot
+   *   be replaced: there is nothing to prove ownership against.
    */
-  createSession(session_id: string, directory: string, title: string, created_by_ip: string) {
-    if (this.sessions.has(session_id)) throw new Error('session exists')
+  createSession(session_id: string, directory: string, title: string, created_by_ip: string, owner_key?: string) {
+    const now = Date.now()
+    const existing = this.sessions.get(session_id)
+    if (existing) {
+      if (!ownerKeyMatches(existing.owner_hash, existing.owner_salt, owner_key)) throw new Error('session exists')
+      // Same revocation as deleteSession: nothing of the old share may carry
+      // over into the new one.
+      this.dropViewers(existing)
+      this.sessionActivations.delete(session_id)
+    } else {
+      const claim = this.liveClaim(session_id, now)
+      if (claim && !ownerKeyMatches(claim.hash, claim.salt, owner_key)) throw new Error('session exists')
+      this.claims.delete(session_id)
+    }
     const access_code = generateCode()
     const code_salt = newSalt()
     const code_hash = saltedHash(access_code, code_salt)
     const bridge_token = generateToken()
     const bridge_token_salt = newSalt()
     const bridge_token_hash = saltedHash(bridge_token, bridge_token_salt)
-    const now = Date.now()
+    let owner_hash: string | undefined
+    let owner_salt: string | undefined
+    if (owner_key !== undefined) {
+      owner_salt = newSalt()
+      owner_hash = saltedHash(owner_key, owner_salt)
+    }
     const session: Session = {
       id: session_id,
       directory,
@@ -153,11 +207,47 @@ export class Store {
       last_seen: now,
       status: 'active',
       created_by_ip,
+      owner_hash,
+      owner_salt,
       viewers: new Map(),
     }
     this.sessions.set(session_id, session)
     this.changed()
-    return { session_id, access_code, bridge_token, viewer_url: `/${session_id}` }
+    return { session_id, access_code, bridge_token, viewer_url: `/${session_id}`, replaced: existing !== undefined }
+  }
+
+  /** The unexpired claim on an id no live session holds, if any. */
+  private liveClaim(session_id: string, now: number): OwnerClaim | undefined {
+    const claim = this.claims.get(session_id)
+    if (claim && now - claim.at > config.ownerClaimTtlMs) {
+      this.claims.delete(session_id)
+      return undefined
+    }
+    return claim
+  }
+
+  /**
+   * Keep an ending session's id reserved for the key it was registered with.
+   * Called wherever a session leaves the store — a delete by its bridge, the
+   * reaper; restore() does the same for one it drops as idle — because each
+   * of those frees the id, and a freed id is exactly what a squatter holding
+   * the old link waits for. A session registered without a key reserves
+   * nothing.
+   */
+  private recordClaim(session: { id: string; owner_hash?: string; owner_salt?: string }, at: number): void {
+    if (session.owner_hash === undefined || session.owner_salt === undefined) return
+    this.pruneClaims(Date.now())
+    // Re-insert, so Map order stays `at` order for pruneClaims.
+    this.claims.delete(session.id)
+    this.setBounded(this.claims, session.id, { hash: session.owner_hash, salt: session.owner_salt, at })
+  }
+
+  /** Drop lapsed claims; they sit at the front of the map (see claims). */
+  private pruneClaims(now: number): void {
+    for (const [id, claim] of this.claims) {
+      if (now - claim.at <= config.ownerClaimTtlMs) break
+      this.claims.delete(id)
+    }
   }
 
   /**
@@ -418,6 +508,8 @@ export class Store {
     // share for the old one's joins.
     this.sessionActivations.delete(session_id)
     this.sessions.delete(session_id)
+    // The id is free now, and it is in every link the owner handed out.
+    this.recordClaim(session, Date.now())
     this.changed()
     return true
   }
@@ -450,6 +542,7 @@ export class Store {
         this.dropViewers(session) // same revocation as deleteSession
         this.sessionActivations.delete(id)
         this.sessions.delete(id)
+        this.recordClaim(session, now)
         removed.push(id)
       }
     }
@@ -500,9 +593,10 @@ export class Store {
 
   /** Serializable view of the session set (salted hashes only, no secrets). */
   snapshot(): PersistedState {
+    const now = Date.now()
     return {
       version: STATE_VERSION,
-      saved_at: Date.now(),
+      saved_at: now,
       sessions: Array.from(this.sessions.values()).map((s) => ({
         id: s.id,
         directory: s.directory,
@@ -517,6 +611,9 @@ export class Store {
         last_seen: s.last_seen,
         status: s.status,
         created_by_ip: s.created_by_ip,
+        ...(s.owner_hash === undefined || s.owner_salt === undefined
+          ? {}
+          : { owner_hash: s.owner_hash, owner_salt: s.owner_salt }),
         // Insertion order is recency order (see matchViewer), and restore()
         // preserves it, so the LRU eviction order survives a restart too.
         viewers: Array.from(s.viewers.entries()).map(([hash, v]) => ({
@@ -527,6 +624,9 @@ export class Store {
           ...(v.index === undefined ? {} : { index: v.index }),
         })),
       })),
+      claims: Array.from(this.claims.entries())
+        .filter(([, c]) => now - c.at <= config.ownerClaimTtlMs)
+        .map(([id, c]) => ({ id, hash: c.hash, salt: c.salt, at: c.at })),
     }
   }
 
@@ -539,10 +639,29 @@ export class Store {
     if (!state || state.version !== STATE_VERSION || !Array.isArray(state.sessions)) return 0
     const now = Date.now()
     let restored = 0
+    // Collected first and inserted in `at` order, the order pruneClaims relies on.
+    const claims: { id: string; hash: string; salt: string; at: number }[] = []
+    for (const c of Array.isArray(state.claims) ? state.claims : []) {
+      if (!c || typeof c.id !== 'string' || !c.id || typeof c.hash !== 'string' || typeof c.salt !== 'string') continue
+      if (typeof c.at !== 'number' || now - c.at > config.ownerClaimTtlMs) continue
+      claims.push({ id: c.id, hash: c.hash, salt: c.salt, at: c.at })
+    }
     for (const s of state.sessions) {
       if (!s || typeof s.id !== 'string' || !s.id) continue
       if (this.sessions.has(s.id)) continue
-      if (typeof s.last_seen !== 'number' || now - s.last_seen > maxIdleMs) continue
+      if (typeof s.last_seen !== 'number' || now - s.last_seen > maxIdleMs) {
+        // Dropped as idle, which ends the share like the reaper would have:
+        // its id stays reserved for its owner all the same.
+        if (
+          typeof s.last_seen === 'number' &&
+          now - s.last_seen <= config.ownerClaimTtlMs &&
+          typeof s.owner_hash === 'string' &&
+          typeof s.owner_salt === 'string'
+        ) {
+          claims.push({ id: s.id, hash: s.owner_hash, salt: s.owner_salt, at: s.last_seen })
+        }
+        continue
+      }
       // A restored session must at least carry a usable bridge_token hash —
       // without it the bridge can never reconnect and the owner can never
       // delete it. Guards a truncated or hand-edited state file too. The
@@ -588,6 +707,9 @@ export class Store {
         last_seen: s.last_seen,
         status: s.status === 'closed' ? 'closed' : 'active',
         created_by_ip: typeof s.created_by_ip === 'string' ? s.created_by_ip : '',
+        ...(typeof s.owner_hash === 'string' && typeof s.owner_salt === 'string'
+          ? { owner_hash: s.owner_hash, owner_salt: s.owner_salt }
+          : {}),
         viewers,
       })
       // Rebuild the lookup index for this session. No stale entry can point at
@@ -598,6 +720,12 @@ export class Store {
         else this.viewerIndex.set(v.index, s.id)
       }
       restored += 1
+    }
+    // A live session carries its own owner hash; a claim this process already
+    // holds is at least as recent as the file.
+    for (const c of claims.sort((a, b) => a.at - b.at)) {
+      if (this.sessions.has(c.id) || this.claims.has(c.id)) continue
+      this.setBounded(this.claims, c.id, { hash: c.hash, salt: c.salt, at: c.at })
     }
     return restored
   }
@@ -667,6 +795,16 @@ function safeEqual(a: string, b: string): boolean {
   const right = Buffer.from(b)
   if (left.length !== right.length) return false
   return timingSafeEqual(left, right)
+}
+
+/**
+ * Whether `owner_key` is the key behind a stored owner hash. Never for a
+ * missing hash (a registration made without a key proves nothing either way)
+ * or a missing key.
+ */
+function ownerKeyMatches(hash: string | undefined, salt: string | undefined, owner_key: string | undefined): boolean {
+  if (hash === undefined || salt === undefined || owner_key === undefined) return false
+  return safeEqual(saltedHash(owner_key, salt), hash)
 }
 
 function sha256Hex(input: string): string {

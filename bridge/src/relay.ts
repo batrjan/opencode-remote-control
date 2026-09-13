@@ -77,18 +77,29 @@ export class RelayClient {
    * Bounded by `timeoutMs`, answer body included: `start` runs it before
    * anything is printed, and a relay that never answers must fail the start
    * with a reason rather than hold it until the plugin cancels it.
+   *
+   * `ownerKey` (see state.ts ownerKey) proves the id is this install's: the
+   * relay reserves an id for the key it was registered with, and lets the
+   * same key replace its own registration. A relay that predates it ignores
+   * the field.
    */
   async createSession(
     sessionId: string,
     directory: string,
     title: string,
+    ownerKey?: string,
     timeoutMs = relayRegisterTimeoutMs(),
   ): Promise<RelaySession> {
     try {
       const res = await fetch(`${this.url}/api/sessions`, {
         method: 'POST',
         headers: this.headers(),
-        body: JSON.stringify({ session_id: sessionId, directory, title }),
+        body: JSON.stringify({
+          session_id: sessionId,
+          directory,
+          title,
+          ...(ownerKey === undefined ? {} : { owner_key: ownerKey }),
+        }),
         signal: AbortSignal.timeout(timeoutMs),
       })
       if (!res.ok) throw new RelayHttpError(res.status, `relay createSession failed: ${res.status}`)

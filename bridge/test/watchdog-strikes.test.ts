@@ -95,7 +95,13 @@ async function until(check: () => boolean, timeoutMs: number): Promise<boolean> 
   return check()
 }
 
+// State files and the install's owner.key of the in-process bridges go to a
+// private HOME, never the real one.
+const savedHome = process.env.HOME
+const privateHome = mkdtempSync(path.join(tmpdir(), 'rc-watchdog-strikes-home-'))
+
 beforeAll(async () => {
+  process.env.HOME = privateHome
   opencode = createServer((req, res) => {
     const url = new URL(req.url ?? '', 'http://localhost')
     // Same basic auth as the real server, so detect.test.ts (parallel worker)
@@ -137,6 +143,9 @@ afterAll(async () => {
   await new Promise((resolve) => relay.close(resolve))
   opencode.closeAllConnections()
   await new Promise((resolve) => opencode.close(resolve))
+  if (savedHome === undefined) delete process.env.HOME
+  else process.env.HOME = savedHome
+  rmSync(privateHome, { recursive: true, force: true })
 })
 
 test('a single health probe that times out neither ends the share nor kills the server it spawned', async () => {

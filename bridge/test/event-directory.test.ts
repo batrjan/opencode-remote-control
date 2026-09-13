@@ -1,5 +1,8 @@
-import { afterEach, beforeEach, expect, test } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from 'vitest'
 import { createServer } from 'node:http'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { OpencodeClient } from '../src/opencode'
@@ -21,6 +24,18 @@ let relay: Server
 let relayUrl: string
 
 const SESSION_DIR = '/projects/shared-one'
+
+// State files and the install's owner.key go to a private HOME, never the real one.
+const savedHome = process.env.HOME
+const home = mkdtempSync(path.join(tmpdir(), 'rc-event-directory-home-'))
+beforeAll(() => {
+  process.env.HOME = home
+})
+afterAll(() => {
+  if (savedHome === undefined) delete process.env.HOME
+  else process.env.HOME = savedHome
+  rmSync(home, { recursive: true, force: true })
+})
 
 beforeEach(async () => {
   eventQueries = []

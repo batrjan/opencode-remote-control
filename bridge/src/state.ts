@@ -1,4 +1,15 @@
-import { mkdirSync, readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync } from 'node:fs'
+import { createHmac, randomBytes } from 'node:crypto'
+import {
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  unlinkSync,
+  existsSync,
+  readdirSync,
+  linkSync,
+  renameSync,
+  rmSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 
@@ -59,6 +70,73 @@ export function clearSessionState(sessionId: string): void {
     unlinkSync(statePath(sessionId))
   } catch {
     // already gone
+  }
+}
+
+/**
+ * The owner_key this install registers `sessionId` with: HMAC-SHA256 of the id
+ * under the install secret (see loadOrCreateOwnerSecret), base64url.
+ *
+ * The share link names the session id, and the owner registers that same id
+ * again every time the conversation is shared. The relay used to hand a freed
+ * id to whoever registered it first, so anyone holding an old link could take
+ * it the moment the owner stopped, and the owner's next start failed with a
+ * 409 it had no token to clear. The relay now reserves an id for the key it
+ * was registered with. Derived per id, so the key sent for one share proves
+ * nothing about any other; the secret itself never leaves this machine.
+ */
+export function ownerKey(sessionId: string): string {
+  return createHmac('sha256', loadOrCreateOwnerSecret()).update(sessionId).digest('base64url')
+}
+
+const OWNER_SECRET_BYTES = 32
+
+function ownerSecretPath(): string {
+  // Not a .json file: latestSessionState and the plugin read every *.json here
+  // as a share.
+  return path.join(stateDir(), 'owner.key')
+}
+
+/**
+ * The install secret behind every owner_key: 32 random bytes, created on first
+ * use, 0600. Unlike a session state it is never deleted — losing it only
+ * means the relay keeps this install's ended shares reserved until their
+ * claims expire.
+ *
+ * Written to a temp file and hard-linked into place, which fails when the
+ * file exists: two starts racing to create it both end up with whichever
+ * secret landed first, and neither ever reads a half-written one.
+ */
+export function loadOrCreateOwnerSecret(): Buffer {
+  const file = ownerSecretPath()
+  const existing = readOwnerSecret(file)
+  if (existing) return existing
+  mkdirSync(stateDir(), { recursive: true, mode: 0o700 })
+  const secret = randomBytes(OWNER_SECRET_BYTES)
+  const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+  writeFileSync(tmp, secret, { mode: 0o600 })
+  try {
+    linkSync(tmp, file)
+    return secret
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+    const raced = readOwnerSecret(file)
+    if (raced) return raced
+    // A file of the wrong size (truncated, edited by hand) proves nothing:
+    // replace it rather than fail every start from now on.
+    renameSync(tmp, file)
+    return secret
+  } finally {
+    rmSync(tmp, { force: true })
+  }
+}
+
+function readOwnerSecret(file: string): Buffer | undefined {
+  try {
+    const secret = readFileSync(file)
+    return secret.length === OWNER_SECRET_BYTES ? secret : undefined
+  } catch {
+    return undefined
   }
 }
 

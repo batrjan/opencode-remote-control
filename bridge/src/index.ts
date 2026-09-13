@@ -19,6 +19,7 @@ import {
   loadSessionState,
   clearSessionState,
   latestSessionState,
+  ownerKey,
   type SessionState,
 } from './state.js'
 
@@ -137,6 +138,8 @@ export async function startBridge(
       picked?.directory ?? process.cwd(),
       picked?.title ?? '',
       spawnedServer !== undefined,
+      // An explicit id was settled above, before anything was spawned.
+      opts.sessionId === undefined,
     ))
     // Persist the owner token so `stop` (even from another shell) can delete
     // the session later. 0600 perms; cleared on stop.
@@ -205,7 +208,11 @@ export async function startBridge(
       // DELETE is time-bounded, so a relay that never answers cannot keep a
       // SIGTERM'd bridge alive after its share is already down (ws closed above).
     }
-    clearSessionState(session_id)
+    // Only our own state. A later start of this session from this install
+    // replaces our registration on the relay (which is how we got here, with a
+    // 4001) and has already written ITS state under the same name: removing
+    // that would leave the live share without the token `stop` needs.
+    if (loadSessionState(session_id)?.bridge_token === bridge_token) clearSessionState(session_id)
     resolveClosed(reason)
   }
   // The relay only closes us on purpose when the session is gone (stopped
@@ -290,15 +297,21 @@ export async function startBridge(
  * Register the share, and when the relay already holds the session id (409),
  * find out whose registration that is before giving up.
  *
- * The relay never lets a second registration replace a session, and it keeps
- * one whose bridge died without a word (SIGKILL, a crash, a reboot) until a day
- * without activity has passed. So a restart after any of those failed with a
- * bare "relay createSession failed: 409" for up to a day, although the state
- * file still held the bridge_token that could end the old registration — and
- * so did a second start of a share that was still running, with nothing saying
- * which of the two it was or that `stop` exists. The earlier share recorded on
- * this machine decides now: still running is refused with its pid and how to
- * end it, dead is ended with its own token and registered again, once.
+ * The share link names the session id, and a relay that hands a freed id to
+ * whoever registers it first let anyone holding an old link take it the moment
+ * the owner stopped. Every registration therefore carries this install's
+ * owner_key (see state.ts ownerKey): the relay keeps an ended share's id
+ * reserved for it, and lets the same key replace its own registration, so a
+ * restart after a bridge died without a word (SIGKILL, a crash, a reboot) no
+ * longer waits a day even without the state file that held its token.
+ *
+ * That replacement is also why a share this machine still runs has to be
+ * found before registering, not on a 409: the relay would take it over under
+ * its viewers. With `settleFirst` the earlier share recorded here is settled
+ * first — still running is refused with its pid and how to end it, dead is
+ * ended with its own token. A 409 still settles it and registers again, once:
+ * a relay that predates owner keys refuses the same install like anyone else,
+ * as does a registration an older bridge made without a key.
  */
 async function registerShare(
   relay: RelayClient,
@@ -306,16 +319,19 @@ async function registerShare(
   directory: string,
   title: string,
   endLeftoverServer: boolean,
+  settleFirst: boolean,
 ): Promise<RelaySession> {
   const isConflict = (err: unknown) => err instanceof RelayHttpError && err.status === 409
+  const key = ownerKey(sessionId)
+  if (settleFirst) await settleEarlierShare(relay, sessionId, endLeftoverServer)
   try {
-    return await relay.createSession(sessionId, directory, title)
+    return await relay.createSession(sessionId, directory, title, key)
   } catch (err) {
     if (!isConflict(err)) throw err
   }
   if (await settleEarlierShare(relay, sessionId, endLeftoverServer)) {
     try {
-      return await relay.createSession(sessionId, directory, title)
+      return await relay.createSession(sessionId, directory, title, key)
     } catch (err) {
       if (!isConflict(err)) throw err
     }
@@ -323,7 +339,8 @@ async function registerShare(
   // Nothing here can end it: the token belongs to whoever registered it.
   throw new Error(
     `session ${sessionId} is already registered on the relay (409) by a share this machine has no record of — ` +
-      'end it from where it was started, or wait for the relay to expire it (by default after a day without activity)',
+      'end it with /remote-control/stop where it was started, or wait for the relay to expire it ' +
+      '(by default after a day without activity; an id shared from another install stays reserved for it for 30 days after that share ended)',
   )
 }
 

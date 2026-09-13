@@ -90,7 +90,13 @@ async function until(check: () => Promise<boolean> | boolean, timeoutMs: number)
   return await check()
 }
 
+// State files and the install's owner.key of the in-process bridges go to a
+// private HOME, never the real one.
+const savedHome = process.env.HOME
+const privateHome = mkdtempSync(path.join(tmpdir(), 'rc-owner-exit-home-'))
+
 beforeAll(async () => {
+  process.env.HOME = privateHome
   opencode = createServer((req, res) => {
     const url = new URL(req.url ?? '', 'http://localhost')
     if (req.headers.authorization !== opencodeAuthHeader()) return json(res, 401, { error: 'unauthorized' })
@@ -113,6 +119,9 @@ afterAll(async () => {
   await new Promise((resolve) => relay.close(resolve))
   opencode.closeAllConnections()
   await new Promise((resolve) => opencode.close(resolve))
+  if (savedHome === undefined) delete process.env.HOME
+  else process.env.HOME = savedHome
+  rmSync(privateHome, { recursive: true, force: true })
 })
 
 test('the bridge stops and revokes the share when its owner process exits, even with opencode healthy', async () => {

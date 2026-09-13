@@ -86,7 +86,12 @@ async function waitForExit(child: ChildProcess, timeoutMs = 5000): Promise<boole
   })
 }
 
+// State files and the install's owner.key go to a private HOME, never the real one.
+const savedHome = process.env.HOME
+const home = mkdtempSync(path.join(tmpdir(), 'rc-stop-teardown-home-'))
+
 beforeAll(async () => {
+  process.env.HOME = home
   opencode = createServer((req, res) => {
     const url = new URL(req.url ?? '', 'http://localhost')
     if (req.headers.authorization !== opencodeAuthHeader()) return json(res, 401, { error: 'unauthorized' })
@@ -110,6 +115,9 @@ afterAll(async () => {
   opencode.closeAllConnections()
   await new Promise((resolve) => opencode.close(resolve))
   for (const dir of spawnedBridgeDirs) rmSync(dir, { recursive: true, force: true })
+  if (savedHome === undefined) delete process.env.HOME
+  else process.env.HOME = savedHome
+  rmSync(home, { recursive: true, force: true })
 })
 
 test('start records its own pid so another process can stop it', async () => {

@@ -7,7 +7,11 @@ import type { BridgeClient } from '../ws/bridge.js'
  * skill), hence "skill router". Mounted at /api/sessions.
  *
  * PUBLIC by design (works out of the box, no shared key):
- * - POST   /api/sessions        — public registration, rate-limited per IP
+ * - POST   /api/sessions        — public registration, rate-limited per IP;
+ *                                 an optional `owner_key` reserves the id for
+ *                                 the install that registered it and lets that
+ *                                 install replace its own registration (see
+ *                                 Store.createSession)
  * - GET    /api/sessions/:id    — non-secret status view (bridge status cmd)
  * - DELETE /api/sessions/:id    — requires the session's OWN bridge_token in
  *                                 the `x-bridge-token` header, so only the
@@ -24,13 +28,21 @@ import type { BridgeClient } from '../ws/bridge.js'
 export const MAX_SESSION_ID = 128
 const MAX_DIRECTORY = 4096
 const MAX_TITLE = 1024
+/**
+ * Bounds for owner_key (see Store.createSession). The bridge sends a
+ * base64url HMAC-SHA256, 43 characters. The floor is what makes it a proof: a
+ * wrong key costs the caller nothing but a 409, so a short one would only turn
+ * the reservation into a guessing game.
+ */
+const MIN_OWNER_KEY = 32
+const MAX_OWNER_KEY = 256
 
 export function skillRouter(store: Store, bridge?: BridgeClient) {
   const router = express.Router()
 
   router.post('/', (req, res) => {
     const body = req.body ?? {}
-    const { session_id, directory, title } = body
+    const { session_id, directory, title, owner_key } = body
     if (typeof session_id !== 'string' || session_id.length === 0) {
       return res.status(400).json({ error: 'session_id is required' })
     }
@@ -45,6 +57,14 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
     if (typeof title === 'string' && title.length > MAX_TITLE) {
       return res.status(400).json({ error: 'field too long' })
     }
+    // Refused rather than ignored when malformed: registering without the key
+    // the caller meant to send would leave its id unreserved without a word.
+    if (owner_key !== undefined) {
+      if (typeof owner_key !== 'string' || owner_key.length < MIN_OWNER_KEY) {
+        return res.status(400).json({ error: `owner_key must be a string of at least ${MIN_OWNER_KEY} characters` })
+      }
+      if (owner_key.length > MAX_OWNER_KEY) return res.status(400).json({ error: 'field too long' })
+    }
     const ip = req.ip ?? 'unknown'
     try {
       store.checkRegistrationLimit(ip)
@@ -52,17 +72,23 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
       return res.status(429).json({ error: 'rate limited' })
     }
     try {
-      const result = store.createSession(
+      const { replaced, ...result } = store.createSession(
         session_id,
         directory,
         typeof title === 'string' ? title : '',
         ip,
+        owner_key,
       )
       // Consume the registration slot only now that a session really exists:
       // checking used to increment, so a request that ended in 409 below (a
       // duplicate id — a bridge retrying its own registration, typically) burned
       // an hour of the caller's quota while creating nothing.
       store.commitRegistration(ip)
+      // The owner took back its own registration (its bridge died without a
+      // word). The old socket, if the relay still holds one, authenticated with
+      // a token that no longer exists: drop it and fail its requests, as DELETE
+      // does, before the new bridge dials in.
+      if (replaced) bridge?.disconnect(session_id)
       return res.status(201).json(result)
     } catch (err) {
       if (err instanceof Error && err.message === 'session exists') {
