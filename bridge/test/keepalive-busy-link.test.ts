@@ -138,22 +138,37 @@ test("the relay's own pings count as proof the link is alive", async () => {
 }, 15_000)
 
 test('a link whose outbound queue is still draining is not killed', async () => {
-  // The field case, with real TCP backpressure. The relay reads its socket in
-  // rare short bursts, the bridge has just sent ONE large frame through its
-  // real send() path, and no pong can come back because our ping is stuck
-  // behind it. Bytes leave on every drip, yet bufferedAmount cannot move until
-  // the whole frame is out — the case a bufferedAmount-based rule gets wrong.
+  // The field case, with real TCP backpressure. The relay takes a small,
+  // fixed number of bytes every 40 ms — a slow uplink — while the bridge has
+  // megabytes queued through its real send() path, so no pong can come back:
+  // our ping sits behind that queue. Bytes leave on every drip.
   //
-  // Asserted precisely rather than by "one socket at the end": the muted
-  // stand-in genuinely IS dead once the queue empties, so a later re-dial is
-  // correct. What must never happen is the socket being killed while it still
-  // had data queued — and the test fails as vacuous unless that draining
-  // period spanned several keep-alive intervals.
+  // Both sides are pinned down so the test means the same thing on any OS.
+  // The drip is a byte budget (pause() once it is spent), not a time slice —
+  // how much one resumed tick reads differs wildly between kernels. And the
+  // backlog is built until it sits in THIS process, whatever the OS buffers
+  // absorbed first.
+  //
+  // The interval is scaled up for this test only. Even a steady reader frees
+  // the sender's OS buffer in steps: the socket turns writable again only once
+  // a sizeable part of it is free (measured ~0.1 s apart at this drip rate on
+  // macOS, more on Linux), so progress is invisible for a while between steps.
+  // Production has 20 s intervals and a 40 s window against steps of a few
+  // seconds on a 2 Mbit/s line; 60 ms would test the kernel, not the rule.
+  const INTERVAL_MS = 500
+  const savedInterval = process.env.REMOTE_CONTROL_WS_PING_INTERVAL_MS
+  process.env.REMOTE_CONTROL_WS_PING_INTERVAL_MS = String(INTERVAL_MS)
+  const DRIP_BYTES = 256 * 1024
   const relay = await mutedRelay((_socket, raw) => {
+    let budget = 0
+    raw.on('data', (chunk: Buffer) => {
+      budget -= chunk.length
+      if (budget <= 0) raw.pause()
+    })
     raw.pause()
     const drip = setInterval(() => {
+      budget = DRIP_BYTES
       raw.resume()
-      setImmediate(() => raw.pause())
     }, 40)
     raw.on('close', () => clearInterval(drip))
   })
@@ -162,32 +177,41 @@ test('a link whose outbound queue is still draining is not killed', async () => 
   try {
     await ws.connect('sess-draining', 'token')
     const first = client.ws
-    client.send({ type: 'proxy_response', request_id: 'r1', status: 200, body: 'x'.repeat(48 * 1024 * 1024) })
+    const blob = 'x'.repeat(1024 * 1024)
+    const BACKLOG = 16 * 1024 * 1024
+    for (let i = 0; first.bufferedAmount < BACKLOG && i < 512; i++) {
+      client.send({ type: 'proxy_response', request_id: `r${i}`, status: 200, body: blob })
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    expect(first.bufferedAmount).toBeGreaterThanOrEqual(BACKLOG)
 
-    let queuedSamples = 0
+    // Asserted precisely rather than by "one socket at the end": the muted
+    // stand-in genuinely IS dead once the queue empties, so a later re-dial is
+    // correct. What must never happen is a kill while data is still queued.
+    let queuedMs = 0
     let killedWhileQueued = false
     let lastQueued = first.bufferedAmount
     first.on('close', () => {
       if (lastQueued > 0) killedWhileQueued = true
     })
-    const deadline = Date.now() + 4000
-    while (Date.now() < deadline && first.readyState === 1) {
+    const started = Date.now()
+    while (Date.now() - started < 15_000 && first.readyState === 1) {
       lastQueued = first.bufferedAmount
-      if (lastQueued > 0) queuedSamples += 1
-      else break // drained: from here on the stand-in is legitimately silent
+      if (lastQueued === 0) break // drained: from here on the stand-in is legitimately silent
       await settle(20)
     }
-    // Data stayed queued past the point the OLD rule killed a pong-less link
-    // (two 60 ms intervals) — otherwise surviving it would prove nothing…
-    const INTERVAL_MS = 60
-    expect(queuedSamples * 20).toBeGreaterThan(2 * INTERVAL_MS)
-    // …and the socket was never torn down with that data still on it.
+    queuedMs = Date.now() - started
     expect(killedWhileQueued).toBe(false)
+    expect(first.readyState).toBe(1)
+    // And the backlog outlived what the OLD rule allowed a pong-less link (two
+    // intervals) — otherwise surviving it proved nothing.
+    expect(queuedMs).toBeGreaterThan(3 * INTERVAL_MS)
   } finally {
+    process.env.REMOTE_CONTROL_WS_PING_INTERVAL_MS = savedInterval
     ws.close()
     relay.wss.close()
   }
-}, 20_000)
+}, 30_000)
 
 test('a genuinely dead link is still detected and re-dialled', async () => {
   // Nothing comes back and nothing leaves: this is what the keep-alive is for,
