@@ -6,7 +6,11 @@
 export const config = {
   /** Path probed on candidate OpenCode ports during auto-detection. */
   healthPath: '/global/health',
-  /** Per-port health probe timeout; keeps detection fast with stale listeners. */
+  /**
+   * Per-port health probe timeout; keeps detection fast with stale listeners.
+   * Detection only — the running share's watchdog has its own, longer deadline
+   * (watchdogProbeTimeoutMs).
+   */
   healthTimeoutMs: 1500,
   /** Public relay the bridge registers sessions with (overridable via CLI). */
   defaultRelayUrl: 'https://opencode.b4tr.net',
@@ -34,6 +38,30 @@ export function wsPingIntervalMs(): number {
 export function watchdogIntervalMs(): number {
   const v = Number(process.env.REMOTE_CONTROL_WATCHDOG_INTERVAL_MS)
   return Number.isFinite(v) && v > 0 ? v : config.watchdogIntervalMs
+}
+
+/**
+ * Deadline for one watchdog health probe of the local opencode server. It used
+ * to be detection's 1.5 s, which is tuned for skipping stale listeners during a
+ * port scan, not for judging a server that is in use: a server busy with the
+ * very prompt a viewer just sent, or a bridge whose own event loop stalled for
+ * a moment, missed it and the share was ended. Proxied requests to the same
+ * server get 30 s; a live server answering its health route needs far less.
+ */
+export function watchdogProbeTimeoutMs(): number {
+  const v = Number(process.env.REMOTE_CONTROL_WATCHDOG_TIMEOUT_MS)
+  return Number.isFinite(v) && v > 0 ? v : 5_000
+}
+
+/**
+ * Consecutive failed health probes after which the watchdog ends the share.
+ * One was enough, so a single slow answer revoked the code and every viewer
+ * token and killed the server the bridge had spawned. A server that is really
+ * gone keeps failing, so it is still caught, a few intervals later.
+ */
+export function watchdogStrikes(): number {
+  const v = Number(process.env.REMOTE_CONTROL_WATCHDOG_STRIKES)
+  return Number.isInteger(v) && v > 0 ? v : 3
 }
 
 /**

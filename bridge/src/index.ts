@@ -3,7 +3,14 @@ import { execFileSync } from 'node:child_process'
 import { realpathSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { Command } from 'commander'
-import { config, opencodeAuthHeader, relayDeleteTimeoutMs, watchdogIntervalMs } from './config.js'
+import {
+  config,
+  opencodeAuthHeader,
+  relayDeleteTimeoutMs,
+  watchdogIntervalMs,
+  watchdogProbeTimeoutMs,
+  watchdogStrikes,
+} from './config.js'
 import { detectOpenCodePort, ensureOpenCodeServer } from './detect.js'
 import { OpencodeClient } from './opencode.js'
 import { RelayClient, RelayWSClient } from './relay.js'
@@ -27,7 +34,7 @@ export interface StartBridgeOptions {
   sessionId?: string
   /** Full opencode base URL — test hook that overrides port detection. */
   opencodeUrl?: string
-  /** Watchdog poll interval — test hook; defaults to config.watchdogIntervalMs. */
+  /** Watchdog poll interval — test hook; defaults to watchdogIntervalMs(). */
   healthIntervalMs?: number
   /** Server spawner — test hook; defaults to ensureOpenCodeServer(). */
   serverSpawner?: () => Promise<{ port: number; spawned?: import('node:child_process').ChildProcess }>
@@ -43,8 +50,11 @@ export interface BridgeHandle {
   session_id: string
   access_code: string
   viewer_url: string
-  /** Resolves once the bridge has fully shut down (stop() or watchdog). */
-  closed: Promise<void>
+  /**
+   * Resolves once the bridge has fully shut down, with why when it ended on its
+   * own (watchdog, relay) and undefined when stop() was called.
+   */
+  closed: Promise<string | undefined>
   /** Stop the watchdog, close the WS, and delete the relay session. Idempotent. */
   stop(): Promise<void>
 }
@@ -150,12 +160,16 @@ export async function startBridge(
     throw err
   }
 
-  let resolveClosed!: () => void
-  const closed = new Promise<void>((resolve) => {
+  let resolveClosed!: (reason: string | undefined) => void
+  const closed = new Promise<string | undefined>((resolve) => {
     resolveClosed = resolve
   })
   let stopped = false
-  const stop = async () => {
+  // `reason` says why the share ended when nobody asked it to. Every exit path
+  // (watchdog, relay, signal) runs this same teardown, and the owner used to
+  // get a bare "Remote control stopped." for all of them — on the plugin path
+  // only in its private log — with nothing telling a dead server from a signal.
+  const stop = async (reason?: string) => {
     if (stopped) return
     stopped = true
     clearInterval(watchdog)
@@ -173,12 +187,12 @@ export async function startBridge(
       // SIGTERM'd bridge alive after its share is already down (ws closed above).
     }
     clearSessionState(session_id)
-    resolveClosed()
+    resolveClosed(reason)
   }
   // The relay only closes us on purpose when the session is gone (stopped
   // elsewhere, or credentials revoked) — there is nothing left to reconnect
   // to, so shut down instead of retrying forever.
-  ws.onFatal = () => void stop()
+  ws.onFatal = (err) => void stop(`the relay ended the session (${err.message})`)
   // The share belongs to the OpenCode process it was started from, not to the
   // server we talk to. On the TUI path that server is our own `opencode serve`,
   // and the plugin starts us detached, so quitting the TUI signalled neither:
@@ -197,14 +211,60 @@ export async function startBridge(
   }
   // Watchdog: owner gone, or opencode gone (process exited / port closed) →
   // notify the relay (revokes code + tokens) and shut down.
+  //
+  // The owner check is exact, so it acts at once. A failed health probe is not:
+  // a timeout only says the server did not answer in time, and the stop it
+  // triggers is drastic — the code and every viewer token revoked, and on the
+  // TUI path the `opencode serve` holding the viewers' running work killed. So
+  // it takes several failed probes in a row, like the relay link's keep-alive
+  // takes several silent ticks; a server that is really gone keeps failing and
+  // is still caught. Probes never overlap: one that is still waiting for its
+  // answer is not a second failure.
+  const strikes = watchdogStrikes()
+  let probing = false
+  let failedProbes = 0
   const watchdog = setInterval(() => {
+    if (stopped) return
+    if (ownerGone()) {
+      void stop(`the OpenCode process that started the share (pid ${ownerPid}) exited`)
+      return
+    }
+    if (probing) return
+    probing = true
     void (async () => {
-      if (ownerGone() || !(await opencodeHealthy(opencodeUrl))) await stop()
+      try {
+        const failure = await probeOpencode(opencodeUrl)
+        if (stopped) return
+        if (failure === undefined) {
+          if (failedProbes > 0) {
+            console.warn(
+              `bridge: local opencode at ${opencodeUrl} is answering again after ${failedProbes} failed health probe(s)`,
+            )
+          }
+          failedProbes = 0
+          return
+        }
+        failedProbes++
+        if (failedProbes < strikes) {
+          console.warn(
+            `bridge: local opencode at ${opencodeUrl} failed health probe ${failedProbes} of ${strikes} (${failure})`,
+          )
+          return
+        }
+        console.warn(
+          `bridge: local opencode at ${opencodeUrl} failed ${failedProbes} health probes in a row (${failure}) — ending the share`,
+        )
+        await stop(
+          `the local opencode server stopped responding (${failedProbes} health probes in a row failed: ${failure})`,
+        )
+      } finally {
+        probing = false
+      }
     })()
   }, opts.healthIntervalMs ?? watchdogIntervalMs())
   watchdog.unref() // never keep the process alive just for the watchdog
 
-  return { session_id, access_code, viewer_url, closed, stop }
+  return { session_id, access_code, viewer_url, closed, stop: () => stop() }
 }
 
 /**
@@ -480,15 +540,25 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-async function opencodeHealthy(opencodeUrl: string): Promise<boolean> {
+/**
+ * One watchdog health probe of the local opencode server: undefined when it
+ * answered OK, otherwise what went wrong, in words for the log — a timeout, a
+ * refused connection and an HTTP error are different stories for an owner
+ * reading why their share ended.
+ */
+async function probeOpencode(opencodeUrl: string): Promise<string | undefined> {
+  const timeoutMs = watchdogProbeTimeoutMs()
   try {
     const res = await fetch(`${opencodeUrl}${config.healthPath}`, {
       headers: { Authorization: opencodeAuthHeader() },
-      signal: AbortSignal.timeout(config.healthTimeoutMs),
+      signal: AbortSignal.timeout(timeoutMs),
     })
-    return res.ok
-  } catch {
-    return false
+    return res.ok ? undefined : `HTTP ${res.status}`
+  } catch (err) {
+    if (err instanceof Error && err.name === 'TimeoutError') return `no answer within ${timeoutMs} ms`
+    // fetch reports every network failure as "fetch failed"; the errno is on its cause.
+    const code = (err as { cause?: { code?: unknown } } | undefined)?.cause?.code
+    return `unreachable: ${typeof code === 'string' ? code : errorMessage(err)}`
   }
 }
 
@@ -546,8 +616,11 @@ program
     process.on('SIGINT', onSignal)
     process.on('SIGTERM', onSignal)
     process.on('SIGHUP', onSignal)
-    await handle.closed
-    console.log('Remote control stopped.')
+    const reason = await handle.closed
+    // A share that ended on its own says why: this is the only line an owner
+    // finds later (in the plugin's log), and "stopped" alone read the same for
+    // a dead server, a revoked session and their own Ctrl+C.
+    console.log(reason === undefined ? 'Remote control stopped.' : `Remote control stopped: ${reason}.`)
   })
 
 program

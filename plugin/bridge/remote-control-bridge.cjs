@@ -7086,7 +7086,11 @@ var program = new Command();
 var config = {
   /** Path probed on candidate OpenCode ports during auto-detection. */
   healthPath: "/global/health",
-  /** Per-port health probe timeout; keeps detection fast with stale listeners. */
+  /**
+   * Per-port health probe timeout; keeps detection fast with stale listeners.
+   * Detection only — the running share's watchdog has its own, longer deadline
+   * (watchdogProbeTimeoutMs).
+   */
   healthTimeoutMs: 1500,
   /** Public relay the bridge registers sessions with (overridable via CLI). */
   defaultRelayUrl: "https://opencode.b4tr.net",
@@ -7099,6 +7103,14 @@ function wsPingIntervalMs() {
 function watchdogIntervalMs() {
   const v = Number(process.env.REMOTE_CONTROL_WATCHDOG_INTERVAL_MS);
   return Number.isFinite(v) && v > 0 ? v : config.watchdogIntervalMs;
+}
+function watchdogProbeTimeoutMs() {
+  const v = Number(process.env.REMOTE_CONTROL_WATCHDOG_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : 5e3;
+}
+function watchdogStrikes() {
+  const v = Number(process.env.REMOTE_CONTROL_WATCHDOG_STRIKES);
+  return Number.isInteger(v) && v > 0 ? v : 3;
 }
 function wsHandshakeTimeoutMs() {
   const v = Number(process.env.REMOTE_CONTROL_WS_HANDSHAKE_TIMEOUT_MS);
@@ -8217,7 +8229,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     resolveClosed = resolve;
   });
   let stopped = false;
-  const stop = async () => {
+  const stop = async (reason) => {
     if (stopped) return;
     stopped = true;
     clearInterval(watchdog);
@@ -8229,9 +8241,9 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     } catch {
     }
     clearSessionState(session_id);
-    resolveClosed();
+    resolveClosed(reason);
   };
-  ws.onFatal = () => void stop();
+  ws.onFatal = (err) => void stop(`the relay ended the session (${err.message})`);
   const ownerPid = opts.ownerPid;
   const ownerIsParent = ownerPid !== void 0 && ownerPid === process.ppid;
   const ownerGone = () => {
@@ -8239,13 +8251,50 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     if (ownerIsParent && process.ppid !== ownerPid) return true;
     return !pidAlive(ownerPid);
   };
+  const strikes = watchdogStrikes();
+  let probing = false;
+  let failedProbes = 0;
   const watchdog = setInterval(() => {
+    if (stopped) return;
+    if (ownerGone()) {
+      void stop(`the OpenCode process that started the share (pid ${ownerPid}) exited`);
+      return;
+    }
+    if (probing) return;
+    probing = true;
     void (async () => {
-      if (ownerGone() || !await opencodeHealthy(opencodeUrl)) await stop();
+      try {
+        const failure = await probeOpencode(opencodeUrl);
+        if (stopped) return;
+        if (failure === void 0) {
+          if (failedProbes > 0) {
+            console.warn(
+              `bridge: local opencode at ${opencodeUrl} is answering again after ${failedProbes} failed health probe(s)`
+            );
+          }
+          failedProbes = 0;
+          return;
+        }
+        failedProbes++;
+        if (failedProbes < strikes) {
+          console.warn(
+            `bridge: local opencode at ${opencodeUrl} failed health probe ${failedProbes} of ${strikes} (${failure})`
+          );
+          return;
+        }
+        console.warn(
+          `bridge: local opencode at ${opencodeUrl} failed ${failedProbes} health probes in a row (${failure}) \u2014 ending the share`
+        );
+        await stop(
+          `the local opencode server stopped responding (${failedProbes} health probes in a row failed: ${failure})`
+        );
+      } finally {
+        probing = false;
+      }
     })();
   }, opts.healthIntervalMs ?? watchdogIntervalMs());
   watchdog.unref();
-  return { session_id, access_code, viewer_url, closed, stop };
+  return { session_id, access_code, viewer_url, closed, stop: () => stop() };
 }
 async function stopBridge(relayUrl, sessionId, apiKey) {
   const state = loadSessionState(sessionId);
@@ -8383,15 +8432,18 @@ function pidAlive(pid) {
     return err.code === "EPERM";
   }
 }
-async function opencodeHealthy(opencodeUrl) {
+async function probeOpencode(opencodeUrl) {
+  const timeoutMs = watchdogProbeTimeoutMs();
   try {
     const res = await fetch(`${opencodeUrl}${config.healthPath}`, {
       headers: { Authorization: opencodeAuthHeader() },
-      signal: AbortSignal.timeout(config.healthTimeoutMs)
+      signal: AbortSignal.timeout(timeoutMs)
     });
-    return res.ok;
-  } catch {
-    return false;
+    return res.ok ? void 0 : `HTTP ${res.status}`;
+  } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") return `no answer within ${timeoutMs} ms`;
+    const code = err?.cause?.code;
+    return `unreachable: ${typeof code === "string" ? code : errorMessage(err)}`;
   }
 }
 function errorMessage(err) {
@@ -8430,8 +8482,8 @@ program2.command("start").description("Register this session with the relay and 
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
   process.on("SIGHUP", onSignal);
-  await handle.closed;
-  console.log("Remote control stopped.");
+  const reason = await handle.closed;
+  console.log(reason === void 0 ? "Remote control stopped." : `Remote control stopped: ${reason}.`);
 });
 program2.command("stop").description("End a remote-control session on the relay").option("--relay <url>", "relay base URL", config.defaultRelayUrl).option("--api-key <key>", "relay API key (optional)").option("--session-id <id>", "opencode session id (latest started when omitted)").action(async (opts) => {
   const sessionId = resolveSessionId(opts.sessionId);
