@@ -436,6 +436,11 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   // own session. Upstream returns every pending request on the instance
   // (all of the owner's sessions); a viewer must only ever see (and thus be
   // able to reason about) its own. The list endpoint is read-only.
+  // It carries the session's directory like every other route: opencode holds
+  // pending permissions per directory instance, and a bare /permission lists
+  // the server's own one — empty whenever the share lives elsewhere (the
+  // desktop app hosting several projects), so a pending prompt vanished from
+  // the viewer on reload.
   router.get(['/permission', '/api/permission'], (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
@@ -443,7 +448,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       try {
         const out = await bridge.request(
           session.id,
-          { method: 'GET', path: '/permission' },
+          { method: 'GET', path: `/permission${queryForSession(queryOf(req), session)}` },
           config.proxyTimeoutMs,
         )
         let body = out.body
@@ -466,7 +471,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   // session. Upstream lists every pending question on the instance, so the
   // raw list showed a viewer the question text of the owner's OTHER sessions
   // in the same project. The UI only reads it at bootstrap to restore the
-  // question dock. Unlike /permission it keeps the directory query: questions
+  // question dock. Like /permission it keeps the directory query: questions
   // are held by the instance of the directory, the same one the dock's reply
   // is sent to.
   router.get(['/question', '/api/question'], (req, res) => {
@@ -497,6 +502,9 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
 
   // GET /session/status — global status map, filtered to the viewer's
   // session only (other sessions' statuses are not the viewer's business).
+  // Statuses are per directory instance too: without the session's directory
+  // upstream answers {} for a share outside the server's own folder, and a
+  // busy session looked idle to the viewer.
   router.get(['/session/status', '/api/session/status'], (req, res) => {
     const session = requireViewer(req, res)
     if (!session) return
@@ -504,7 +512,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       try {
         const out = await bridge.request(
           session.id,
-          { method: 'GET', path: '/session/status' },
+          { method: 'GET', path: `/session/status${queryForSession(queryOf(req), session)}` },
           config.proxyTimeoutMs,
         )
         let body = out.body

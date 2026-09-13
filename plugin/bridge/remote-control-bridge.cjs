@@ -7256,9 +7256,14 @@ var OpencodeClient = class {
     const res = await fetch(`${this.url}/session/status`, { headers: this.auth() });
     return res.json();
   }
-  /** Pending permission requests (instance-wide list; callers must filter). */
-  async listPermissions() {
-    const res = await fetch(`${this.url}/permission`, { headers: this.auth() });
+  /**
+   * Pending permission requests (instance-wide list; callers must filter).
+   * `query` ('' or '?…') picks the instance, as for listQuestions: opencode
+   * holds pending permissions per directory, and without one it lists the
+   * SERVER's own instance — empty whenever the session lives elsewhere.
+   */
+  async listPermissions(query = "") {
+    const res = await fetch(`${this.url}/permission${query}`, { headers: this.auth() });
     if (!res.ok) throw new Error(`listPermissions failed: ${res.status}`);
     return res.json();
   }
@@ -7532,6 +7537,10 @@ function isProxyRequestAllowed(method, path3, boundSessionId) {
   const pathname = path3.split(/[?#]/)[0] ?? "";
   if (!pathname.startsWith("/")) return false;
   return templates.some((template) => matchesTemplate(template, pathname, boundSessionId));
+}
+function queryOfPath(path3) {
+  const queryStart = path3.indexOf("?");
+  return queryStart === -1 ? "" : path3.slice(queryStart).split("#")[0];
 }
 var warnedRejections = /* @__PURE__ */ new Set();
 var MAX_LOGGED_REJECTIONS = 50;
@@ -7930,7 +7939,7 @@ var RelayWSClient = class {
     const permissionID = decodeURIComponent(m[1]);
     if (!this.boundSessionId) return null;
     try {
-      const pending = await this.opencode.listPermissions();
+      const pending = await this.opencode.listPermissions(queryOfPath(path3));
       const list = Array.isArray(pending) ? pending : [];
       const owned = list.some((p) => {
         const rec = p;
@@ -7955,10 +7964,8 @@ var RelayWSClient = class {
   async guardQuestion(requestID, path3) {
     const notFound = "question request not found for this session";
     if (!this.boundSessionId) return "question verification unavailable";
-    const queryStart = path3.indexOf("?");
-    const query = queryStart === -1 ? "" : path3.slice(queryStart).split("#")[0];
     try {
-      const pending = await this.opencode.listQuestions(query);
+      const pending = await this.opencode.listQuestions(queryOfPath(path3));
       if (!Array.isArray(pending)) return notFound;
       const owned = pending.some((q) => {
         const rec = q;

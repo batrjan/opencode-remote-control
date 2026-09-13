@@ -78,8 +78,8 @@ const ACCEPTED: Array<[string, string]> = [
   ['GET', '/api/skill?directory=%2Fp'],
   // Paths the relay's own handlers build instead of templating.
   ['GET', '/project?directory=%2Fp'],
-  ['GET', '/permission'],
-  ['GET', '/session/status'],
+  ['GET', '/permission?directory=%2Fp'],
+  ['GET', '/session/status?directory=%2Fp'],
   ['GET', `/session/${SES}`], // the subagent ancestry walk, no query
   // The '/api/…' twins of the above: the UI's bootstrap asks for these.
   ['GET', `/api/session/${SES}/message?directory=%2Fp`],

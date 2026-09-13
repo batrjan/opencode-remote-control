@@ -299,6 +299,16 @@ export function isProxyRequestAllowed(
   return templates.some((template) => matchesTemplate(template, pathname, boundSessionId))
 }
 
+/**
+ * The query ('' or '?…', fragment dropped) of a relay-forwarded path. It
+ * carries the ?directory=… the relay pins, which picks the opencode instance
+ * the request acts on — the ownership guards read their pending lists there.
+ */
+function queryOfPath(path: string): string {
+  const queryStart = path.indexOf('?')
+  return queryStart === -1 ? '' : path.slice(queryStart).split('#')[0]!
+}
+
 /** method+path pairs already reported, so one confused relay cannot spam the
  * log (and cannot grow this set without bound either). */
 const warnedRejections = new Set<string>()
@@ -852,7 +862,13 @@ export class RelayWSClient {
     const permissionID = decodeURIComponent(m[1]!)
     if (!this.boundSessionId) return null
     try {
-      const pending = await this.opencode.listPermissions()
+      // Listed with the forwarded request's own query, like guardQuestion:
+      // pending permissions are held per directory instance, and a list
+      // without ?directory=… reads the server's own one. That found nothing
+      // whenever the shared session lived elsewhere (the desktop app hosting
+      // several projects, a server started from another folder), so every
+      // viewer answer was refused as foreign.
+      const pending = await this.opencode.listPermissions(queryOfPath(path))
       const list = Array.isArray(pending) ? pending : []
       const owned = list.some((p) => {
         const rec = p as Record<string, unknown>
@@ -879,10 +895,8 @@ export class RelayWSClient {
   private async guardQuestion(requestID: string, path: string): Promise<string | null> {
     const notFound = 'question request not found for this session'
     if (!this.boundSessionId) return 'question verification unavailable'
-    const queryStart = path.indexOf('?')
-    const query = queryStart === -1 ? '' : path.slice(queryStart).split('#')[0]!
     try {
-      const pending: unknown = await this.opencode.listQuestions(query)
+      const pending: unknown = await this.opencode.listQuestions(queryOfPath(path))
       if (!Array.isArray(pending)) return notFound
       const owned = pending.some((q) => {
         const rec = q as Record<string, unknown> | null

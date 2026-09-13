@@ -39,9 +39,14 @@ export class OpencodeClient {
     return res.json()
   }
 
-  /** Pending permission requests (instance-wide list; callers must filter). */
-  async listPermissions() {
-    const res = await fetch(`${this.url}/permission`, { headers: this.auth() })
+  /**
+   * Pending permission requests (instance-wide list; callers must filter).
+   * `query` ('' or '?…') picks the instance, as for listQuestions: opencode
+   * holds pending permissions per directory, and without one it lists the
+   * SERVER's own instance — empty whenever the session lives elsewhere.
+   */
+  async listPermissions(query = '') {
+    const res = await fetch(`${this.url}/permission${query}`, { headers: this.auth() })
     if (!res.ok) throw new Error(`listPermissions failed: ${res.status}`)
     return res.json()
   }
