@@ -7,7 +7,7 @@
 // `tui()` / `server()` — hence two entries over one shared implementation.
 
 import { spawn, execFile } from "node:child_process"
-import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, rmSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -136,6 +136,96 @@ export function parseBridgeLog(text) {
   return { ready: undefined, failure }
 }
 
+/**
+ * How long `start` waits for the bridge to print its URL and code.
+ *
+ * It was 30 s, and a slow start ran past that while every stage was still
+ * inside its own limit: detection, a cold `opencode serve` (up to 20 s to
+ * report a port, then a health poll), the relay registration and the bridge
+ * WebSocket, over owner uplinks measured at 0.7-1.7 Mbit/s. The plugin then
+ * reported "timeout waiting for the bridge" while the detached bridge carried
+ * on, registered the share and printed a code nobody read. Two minutes sits
+ * above every bounded startup stage; what still runs past it is cancelled, not
+ * abandoned (see cancelStart).
+ *
+ * REMOTE_CONTROL_START_TIMEOUT_MS overrides it, so a test that drives the real
+ * bundle through the plugin does not wait two minutes for a cancel.
+ */
+export function startTimeoutMs(env = process.env) {
+  const v = Number(env.REMOTE_CONTROL_START_TIMEOUT_MS)
+  return Number.isFinite(v) && v > 0 ? v : 120_000
+}
+
+/** How long a cancelled bridge gets to die before its state file is read. */
+const CANCEL_EXIT_WAIT_MS = 3_000
+
+/**
+ * The share a bridge registered, found by that bridge's pid in the state files
+ * it writes beside the log (`<session>.json`, `pid` = the `start` process).
+ * Matching the pid rather than the session id keeps an older, live share of
+ * the same session out of it, and still finds the share of a start that picked
+ * its own session. Undefined when that bridge registered nothing.
+ */
+function registeredShare(pid, dir = path.dirname(logPath())) {
+  let files
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".json"))
+  } catch {
+    return undefined
+  }
+  for (const file of files) {
+    try {
+      const state = JSON.parse(readFileSync(path.join(dir, file), "utf8"))
+      if (state && state.pid === pid && typeof state.session_id === "string") return state.session_id
+    } catch {
+      // Unreadable or half-written entry: not the one we are looking for.
+    }
+  }
+  return undefined
+}
+
+/**
+ * Take down a bridge that did not come up in time, and anything it left.
+ *
+ * Rejecting alone left it running: detached and unref'd, nothing else ever
+ * signals it, so it went on to register the share and print a code the plugin
+ * had stopped reading, with the `opencode serve` it spawned behind it. A retry
+ * then hit 409 for the session and truncated the log holding that code.
+ *
+ * The bridge leads its own process group (spawned detached) and the server it
+ * spawns stays in it, so the group is signalled: a pid-only SIGTERM killed the
+ * bridge and left the server re-parented to init. Before it is up the bridge
+ * has no signal handler, so SIGTERM ends it without any cleanup — hence the
+ * `stop` for a share it had already registered, which deletes it on the relay
+ * and clears its state. Where groups cannot be signalled (Windows) the bridge
+ * pid is the fallback.
+ *
+ * Resolves with a sentence for the owner; never rejects.
+ */
+async function cancelStart(child, exited) {
+  try {
+    process.kill(-child.pid, "SIGTERM")
+  } catch {
+    try {
+      child.kill("SIGTERM")
+    } catch {
+      // Already gone.
+    }
+  }
+  // Read the state only once the bridge is gone, so a registration completing
+  // at this very moment cannot write a state file after it was looked for.
+  await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, CANCEL_EXIT_WAIT_MS))])
+  const sessionID = registeredShare(child.pid)
+  if (!sessionID) return "Nothing is shared."
+  try {
+    const out = await runBridge(["stop", "--relay", relayUrl(), "--session-id", sessionID])
+    // `stop` says more than this only when the relay could not be told.
+    return !out || out === "Remote control stopped." ? "The share it had registered was ended." : out
+  } catch (err) {
+    return `The share it had registered could not be ended (${String(err?.message ?? err)}) — run /remote-control/stop.`
+  }
+}
+
 /** Start the bridge detached, logging to LOG; resolve once it prints URL+CODE.
  * `sessionID` pins the share to the user's current session, never another. */
 function startBridge(sessionID) {
@@ -162,30 +252,22 @@ function startBridge(sessionID) {
       stdio: ["ignore", out, out],
     })
     child.unref()
+    // Watched from the start: a bridge can exit before anyone waits for it.
+    const exited = new Promise((resolve) => child.on("exit", resolve))
     let settled = false
     const fail = (msg) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      clearInterval(poll)
       reject(new Error(msg))
     }
-    const timer = setTimeout(() => {
-      if (settled) return
-      settled = true
-      try {
-        const text = readFileSync(LOG, "utf8").trim()
-        reject(new Error(text || "timeout waiting for the bridge"))
-      } catch {
-        reject(new Error("timeout waiting for the bridge"))
-      }
-    }, 30_000)
-    const poll = setInterval(() => {
-      if (settled) return clearInterval(poll)
+    const check = () => {
       let text = ""
       try {
         text = readFileSync(LOG, "utf8")
       } catch {
-        return
+        return false
       }
       const { ready, failure } = parseBridgeLog(text)
       if (ready) {
@@ -193,9 +275,32 @@ function startBridge(sessionID) {
         clearInterval(poll)
         clearTimeout(timer)
         resolve(ready)
-      } else if (failure) {
-        fail(failure)
+        return true
       }
+      if (failure) {
+        fail(failure)
+        return true
+      }
+      return false
+    }
+    const timeoutMs = startTimeoutMs()
+    const timer = setTimeout(() => {
+      if (settled) return
+      // A code printed since the last poll still counts.
+      if (check()) return
+      settled = true
+      clearInterval(poll)
+      void cancelStart(child, exited).then((outcome) =>
+        reject(
+          new Error(
+            `start cancelled: the bridge did not come up within ${timeoutMs / 1000} s and was stopped. ${outcome}`,
+          ),
+        ),
+      )
+    }, timeoutMs)
+    const poll = setInterval(() => {
+      if (settled) return clearInterval(poll)
+      check()
     }, 250)
     child.on("error", (err) => fail(String(err)))
   })

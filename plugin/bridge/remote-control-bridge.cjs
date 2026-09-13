@@ -7108,6 +7108,10 @@ function relayDeleteTimeoutMs() {
   const v = Number(process.env.REMOTE_CONTROL_RELAY_DELETE_TIMEOUT_MS);
   return Number.isFinite(v) && v > 0 ? v : 5e3;
 }
+function relayRegisterTimeoutMs() {
+  const v = Number(process.env.REMOTE_CONTROL_RELAY_REGISTER_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : 15e3;
+}
 function reconnectBaseMs() {
   return Number(process.env.REMOTE_CONTROL_RECONNECT_BASE_MS ?? 1e3);
 }
@@ -7392,15 +7396,29 @@ var RelayClient = class {
     if (this.apiKey) h["x-api-key"] = this.apiKey;
     return h;
   }
-  /** Register a session; secrets (access_code, bridge_token) return once. */
-  async createSession(sessionId, directory, title) {
-    const res = await fetch(`${this.url}/api/sessions`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({ session_id: sessionId, directory, title })
-    });
-    if (!res.ok) throw new Error(`relay createSession failed: ${res.status}`);
-    return await res.json();
+  /**
+   * Register a session; secrets (access_code, bridge_token) return once.
+   *
+   * Bounded by `timeoutMs`, answer body included: `start` runs it before
+   * anything is printed, and a relay that never answers must fail the start
+   * with a reason rather than hold it until the plugin cancels it.
+   */
+  async createSession(sessionId, directory, title, timeoutMs = relayRegisterTimeoutMs()) {
+    try {
+      const res = await fetch(`${this.url}/api/sessions`, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({ session_id: sessionId, directory, title }),
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+      if (!res.ok) throw new Error(`relay createSession failed: ${res.status}`);
+      return await res.json();
+    } catch (err) {
+      if (err instanceof Error && err.name === "TimeoutError") {
+        throw new Error(`relay createSession failed: no answer within ${timeoutMs / 1e3} s`);
+      }
+      throw err;
+    }
   }
   /**
    * End a session on the relay. Requires the session's own bridge_token.

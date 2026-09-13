@@ -41,8 +41,9 @@ export function watchdogIntervalMs(): number {
  * and the HTTP upgrade. ws applies it as an idle timeout on the socket, so it
  * only fires once nothing has crossed it for this long. The whole handshake is
  * a few kilobytes, which even a 0.7 Mbit/s uplink moves in well under a
- * second; it stays below the plugin's 30 s wait for a starting bridge, so a
- * stalled first dial fails and cleans up before the plugin gives up on it.
+ * second; it stays well below the plugin's two-minute wait for a starting
+ * bridge, so a stalled first dial fails and cleans up before the plugin gives
+ * up on it.
  */
 export function wsHandshakeTimeoutMs(): number {
   const v = Number(process.env.REMOTE_CONTROL_WS_HANDSHAKE_TIMEOUT_MS)
@@ -61,6 +62,21 @@ export function wsHandshakeTimeoutMs(): number {
 export function relayDeleteTimeoutMs(): number {
   const v = Number(process.env.REMOTE_CONTROL_RELAY_DELETE_TIMEOUT_MS)
   return Number.isFinite(v) && v > 0 ? v : 5_000
+}
+
+/**
+ * Deadline for the relay registration (POST /api/sessions) that starts a share.
+ * The request carried none, so a relay that accepted the connection and never
+ * answered (a wedged upstream, a black-holed path) held `start` open for as
+ * long as the socket lived. The plugin gives a starting bridge two minutes and
+ * cancels it after that, so a registration nobody answers must fail well inside
+ * that window, with a reason the owner is shown instead of a bare cancel. The
+ * request and its answer are a few hundred bytes each, which even a
+ * 0.7 Mbit/s uplink moves in well under a second.
+ */
+export function relayRegisterTimeoutMs(): number {
+  const v = Number(process.env.REMOTE_CONTROL_RELAY_REGISTER_TIMEOUT_MS)
+  return Number.isFinite(v) && v > 0 ? v : 15_000
 }
 
 /** First reconnect delay; doubles per attempt up to reconnectMaxMs. */

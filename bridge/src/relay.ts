@@ -7,6 +7,7 @@ import {
   eventHighWaterBytes,
   eventRetryMs,
   relayDeleteTimeoutMs,
+  relayRegisterTimeoutMs,
   wsHandshakeTimeoutMs,
   wsPingIntervalMs,
 } from './config.js'
@@ -55,19 +56,34 @@ export class RelayClient {
     return h
   }
 
-  /** Register a session; secrets (access_code, bridge_token) return once. */
+  /**
+   * Register a session; secrets (access_code, bridge_token) return once.
+   *
+   * Bounded by `timeoutMs`, answer body included: `start` runs it before
+   * anything is printed, and a relay that never answers must fail the start
+   * with a reason rather than hold it until the plugin cancels it.
+   */
   async createSession(
     sessionId: string,
     directory: string,
     title: string,
+    timeoutMs = relayRegisterTimeoutMs(),
   ): Promise<RelaySession> {
-    const res = await fetch(`${this.url}/api/sessions`, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify({ session_id: sessionId, directory, title }),
-    })
-    if (!res.ok) throw new Error(`relay createSession failed: ${res.status}`)
-    return (await res.json()) as RelaySession
+    try {
+      const res = await fetch(`${this.url}/api/sessions`, {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify({ session_id: sessionId, directory, title }),
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+      if (!res.ok) throw new Error(`relay createSession failed: ${res.status}`)
+      return (await res.json()) as RelaySession
+    } catch (err) {
+      if (err instanceof Error && err.name === 'TimeoutError') {
+        throw new Error(`relay createSession failed: no answer within ${timeoutMs / 1000} s`)
+      }
+      throw err
+    }
   }
 
   /**
