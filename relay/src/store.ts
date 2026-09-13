@@ -39,8 +39,12 @@ export interface Session {
   viewers: Map<string, ViewerToken> // salted hash -> { salt, created_at, last_used, index }
 }
 
-/** Minimum last_seen advance before it is worth re-persisting. */
-const LAST_SEEN_PERSIST_THROTTLE_MS = 60_000
+/**
+ * How often mere activity (a session's last_seen, a viewer's last_used) may
+ * mark the store dirty. Far inside the day restore() allows before it drops a
+ * record as idle, so a crash loses at most this much of either.
+ */
+const ACTIVITY_PERSIST_THROTTLE_MS = 60_000
 
 export class Store {
   private sessions: Map<string, Session> = new Map()
@@ -65,8 +69,10 @@ export class Store {
    * tokens never trigger the fallback scan.
    */
   private unindexedViewers = 0
-  /** Called after anything that changes the session set (see setChangeListener). */
+  /** Called after anything that changes the session set, or activity on it (see setChangeListener). */
   private onChange: (() => void) | null = null
+  /** When the store last marked itself dirty — see noteActivity. */
+  private lastDirtyAt = 0
 
   /**
    * @param maxTrackingEntries cap for codeFails/blockedCodes/sessionFails
@@ -313,6 +319,8 @@ export class Store {
       // (coldest) entry and needs no separate LRU bookkeeping.
       session.viewers.delete(hash)
       session.viewers.set(hash, viewer)
+      // Last, so a listener that snapshots at once sees the finished record.
+      this.noteActivity(now)
       return true
     }
     return false
@@ -454,25 +462,39 @@ export class Store {
     const s = this.sessions.get(session_id)
     if (!s) return
     const now = Date.now()
-    const prev = s.last_seen
     s.last_seen = now
-    // last_seen changes on every pong and every proxied request; persisting
-    // each one would rewrite the whole state file several times a minute for a
-    // best-effort timestamp. Only mark dirty when it moved enough to matter for
-    // the idle reaper across a restart.
-    if (now - prev >= LAST_SEEN_PERSIST_THROTTLE_MS) this.changed()
+    this.noteActivity(now)
   }
 
   /**
-   * Register a listener fired after every change to the session set. The
-   * server uses it to persist a snapshot, so a restart no longer drops live
-   * shares. Rate-limit state is intentionally out of scope.
+   * Mark the store dirty for a timestamp that moved, at most once per
+   * ACTIVITY_PERSIST_THROTTLE_MS store-wide.
+   *
+   * last_seen changes on every pong and every proxied request, last_used on
+   * every viewer request; persisting each one would rewrite the whole state
+   * file several times a minute. The throttle used to compare against the
+   * PREVIOUS touch instead, and a connected bridge touches every 25 s at most,
+   * so the gap never came and nothing reached the file while a share was only
+   * in use. A day of that and restore() dropped the share as idle: a redeploy
+   * refused the still-running bridge with 401, which it takes as fatal. The
+   * snapshot is store-wide, so one mark refreshes every session's timestamps.
+   */
+  private noteActivity(now: number): void {
+    if (now - this.lastDirtyAt >= ACTIVITY_PERSIST_THROTTLE_MS) this.changed()
+  }
+
+  /**
+   * Register a listener fired after every change to the session set, and at
+   * most once a minute for activity on it (see noteActivity). The server uses
+   * it to persist a snapshot, so a restart no longer drops live shares.
+   * Rate-limit state is intentionally out of scope.
    */
   setChangeListener(listener: (() => void) | null): void {
     this.onChange = listener
   }
 
   private changed(): void {
+    this.lastDirtyAt = Date.now()
     this.onChange?.()
   }
 

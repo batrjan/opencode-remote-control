@@ -444,10 +444,20 @@ export async function startServer(port: number = config.port): Promise<http.Serv
   }, config.orphanSweepIntervalMs)
   reaper.unref()
   server.on('close', () => clearInterval(reaper))
+  // Write the store as it is now, not only what is queued: activity queues a
+  // write at most once a minute (see Store.noteActivity), and a bare flush with
+  // nothing queued wrote nothing, leaving last_seen/last_used on disk behind
+  // the live ones. An empty store with nothing queued has nothing newer to
+  // say, so the file is left alone rather than written over one this process
+  // could not read (a wrong RELAY_STATE_KEY, say).
+  const persistNow = () => {
+    if (!persistence) return
+    if (store.sessionCount() > 0) persistence.schedule(() => store.snapshot())
+    persistence.flush()
+  }
   server.on('close', () => {
     if (!persistence) return
-    // Write whatever is still queued before the process goes away.
-    persistence.flush()
+    persistNow()
     persistence.close()
     store.setChangeListener(null)
   })
@@ -455,10 +465,7 @@ export async function startServer(port: number = config.port): Promise<http.Serv
   // viewer SSE stream keeps server.close() pending, so 'close' can be too late
   // (or never fire before SIGKILL). Attach the flush to the server so
   // shutdown() can run it before anything else.
-  ;(server as RelayServer).flushState = () => {
-    if (!persistence) return
-    persistence.flush()
-  }
+  ;(server as RelayServer).flushState = persistNow
   ;(server as RelayServer).endEventStreams = app.endEventStreams
   await new Promise<void>((resolve) => server.listen(port, resolve))
   return server

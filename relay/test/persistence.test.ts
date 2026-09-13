@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from 'vitest'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -6,9 +6,11 @@ import path from 'node:path'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
+import { WebSocket } from 'ws'
 import { Store } from '../src/store'
+import type { PersistedState } from '../src/persist'
 import { FileStateStore, stateKey } from '../src/persist'
-import { startServer } from '../src/server'
+import { shutdown, startServer } from '../src/server'
 
 /**
  * A relay restart used to end every share: the store is a set of in-memory
@@ -36,6 +38,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   delete process.env.RELAY_STATE_FILE
   delete process.env.RELAY_STATE_KEY
   rmSync(dir, { recursive: true, force: true })
@@ -356,3 +359,214 @@ test('the shutdown flush handle writes the latest state without waiting for clos
     await new Promise((resolve) => relay.close(resolve))
   }
 }, 20_000)
+
+/**
+ * A share that stayed quiet for a day did not survive the next restart.
+ *
+ * Nothing wrote the state file while a share was merely in use. last_seen was
+ * re-persisted only when it had moved a minute past the PREVIOUS touch, and a
+ * connected bridge touches its session on every pong (25 s) and every byte it
+ * sends, so that gap never came. Viewer use slid last_used in memory only, and
+ * the shutdown flush wrote nothing unless a write was already queued. So the
+ * file kept the timestamps of the last create, activate, delete or reap
+ * anywhere on the relay. restore() drops a session whose last_seen is older
+ * than a day, and a viewer idle for longer: a redeploy or a crash after an
+ * overnight or weekend share answered the viewers 404 and 401 and refused the
+ * still-running bridge with 401, which it takes as fatal and ends the share.
+ */
+
+const HOUR = 3_600_000
+/** The relay's production keep-alive ping interval. */
+const PONG_EVERY_MS = 25_000
+
+test('a snapshot keeps up with a share whose bridge only answers pings for over a day', () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  const store = new Store()
+  let lastSnapshot: PersistedState | undefined
+  // What the relay would find on disk after a crash: the last snapshot the
+  // store asked to have written.
+  store.setChangeListener(() => {
+    lastSnapshot = store.snapshot()
+  })
+  const created = store.createSession('ses_quiet_store', '/work', 't', '1.2.3.4')
+  const { viewer_token } = store.activate(created.access_code, 'ses_quiet_store')
+
+  const started = Date.now()
+  for (let t = PONG_EVERY_MS; t <= 25 * HOUR; t += PONG_EVERY_MS) {
+    vi.setSystemTime(started + t)
+    store.touchSession('ses_quiet_store')
+    // The open tab's event stream re-checks its token as it goes.
+    if (t % (15 * 60_000) === 0) expect(store.verifyViewer('ses_quiet_store', viewer_token)).toBe(true)
+  }
+
+  const restarted = new Store()
+  expect(restarted.restore(lastSnapshot)).toBe(1)
+  expect(restarted.verifyBridgeToken('ses_quiet_store', created.bridge_token)).toBe(true)
+  expect(restarted.verifyViewer('ses_quiet_store', viewer_token)).toBe(true)
+})
+
+test("a snapshot carries a viewer's sliding window, not the time its token was issued", () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  const store = new Store()
+  let lastSnapshot: PersistedState | undefined
+  store.setChangeListener(() => {
+    lastSnapshot = store.snapshot()
+  })
+  const created = store.createSession('ses_viewer_slide', '/work', 't', '1.2.3.4')
+  const { viewer_token } = store.activate(created.access_code, 'ses_viewer_slide')
+
+  // Only the viewer is active: nothing touches the session itself.
+  const started = Date.now()
+  for (let t = 15_000; t <= 2 * HOUR; t += 15_000) {
+    vi.setSystemTime(started + t)
+    expect(store.verifyViewer('ses_viewer_slide', viewer_token)).toBe(true)
+  }
+
+  const persisted = lastSnapshot!.sessions[0]!.viewers[0]!
+  // Persisting is throttled, so the snapshot may trail by up to a minute.
+  expect(Date.now() - persisted.last_used!).toBeLessThanOrEqual(60_000)
+})
+
+test('the shutdown flush writes timestamps that moved since the last write', async () => {
+  process.env.RELAY_STATE_FILE = file
+  process.env.RELAY_STATE_KEY = KEY
+  vi.useFakeTimers({ toFake: ['Date'] })
+  const relay = await startServer(0)
+  const port = (relay.address() as AddressInfo).port
+  let bridge: WebSocket | undefined
+  try {
+    const created = await request(relay)
+      .post('/api/sessions')
+      .set('x-api-key', API_KEY)
+      .send({ session_id: 'ses_flush_fresh', directory: '/w', title: 't' })
+    const act = await request(relay)
+      .post('/api/activate')
+      .send({ code: created.body.access_code, session_id: 'ses_flush_fresh' })
+    expect(act.status).toBe(200)
+    const flushState = (relay as unknown as { flushState: () => void }).flushState
+    // The debounced write for the activation lands.
+    flushState()
+
+    // Half a minute of use: less than any persist throttle, so nothing queues.
+    vi.setSystemTime(Date.now() + 30_000)
+    const usedAt = Date.now()
+    await request(relay)
+      .get('/ses_flush_fresh')
+      .set('cookie', `viewer_token=${act.body.viewer_token}`)
+      .expect(302)
+    const link = new WebSocket(`ws://127.0.0.1:${port}/bridge?session_id=ses_flush_fresh`, {
+      headers: { 'x-bridge-token': created.body.bridge_token },
+    })
+    bridge = link
+    await new Promise((resolve, reject) => {
+      link.once('open', resolve)
+      link.once('error', reject)
+    })
+    // Any byte from the bridge touches its session; the pong proves it was read.
+    await new Promise((resolve) => {
+      link.once('pong', resolve)
+      link.ping()
+    })
+
+    flushState()
+    const onDisk = new FileStateStore(file, 0).load()!.sessions[0]!
+    expect(onDisk.last_seen).toBe(usedAt)
+    expect(onDisk.viewers[0]!.last_used).toBe(usedAt)
+  } finally {
+    bridge?.terminate()
+    relay.closeAllConnections()
+    await new Promise((resolve) => relay.close(resolve))
+  }
+}, 20_000)
+
+test('shutdown leaves alone a state file the relay could not read', async () => {
+  // The shutdown flush now writes the store as it is. A relay started with the
+  // wrong RELAY_STATE_KEY holds nothing, and must not make that permanent.
+  const a = new Store()
+  a.createSession('ses_unread', '/work', 't', '1.2.3.4')
+  const write = new FileStateStore(file, 0, stateKey({ RELAY_STATE_KEY: KEY } as NodeJS.ProcessEnv))
+  write.schedule(() => a.snapshot())
+  write.flush()
+  const before = readFileSync(file, 'utf8')
+
+  process.env.RELAY_STATE_FILE = file
+  process.env.RELAY_STATE_KEY = randomBytes(32).toString('hex')
+  const relay = await startServer(0)
+  expect((await request(relay).get('/api/sessions/ses_unread')).status).toBe(404)
+  await shutdown(relay)
+
+  expect(readFileSync(file, 'utf8')).toBe(before)
+}, 20_000)
+
+test('a share kept alive by its bridge for over a day survives a redeploy', async () => {
+  process.env.RELAY_STATE_FILE = file
+  process.env.RELAY_STATE_KEY = KEY
+  vi.useFakeTimers({ toFake: ['Date'] })
+  let relay: Server = await startServer(0)
+  const port = (relay.address() as AddressInfo).port
+  const bridgeUrl = `ws://127.0.0.1:${port}/bridge?session_id=ses_overnight`
+  const sockets: WebSocket[] = []
+  /** Dial the bridge endpoint: 'open', or the HTTP status of the refusal. */
+  const dial = async (token: string) => {
+    const ws = new WebSocket(bridgeUrl, { headers: { 'x-bridge-token': token } })
+    sockets.push(ws)
+    ws.on('error', () => {})
+    const outcome = await new Promise<'open' | number>((resolve) => {
+      ws.once('open', () => resolve('open'))
+      ws.once('unexpected-response', (_req, res) => resolve(res.statusCode ?? 0))
+    })
+    return { ws, outcome }
+  }
+  try {
+    const created = await request(relay)
+      .post('/api/sessions')
+      .set('x-api-key', API_KEY)
+      .send({ session_id: 'ses_overnight', directory: '/work', title: 'overnight' })
+    expect(created.status).toBe(201)
+    const act = await request(relay)
+      .post('/api/activate')
+      .send({ code: created.body.access_code, session_id: 'ses_overnight' })
+    expect(act.status).toBe(200)
+    const viewerCookie = `viewer_token=${act.body.viewer_token}`
+    const link = await dial(created.body.bridge_token)
+    expect(link.outcome).toBe('open')
+    // Let the activation's debounced write land now. Left queued, it would
+    // take its snapshot whenever the timer fired, somewhere inside the loop.
+    ;(relay as unknown as { flushState: () => void }).flushState()
+
+    // 25 hours in which nobody creates, joins or stops anything. The bridge
+    // answers every keep-alive; the open tab keeps using its token.
+    const started = Date.now()
+    for (let t = PONG_EVERY_MS; t <= 25 * HOUR; t += PONG_EVERY_MS) {
+      vi.setSystemTime(started + t)
+      // Any byte from the bridge touches its session; the pong comes back only
+      // after the relay has read the ping, so each step is really seen.
+      await new Promise((resolve) => {
+        link.ws.once('pong', resolve)
+        link.ws.ping()
+      })
+      if (t % (10 * 60_000) === 0) {
+        await request(relay).get('/ses_overnight').set('cookie', viewerCookie).expect(302)
+      }
+    }
+
+    // Redeploy: the signal handler's shutdown, the old process's exit taking
+    // the bridge link with it, then a new relay on the same state file.
+    const closed = shutdown(relay)
+    link.ws.terminate()
+    await closed
+    relay = await startServer(port)
+
+    expect((await request(relay).get('/api/sessions/ses_overnight')).status).toBe(200)
+    // The still-running bridge is let back in instead of refused with 401...
+    expect((await dial(created.body.bridge_token)).outcome).toBe('open')
+    // ...and the viewer's tab is still in its share.
+    await request(relay).get('/ses_overnight').set('cookie', viewerCookie).expect(302)
+  } finally {
+    for (const ws of sockets) ws.terminate()
+    if (relay.listening) {
+      relay.closeAllConnections()
+      await new Promise((resolve) => relay.close(resolve))
+    }
+  }
+}, 30_000)
