@@ -220,12 +220,14 @@ const RESYNC_MESSAGE_LIMIT = 20
  */
 const RESYNC_DRAIN_TIMEOUT_MS = 30_000
 
-/** What a bridge re-dial needs from one open viewer stream. */
+/** What the relay needs from one open viewer stream: a bridge re-dial resyncs it, a shutdown ends it. */
 interface ViewerStream {
   /** Re-send opencode's handshake frame; ends the stream instead if the viewer was revoked. */
   handshake(): void
   /** Write each event (bare opencode JSON, already filtered to the session), keeping the viewer's backlog under its cap. */
   replay(events: string[]): Promise<void>
+  /** Stop feeding the stream and end it with its final chunk. */
+  end(): void
 }
 
 export function proxyAdapter(store: Store, bridge: BridgeClient) {
@@ -889,6 +891,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           if (!(await backlogAtMost(res, maxBuffer / 2, RESYNC_DRAIN_TIMEOUT_MS))) return
         }
       },
+      end: endStream,
     })
     unsubscribe = () => {
       unsubscribeEvents()
@@ -898,7 +901,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     res.on('close', unsubscribe)
   }
 
-  /** Open viewer streams per session — what a bridge re-dial resyncs. */
+  /** Open viewer streams per session — what a bridge re-dial resyncs and a shutdown ends. */
   const viewerStreams = new Map<string, Set<ViewerStream>>()
 
   /** Register an open stream; returns an idempotent unregister. */
@@ -1061,7 +1064,24 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     openEventStream(req, res, session, true)
   })
 
-  return router
+  /**
+   * End every open viewer stream normally, for a relay shutdown.
+   *
+   * The web UI's SSE reader tells a stream that ENDED from one that FAILED,
+   * and only a failure costs the viewer: that reader waits 3 s, 6 s, 12 s, up
+   * to 30 s between attempts, and never resets the count while it lives, not
+   * even after it reconnects. A stream that ends retires the reader; the UI
+   * opens a new one 250 ms later, with the count at zero. Closing the socket
+   * under a stream, which is what dropping the connection does, is a failure.
+   * Each end unregisters its stream, so walk copies.
+   */
+  function endEventStreams(): void {
+    for (const streams of [...viewerStreams.values()]) {
+      for (const stream of [...streams]) stream.end()
+    }
+  }
+
+  return Object.assign(router, { endEventStreams })
 }
 
 /**

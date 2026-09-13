@@ -1,5 +1,4 @@
-import type http from 'node:http'
-import { startServer } from './server.js'
+import { shutdown, startServer } from './server.js'
 import { config } from './config.js'
 
 /**
@@ -15,13 +14,9 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
     if (shuttingDown) return
     shuttingDown = true
-    // Persist NOW, before anything can hang: an open viewer SSE stream keeps
-    // server.close() pending, so relying on the 'close' event to flush would
-    // lose the last snapshot on a redeploy — exactly when it matters.
-    ;(server as http.Server & { flushState?: () => void }).flushState?.()
-    // Drop lingering connections (SSE streams) so close() can actually finish.
-    server.closeAllConnections?.()
-    server.close(() => process.exit(0))
+    // Persists first, then ends the viewers' streams rather than cutting them
+    // (see shutdown() for why that order matters to the web UI).
+    void shutdown(server).then(() => process.exit(0))
     // Hard deadline: never let a stuck connection block the redeploy.
     setTimeout(() => process.exit(0), 3000).unref()
   })

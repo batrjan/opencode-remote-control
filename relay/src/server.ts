@@ -74,8 +74,10 @@ function terminalHtml(): string {
  * instance per app. The optional BridgeClient lets the session API disconnect
  * a bridge when its session is deleted (startServer always passes it).
  */
-export function createApp(store: Store, bridge?: BridgeClient): Express {
+export function createApp(store: Store, bridge?: BridgeClient): Express & { endEventStreams: () => void } {
   const app = express()
+  // Ends the viewers' SSE streams on shutdown; nothing to end without the proxy.
+  let endEventStreams = () => {}
   // Which proxy hop to believe for X-Forwarded-For — see trustProxy(). A
   // permissive `true` made XFF fully client-spoofable, defeating per-IP rate
   // limits; a bare 'loopback' inside Docker trusted nothing and collapsed
@@ -203,7 +205,11 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
   // allowlisted opencode paths (/session/..., /agent, /provider, /file, ...);
   // everything else falls through to this 404. Because it is registered after
   // every relay route (/api/*, /join, /terminal, /:id), those keep working.
-  if (bridge) app.use(proxyAdapter(store, bridge))
+  if (bridge) {
+    const adapter = proxyAdapter(store, bridge)
+    app.use(adapter)
+    endEventStreams = adapter.endEventStreams
+  }
   // Nothing matched. express's own finalhandler answers an HTML page reading
   // "Cannot PUT /config", which is both the wrong content type for an API and
   // a free framework fingerprint — every other error this relay produces is
@@ -221,7 +227,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express {
     if (res.headersSent) return next(err)
     return res.status(413).json({ error: 'payload too large' })
   })
-  return app
+  return Object.assign(app, { endEventStreams })
 }
 
 /**
@@ -369,12 +375,61 @@ export async function startServer(port: number = config.port): Promise<http.Serv
   })
   // Deterministic shutdown flush, independent of the 'close' event: an open
   // viewer SSE stream keeps server.close() pending, so 'close' can be too late
-  // (or never fire before SIGKILL). Attach the flush to the server so the
-  // signal handler can run it directly and then force connections closed.
-  ;(server as http.Server & { flushState?: () => void }).flushState = () => {
+  // (or never fire before SIGKILL). Attach the flush to the server so
+  // shutdown() can run it before anything else.
+  ;(server as RelayServer).flushState = () => {
     if (!persistence) return
     persistence.flush()
   }
+  ;(server as RelayServer).endEventStreams = app.endEventStreams
   await new Promise<void>((resolve) => server.listen(port, resolve))
   return server
+}
+
+/** What startServer hangs on its http.Server for shutdown() to use. */
+type RelayServer = http.Server & { flushState?: () => void; endEventStreams?: () => void }
+
+/**
+ * How long shutdown() lets the viewers' final chunks go out before it drops
+ * every connection still open. Kept under the web UI's 250 ms reconnect delay:
+ * a browser that sends that reconnect down a kept-alive connection must find
+ * it closed, not get a new stream from this process that is then cut. A viewer
+ * too backed up to take its final chunk by then is cut, as before.
+ */
+const SHUTDOWN_GRACE_MS = 150
+
+/**
+ * Stop a server from startServer: what the SIGINT/SIGTERM handler runs.
+ * Resolves once the server has closed. A connected bridge's WebSocket keeps it
+ * open, so the caller still needs its own deadline.
+ *
+ * This used to drop every connection at once, and the web UI takes a stream
+ * whose connection drops as a failed attempt. Its reader keeps counting those
+ * for as long as it lives, even across successful reconnects, and waits longer
+ * after each one: 3 s, 6 s, 12 s, 24 s, then 30 s. So every redeploy added one
+ * for every open tab, plus one for each refused retry while the relay was down,
+ * until a tab open through a few deploys went blind for 30 s on a restart that
+ * took a second. A stream that ENDS normally is no failure: the UI reconnects
+ * 250 ms later with a fresh reader. Hence the order:
+ *
+ *  1. Persist, before anything can hang.
+ *  2. Stop taking connections, so that 250 ms reconnect is refused and retried
+ *     against the next process instead of opening a stream on this one.
+ *  3. End every viewer stream with its final chunk.
+ *  4. After a short grace, drop whatever is still open. An open connection
+ *     would keep close() pending, and a stuck one must not hold up a redeploy.
+ *
+ * What the relay does not control still counts against the tab: a drop on the
+ * viewer's own network, a crash, and each retry nginx answers with 502 while
+ * no relay is listening. So a restart costs a viewer the backoff a fresh tab
+ * would wait out for that much downtime, not a count run up over earlier ones.
+ */
+export function shutdown(server: http.Server): Promise<void> {
+  const relay = server as RelayServer
+  relay.flushState?.()
+  const closed = new Promise<void>((resolve) => server.close(() => resolve()))
+  relay.endEventStreams?.()
+  const cut = setTimeout(() => server.closeAllConnections(), SHUTDOWN_GRACE_MS)
+  cut.unref()
+  return closed.finally(() => clearTimeout(cut))
 }

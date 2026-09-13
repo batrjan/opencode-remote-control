@@ -254,9 +254,12 @@ export function trustProxy(): boolean | number | string {
 }
 
 /**
- * Reconnect delay advertised to standards-compliant SSE clients (the `retry:`
- * field). The web UI runs its own reader with its own policy and ignores it;
- * a plain EventSource uses it after the stream drops.
+ * Reconnect delay advertised in the SSE `retry:` field. A plain EventSource
+ * waits this long after the stream drops. The web UI's own reader does NOT
+ * ignore it: it takes it as the base of its backoff, doubling it for every
+ * failed attempt up to 30 s, so this sets how soon a viewer retries after an
+ * error. It must stay positive (envInt refuses 0): a zero base would have the
+ * UI retry in a tight loop.
  */
 export function sseRetryMs(): number {
   return envInt('RELAY_SSE_RETRY_MS', 3000)
