@@ -8142,47 +8142,58 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     resolvedPort = ensured.port;
     spawnedServer = ensured.spawned;
   }
+  const killSpawnedServer = () => {
+    if (spawnedServer && spawnedServer.exitCode === null && !spawnedServer.killed) spawnedServer.kill();
+  };
+  process.on("exit", killSpawnedServer);
   const opencodeUrl = opts.opencodeUrl ?? `http://127.0.0.1:${resolvedPort}`;
   const opencode = new OpencodeClient(
     opencodeUrl,
     process.env.OPENCODE_SERVER_USERNAME ?? "opencode",
     process.env.OPENCODE_SERVER_PASSWORD ?? ""
   );
-  const picked = opts.sessionId === void 0 ? await pickSession(opencode) : await fetchSession(opencode, opts.sessionId);
-  const session_id = opts.sessionId ?? picked.id;
   const relay = new RelayClient(relayUrl, apiKey);
-  const { access_code, bridge_token, viewer_url } = await relay.createSession(
-    session_id,
-    picked?.directory ?? process.cwd(),
-    picked?.title ?? ""
-  );
-  saveSessionState({
-    session_id,
-    access_code,
-    bridge_token,
-    relay: relayUrl,
-    started_at: Date.now(),
-    pid: process.pid,
-    // Only when WE spawned it: a server that was already listening belongs to
-    // the user (their GUI, their own `opencode serve`) and must never be killed
-    // by `stop`.
-    server_pid: spawnedServer?.pid
-  });
-  const ws = new RelayWSClient(relayUrl, opencode);
+  let session_id;
+  let access_code;
+  let bridge_token;
+  let viewer_url;
+  let ws;
   try {
-    await ws.connect(session_id, bridge_token, picked?.directory);
-    await ws.startEventForwarding();
-  } catch (err) {
-    ws.close();
-    await relay.deleteSession(session_id, bridge_token).catch(() => {
+    const picked = opts.sessionId === void 0 ? await pickSession(opencode) : await fetchSession(opencode, opts.sessionId);
+    session_id = opts.sessionId ?? picked.id;
+    ({ access_code, bridge_token, viewer_url } = await relay.createSession(
+      session_id,
+      picked?.directory ?? process.cwd(),
+      picked?.title ?? ""
+    ));
+    saveSessionState({
+      session_id,
+      access_code,
+      bridge_token,
+      relay: relayUrl,
+      started_at: Date.now(),
+      pid: process.pid,
+      // Only when WE spawned it: a server that was already listening belongs to
+      // the user (their GUI, their own `opencode serve`) and must never be killed
+      // by `stop`.
+      server_pid: spawnedServer?.pid
     });
-    clearSessionState(session_id);
+    ws = new RelayWSClient(relayUrl, opencode);
+    try {
+      await ws.connect(session_id, bridge_token, picked?.directory);
+      await ws.startEventForwarding();
+    } catch (err) {
+      ws.close();
+      await relay.deleteSession(session_id, bridge_token).catch(() => {
+      });
+      clearSessionState(session_id);
+      throw err;
+    }
+  } catch (err) {
+    process.off("exit", killSpawnedServer);
+    killSpawnedServer();
     throw err;
   }
-  const killSpawnedServer = () => {
-    if (spawnedServer && spawnedServer.exitCode === null && !spawnedServer.killed) spawnedServer.kill();
-  };
-  process.on("exit", killSpawnedServer);
   let resolveClosed;
   const closed = new Promise((resolve) => {
     resolveClosed = resolve;

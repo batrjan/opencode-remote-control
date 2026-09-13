@@ -77,60 +77,78 @@ export async function startBridge(
     resolvedPort = ensured.port
     spawnedServer = ensured.spawned
   }
+  const killSpawnedServer = () => {
+    if (spawnedServer && spawnedServer.exitCode === null && !spawnedServer.killed) spawnedServer.kill()
+  }
+  // Last resort: never leave the spawned server behind if this process dies
+  // for a reason that does not go through stop(). Armed as soon as the server
+  // exists, not once the share is up — everything below can still fail.
+  process.on('exit', killSpawnedServer)
   const opencodeUrl = opts.opencodeUrl ?? `http://127.0.0.1:${resolvedPort}`
   const opencode = new OpencodeClient(
     opencodeUrl,
     process.env.OPENCODE_SERVER_USERNAME ?? 'opencode',
     process.env.OPENCODE_SERVER_PASSWORD ?? '',
   )
-  // With an explicit --session-id we still need the session's OWN directory:
-  // it is what the relay pins every proxied request to and what scopes the
-  // event stream. Falling back to process.cwd() pointed both at whatever
-  // folder the bridge happened to start in.
-  const picked =
-    opts.sessionId === undefined ? await pickSession(opencode) : await fetchSession(opencode, opts.sessionId)
-  const session_id = opts.sessionId ?? picked!.id
   const relay = new RelayClient(relayUrl, apiKey)
-  const { access_code, bridge_token, viewer_url } = await relay.createSession(
-    session_id,
-    picked?.directory ?? process.cwd(),
-    picked?.title ?? '',
-  )
-  // Persist the owner token so `stop` (even from another shell) can delete
-  // the session later. 0600 perms; cleared on stop.
-  // The pid lets `stop` (run from the TUI plugin or another shell) terminate
-  // this long-running process — deleting the relay session alone left the
-  // bridge and the `opencode serve` it spawned running forever.
-  saveSessionState({
-    session_id,
-    access_code,
-    bridge_token,
-    relay: relayUrl,
-    started_at: Date.now(),
-    pid: process.pid,
-    // Only when WE spawned it: a server that was already listening belongs to
-    // the user (their GUI, their own `opencode serve`) and must never be killed
-    // by `stop`.
-    server_pid: spawnedServer?.pid,
-  })
-  const ws = new RelayWSClient(relayUrl, opencode)
+  let session_id: string
+  let access_code: string
+  let bridge_token: string
+  let viewer_url: string
+  let ws: RelayWSClient
   try {
-    await ws.connect(session_id, bridge_token, picked?.directory)
-    await ws.startEventForwarding()
+    // With an explicit --session-id we still need the session's OWN directory:
+    // it is what the relay pins every proxied request to and what scopes the
+    // event stream. Falling back to process.cwd() pointed both at whatever
+    // folder the bridge happened to start in.
+    const picked =
+      opts.sessionId === undefined ? await pickSession(opencode) : await fetchSession(opencode, opts.sessionId)
+    session_id = opts.sessionId ?? picked!.id
+    ;({ access_code, bridge_token, viewer_url } = await relay.createSession(
+      session_id,
+      picked?.directory ?? process.cwd(),
+      picked?.title ?? '',
+    ))
+    // Persist the owner token so `stop` (even from another shell) can delete
+    // the session later. 0600 perms; cleared on stop.
+    // The pid lets `stop` (run from the TUI plugin or another shell) terminate
+    // this long-running process — deleting the relay session alone left the
+    // bridge and the `opencode serve` it spawned running forever.
+    saveSessionState({
+      session_id,
+      access_code,
+      bridge_token,
+      relay: relayUrl,
+      started_at: Date.now(),
+      pid: process.pid,
+      // Only when WE spawned it: a server that was already listening belongs to
+      // the user (their GUI, their own `opencode serve`) and must never be killed
+      // by `stop`.
+      server_pid: spawnedServer?.pid,
+    })
+    ws = new RelayWSClient(relayUrl, opencode)
+    try {
+      await ws.connect(session_id, bridge_token, picked?.directory)
+      await ws.startEventForwarding()
+    } catch (err) {
+      // Never leave an orphaned session behind when the WS/SSE setup fails.
+      ws.close()
+      await relay.deleteSession(session_id, bridge_token).catch(() => {})
+      clearSessionState(session_id)
+      throw err
+    }
   } catch (err) {
-    // Never leave an orphaned session behind when the WS/SSE setup fails.
-    ws.close()
-    await relay.deleteSession(session_id, bridge_token).catch(() => {})
-    clearSessionState(session_id)
+    // A start that fails after spawning `opencode serve` (relay unreachable,
+    // 429/409 on registration, no session to pick, bridge WebSocket refused)
+    // must take that server down with it. Left running, it was an orphan no
+    // `stop` could find (no state file), its stdout/stderr pipes kept this
+    // process's event loop alive so the failed CLI hung instead of exiting, and
+    // the next `start` attached to it as if it were the user's own server —
+    // without a server_pid, so nothing ever killed it.
+    process.off('exit', killSpawnedServer)
+    killSpawnedServer()
     throw err
   }
-
-  const killSpawnedServer = () => {
-    if (spawnedServer && spawnedServer.exitCode === null && !spawnedServer.killed) spawnedServer.kill()
-  }
-  // Last resort: never leave the spawned server behind if this process dies
-  // for a reason that does not go through stop().
-  process.on('exit', killSpawnedServer)
 
   let resolveClosed!: () => void
   const closed = new Promise<void>((resolve) => {
