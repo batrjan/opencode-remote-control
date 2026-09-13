@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -29,15 +29,18 @@ const fake = vi.hoisted(() => ({
   /** Larger than any pid_max, so even an unmocked kill could not reach a real group. */
   pid: 2_000_000_001,
   child: undefined as undefined | (import('node:events').EventEmitter & { pid: number; unref: () => void; kill: (s?: string) => boolean }),
+  /** The fd the plugin handed the bridge for its output. */
+  stdout: undefined as number | undefined,
   execCalls: [] as string[][],
 }))
 
 vi.mock('node:child_process', async () => {
   const { EventEmitter } = await import('node:events')
   return {
-    spawn: vi.fn(() => {
+    spawn: vi.fn((_command: string, _args: string[], opts: { stdio: [unknown, number, number] }) => {
       const child = Object.assign(new EventEmitter(), { pid: fake.pid, unref: vi.fn(), kill: vi.fn(() => true) })
       fake.child = child
+      fake.stdout = opts.stdio[1]
       return child
     }),
     execFile: vi.fn((_file: string, args: string[], _opts: unknown, cb: (e: Error | null, o: string, s: string) => void) => {
@@ -109,10 +112,12 @@ test('a start still coming up after 30 s delivers its code', async () => {
   const { outcome, done } = start('ses_slow')
   await vi.advanceTimersByTimeAsync(45_000)
   expect(outcome.error?.message).toBeUndefined()
-  writeFileSync(logPath(), 'http://relay.local/ses_slow\nCODE: LATE00\n')
+  writeSync(fake.stdout!, 'http://relay.local/ses_slow\nCODE: LATE00\n')
   await vi.advanceTimersByTimeAsync(1_000)
   await done
   expect(outcome.value).toBe('http://relay.local/ses_slow\nCODE: LATE00')
+  // A start that came up publishes its log as bridge.log.
+  expect(readFileSync(logPath(), 'utf8')).toBe('http://relay.local/ses_slow\nCODE: LATE00\n')
   expect(signalled).toEqual([])
 })
 

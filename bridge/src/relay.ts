@@ -43,6 +43,21 @@ export interface SessionStatus {
   bridge_connected: boolean
 }
 
+/**
+ * A relay answer that is not a success, with its status kept. The message
+ * alone ("relay createSession failed: 409") left callers nothing to branch on,
+ * and a 409 needs a different story than a 429 or a 502.
+ */
+export class RelayHttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'RelayHttpError'
+  }
+}
+
 export class RelayClient {
   constructor(
     public url: string,
@@ -76,7 +91,7 @@ export class RelayClient {
         body: JSON.stringify({ session_id: sessionId, directory, title }),
         signal: AbortSignal.timeout(timeoutMs),
       })
-      if (!res.ok) throw new Error(`relay createSession failed: ${res.status}`)
+      if (!res.ok) throw new RelayHttpError(res.status, `relay createSession failed: ${res.status}`)
       return (await res.json()) as RelaySession
     } catch (err) {
       if (err instanceof Error && err.name === 'TimeoutError') {

@@ -13,8 +13,14 @@ import {
 } from './config.js'
 import { detectOpenCodePort, ensureOpenCodeServer } from './detect.js'
 import { OpencodeClient } from './opencode.js'
-import { RelayClient, RelayWSClient } from './relay.js'
-import { saveSessionState, loadSessionState, clearSessionState, latestSessionState } from './state.js'
+import { RelayClient, RelayHttpError, RelayWSClient, type RelaySession } from './relay.js'
+import {
+  saveSessionState,
+  loadSessionState,
+  clearSessionState,
+  latestSessionState,
+  type SessionState,
+} from './state.js'
 
 /**
  * Bridge CLI and lifecycle: `start` registers the current opencode session
@@ -72,6 +78,12 @@ export async function startBridge(
   apiKey: string | undefined,
   opts: StartBridgeOptions = {},
 ): Promise<BridgeHandle> {
+  const relay = new RelayClient(relayUrl, apiKey)
+  // An earlier share of this session recorded on this machine is settled
+  // before any server is detected or spawned: a live one is refused without
+  // anything being started, and the `opencode serve` a dead one left behind
+  // has to be gone before detection could mistake it for the user's own.
+  if (opts.sessionId !== undefined) await settleEarlierShare(relay, opts.sessionId, true)
   // When no opencode server is listening (plain console runs use an
   // in-process server with no HTTP port), spawn `opencode serve` ourselves so
   // remote control works without the TUI. The spawned server is tied to the
@@ -104,7 +116,6 @@ export async function startBridge(
     process.env.OPENCODE_SERVER_USERNAME ?? 'opencode',
     process.env.OPENCODE_SERVER_PASSWORD ?? '',
   )
-  const relay = new RelayClient(relayUrl, apiKey)
   let session_id: string
   let access_code: string
   let bridge_token: string
@@ -118,10 +129,14 @@ export async function startBridge(
     const picked =
       opts.sessionId === undefined ? await pickSession(opencode) : await fetchSession(opencode, opts.sessionId)
     session_id = opts.sessionId ?? picked!.id
-    ;({ access_code, bridge_token, viewer_url } = await relay.createSession(
+    // A leftover server of an earlier share is only ended here when this start
+    // runs on a server of its own: an attached one may be that very server.
+    ;({ access_code, bridge_token, viewer_url } = await registerShare(
+      relay,
       session_id,
       picked?.directory ?? process.cwd(),
       picked?.title ?? '',
+      spawnedServer !== undefined,
     ))
     // Persist the owner token so `stop` (even from another shell) can delete
     // the session later. 0600 perms; cleared on stop.
@@ -272,6 +287,125 @@ export async function startBridge(
 }
 
 /**
+ * Register the share, and when the relay already holds the session id (409),
+ * find out whose registration that is before giving up.
+ *
+ * The relay never lets a second registration replace a session, and it keeps
+ * one whose bridge died without a word (SIGKILL, a crash, a reboot) until a day
+ * without activity has passed. So a restart after any of those failed with a
+ * bare "relay createSession failed: 409" for up to a day, although the state
+ * file still held the bridge_token that could end the old registration — and
+ * so did a second start of a share that was still running, with nothing saying
+ * which of the two it was or that `stop` exists. The earlier share recorded on
+ * this machine decides now: still running is refused with its pid and how to
+ * end it, dead is ended with its own token and registered again, once.
+ */
+async function registerShare(
+  relay: RelayClient,
+  sessionId: string,
+  directory: string,
+  title: string,
+  endLeftoverServer: boolean,
+): Promise<RelaySession> {
+  const isConflict = (err: unknown) => err instanceof RelayHttpError && err.status === 409
+  try {
+    return await relay.createSession(sessionId, directory, title)
+  } catch (err) {
+    if (!isConflict(err)) throw err
+  }
+  if (await settleEarlierShare(relay, sessionId, endLeftoverServer)) {
+    try {
+      return await relay.createSession(sessionId, directory, title)
+    } catch (err) {
+      if (!isConflict(err)) throw err
+    }
+  }
+  // Nothing here can end it: the token belongs to whoever registered it.
+  throw new Error(
+    `session ${sessionId} is already registered on the relay (409) by a share this machine has no record of — ` +
+      'end it from where it was started, or wait for the relay to expire it (by default after a day without activity)',
+  )
+}
+
+/**
+ * Deal with an earlier share of `sessionId` that this machine recorded, before a
+ * new share of it is registered. Resolves with whether there was one.
+ *
+ * - Its bridge still runs: throws, naming the pid and how to end that share.
+ *   Taking it over would delete its registration under its viewers.
+ * - Its bridge is gone: ends its relay registration with the bridge_token from
+ *   its state, drops that state and, with `endLeftoverServer`, the
+ *   `opencode serve` it spawned — what `stop` would have done. Throws when the
+ *   relay cannot be told, keeping the state so a retry or `stop` still can.
+ */
+async function settleEarlierShare(relay: RelayClient, sessionId: string, endLeftoverServer: boolean): Promise<boolean> {
+  const state = loadSessionState(sessionId)
+  if (!state) return false
+  if (shareBridgeRunning(state)) {
+    throw new Error(
+      `session ${sessionId} is already shared from this machine (bridge pid ${state.pid ?? 'unknown'}) — ` +
+        `run /remote-control/stop (or \`bridge stop --session-id ${sessionId}\`) to end that share first`,
+    )
+  }
+  let failure: string | undefined
+  try {
+    const status = await relay.deleteSession(sessionId, state.bridge_token)
+    // 404: the relay holds nothing under this token any more (expired, or
+    // registered again by someone else) — nothing of ours left to end.
+    if (status !== 204 && status !== 404) failure = `relay answered ${status}`
+  } catch (err) {
+    failure = describeRelayError(err)
+  }
+  if (failure !== undefined) {
+    throw new Error(
+      `session ${sessionId} is still registered by an earlier share whose bridge (pid ${state.pid}) is gone, ` +
+        `and it could not be ended on the relay (${failure}) — try again`,
+    )
+  }
+  clearSessionState(sessionId)
+  console.warn(`bridge: ended the earlier share of session ${sessionId}; its bridge (pid ${state.pid}) was no longer running`)
+  if (endLeftoverServer && terminateSpawnedServer(state.server_pid, state.started_at)) {
+    // Detection runs next, and a server still shutting down answers its health
+    // probe like any other: the new share would attach to it and lose it a
+    // moment later.
+    const deadline = Date.now() + LEFTOVER_SERVER_EXIT_WAIT_MS
+    while (pidAlive(state.server_pid!) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+  }
+  return true
+}
+
+/** How long a start waits for the `opencode serve` of a dead share to exit once signalled. */
+const LEFTOVER_SERVER_EXIT_WAIT_MS = 5_000
+
+/**
+ * Whether the bridge a state file names is still running.
+ *
+ * Says "running" whenever it cannot tell — state from a version that recorded
+ * no pid, or a pid that exists but `ps` cannot describe: mistaking a live share
+ * for a dead one deletes it under its viewers, while the opposite mistake only
+ * asks the owner to run `stop`. The pid is otherwise held to the same identity
+ * check `stop` uses before signalling, so a pid recycled after a reboot does
+ * not keep a dead share alive.
+ */
+function shareBridgeRunning(state: SessionState, inspect: (pid: number) => ProcessSnapshot | null = describeProcess): boolean {
+  const pid = state.pid
+  if (!pid) return true
+  // Our own pid: a share this very process runs (a library caller), unless the
+  // state predates this process — a pid handed out again after a reboot.
+  if (pid === process.pid) return state.started_at >= Date.now() - process.uptime() * 1000 - 1000
+  let snapshot: ProcessSnapshot | null
+  try {
+    snapshot = inspect(pid)
+  } catch {
+    snapshot = null
+  }
+  if (!snapshot) return pidAlive(pid)
+  return refuseToSignal(snapshot, state.started_at) === null
+}
+
+/**
  * End a share: delete the relay session, then take the share down on this
  * machine (state file, bridge process, the server it spawned).
  *
@@ -345,35 +479,38 @@ const SERVE_COMMAND_RE = /(^|[/\\])opencode(\.exe)?\s+serve(\s|$)/
  *
  * Same reasoning as terminateBridgeProcess: the pid comes from a state file
  * that can outlive the process it names, and pids are recycled. Never throws —
- * `stop` stays idempotent even where `ps` is unavailable.
+ * `stop` stays idempotent even where `ps` is unavailable. Returns whether the
+ * server was signalled.
  */
 export function terminateSpawnedServer(
   pid: number | undefined,
   startedAt?: number,
   inspect: (pid: number) => ProcessSnapshot | null = describeProcess,
-): void {
-  if (!pid || pid === process.pid) return
+): boolean {
+  if (!pid || pid === process.pid) return false
   let snapshot: ProcessSnapshot | null = null
   try {
     snapshot = inspect(pid)
   } catch {
     snapshot = null
   }
-  if (!snapshot) return // already gone: nothing to clean up, nothing to report
+  if (!snapshot) return false // already gone: nothing to clean up, nothing to report
   if (!SERVE_COMMAND_RE.test(snapshot.command)) {
     console.warn(
       `bridge stop: not signalling opencode server pid ${pid} — pid now belongs to an unrelated process: ${snapshot.command.slice(0, 120)}`,
     )
-    return
+    return false
   }
   if (startedAt !== undefined && snapshot.startedAt !== undefined && snapshot.startedAt > startedAt + PID_START_SLACK_MS) {
     console.warn(`bridge stop: not signalling opencode server pid ${pid} — it started after this share was registered`)
-    return
+    return false
   }
   try {
     process.kill(pid, 'SIGTERM')
+    return true
   } catch {
     // Already gone (ESRCH) or not ours (EPERM).
+    return false
   }
 }
 
@@ -756,21 +893,41 @@ program
     }
     const sessionId = resolveSessionId(opts.sessionId)
     if (sessionId) {
+      const local = loadSessionState(sessionId)
+      // The relay cannot tell a bridge that is re-dialling from one that died
+      // without a word (SIGKILL, a crash, a reboot): both are "disconnected"
+      // there, and the session stays "active" until it expires a day later. A
+      // dead bridge's share looked alive apart from that one line, and status
+      // exited 0. The pid this machine recorded can tell them apart.
+      let bridgeProcess: string | undefined
+      if (local?.pid) {
+        if (shareBridgeRunning(local)) {
+          bridgeProcess = `  bridge process: running (pid ${local.pid})`
+        } else {
+          bridgeProcess = `  bridge process: not running (pid ${local.pid}) — this share is stale, run stop to end it`
+          ok = false
+        }
+      }
       // Pass our own bridge_token so the relay returns the owner-only fields
       // (directory, title) it withholds from the public presence view.
-      const ownerToken = loadSessionState(sessionId)?.bridge_token
+      const ownerToken = local?.bridge_token
       const { status, body } = await new RelayClient(opts.relay, opts.apiKey).getSession(sessionId, ownerToken)
       if (status === 404) {
         console.log(`session ${sessionId}: not found`)
+        if (bridgeProcess) console.log(bridgeProcess)
         ok = false
       } else if (status !== 200 || !body) {
         console.log(`session ${sessionId}: HTTP ${status}`)
+        if (bridgeProcess) console.log(bridgeProcess)
         ok = false
       } else {
         const ageMs = Date.now() - body.created_at
         const age = formatDuration(ageMs)
         console.log(`session ${sessionId}: ${body.status}`)
         console.log(`  bridge: ${body.bridge_connected ? 'connected' : 'disconnected'}`)
+        if (bridgeProcess) console.log(bridgeProcess)
+        // A share with no bridge on the relay serves no viewer right now, whatever the reason.
+        if (!body.bridge_connected) ok = false
         console.log(`  viewers: ${body.viewer_count}`)
         console.log(`  alive: ${age}`)
         if (body.title !== undefined) console.log(`  title: ${body.title || '(untitled)'}`)

@@ -7415,6 +7415,13 @@ var import_websocket_server = __toESM(require_websocket_server(), 1);
 var wrapper_default = import_websocket.default;
 
 // src/relay.ts
+var RelayHttpError = class extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+    this.name = "RelayHttpError";
+  }
+};
 var RelayClient = class {
   constructor(url, apiKey) {
     this.url = url;
@@ -7440,7 +7447,7 @@ var RelayClient = class {
         body: JSON.stringify({ session_id: sessionId, directory, title }),
         signal: AbortSignal.timeout(timeoutMs)
       });
-      if (!res.ok) throw new Error(`relay createSession failed: ${res.status}`);
+      if (!res.ok) throw new RelayHttpError(res.status, `relay createSession failed: ${res.status}`);
       return await res.json();
     } catch (err) {
       if (err instanceof Error && err.name === "TimeoutError") {
@@ -8178,6 +8185,8 @@ function latestSessionState() {
 // src/index.ts
 var import_meta = {};
 async function startBridge(relayUrl, apiKey, opts = {}) {
+  const relay = new RelayClient(relayUrl, apiKey);
+  if (opts.sessionId !== void 0) await settleEarlierShare(relay, opts.sessionId, true);
   let spawnedServer;
   let resolvedPort;
   if (opts.opencodeUrl) {
@@ -8199,7 +8208,6 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     process.env.OPENCODE_SERVER_USERNAME ?? "opencode",
     process.env.OPENCODE_SERVER_PASSWORD ?? ""
   );
-  const relay = new RelayClient(relayUrl, apiKey);
   let session_id;
   let access_code;
   let bridge_token;
@@ -8208,10 +8216,12 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
   try {
     const picked = opts.sessionId === void 0 ? await pickSession(opencode) : await fetchSession(opencode, opts.sessionId);
     session_id = opts.sessionId ?? picked.id;
-    ({ access_code, bridge_token, viewer_url } = await relay.createSession(
+    ({ access_code, bridge_token, viewer_url } = await registerShare(
+      relay,
       session_id,
       picked?.directory ?? process.cwd(),
-      picked?.title ?? ""
+      picked?.title ?? "",
+      spawnedServer !== void 0
     ));
     saveSessionState({
       session_id,
@@ -8313,6 +8323,68 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
   watchdog.unref();
   return { session_id, access_code, viewer_url, closed, stop: () => stop() };
 }
+async function registerShare(relay, sessionId, directory, title, endLeftoverServer) {
+  const isConflict = (err) => err instanceof RelayHttpError && err.status === 409;
+  try {
+    return await relay.createSession(sessionId, directory, title);
+  } catch (err) {
+    if (!isConflict(err)) throw err;
+  }
+  if (await settleEarlierShare(relay, sessionId, endLeftoverServer)) {
+    try {
+      return await relay.createSession(sessionId, directory, title);
+    } catch (err) {
+      if (!isConflict(err)) throw err;
+    }
+  }
+  throw new Error(
+    `session ${sessionId} is already registered on the relay (409) by a share this machine has no record of \u2014 end it from where it was started, or wait for the relay to expire it (by default after a day without activity)`
+  );
+}
+async function settleEarlierShare(relay, sessionId, endLeftoverServer) {
+  const state = loadSessionState(sessionId);
+  if (!state) return false;
+  if (shareBridgeRunning(state)) {
+    throw new Error(
+      `session ${sessionId} is already shared from this machine (bridge pid ${state.pid ?? "unknown"}) \u2014 run /remote-control/stop (or \`bridge stop --session-id ${sessionId}\`) to end that share first`
+    );
+  }
+  let failure;
+  try {
+    const status = await relay.deleteSession(sessionId, state.bridge_token);
+    if (status !== 204 && status !== 404) failure = `relay answered ${status}`;
+  } catch (err) {
+    failure = describeRelayError(err);
+  }
+  if (failure !== void 0) {
+    throw new Error(
+      `session ${sessionId} is still registered by an earlier share whose bridge (pid ${state.pid}) is gone, and it could not be ended on the relay (${failure}) \u2014 try again`
+    );
+  }
+  clearSessionState(sessionId);
+  console.warn(`bridge: ended the earlier share of session ${sessionId}; its bridge (pid ${state.pid}) was no longer running`);
+  if (endLeftoverServer && terminateSpawnedServer(state.server_pid, state.started_at)) {
+    const deadline = Date.now() + LEFTOVER_SERVER_EXIT_WAIT_MS;
+    while (pidAlive(state.server_pid) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  return true;
+}
+var LEFTOVER_SERVER_EXIT_WAIT_MS = 5e3;
+function shareBridgeRunning(state, inspect = describeProcess) {
+  const pid = state.pid;
+  if (!pid) return true;
+  if (pid === process.pid) return state.started_at >= Date.now() - process.uptime() * 1e3 - 1e3;
+  let snapshot;
+  try {
+    snapshot = inspect(pid);
+  } catch {
+    snapshot = null;
+  }
+  if (!snapshot) return pidAlive(pid);
+  return refuseToSignal(snapshot, state.started_at) === null;
+}
 async function stopBridge(relayUrl, sessionId, apiKey) {
   const state = loadSessionState(sessionId);
   if (!state) {
@@ -8340,27 +8412,29 @@ function describeRelayError(err) {
 }
 var SERVE_COMMAND_RE = /(^|[/\\])opencode(\.exe)?\s+serve(\s|$)/;
 function terminateSpawnedServer(pid, startedAt, inspect = describeProcess) {
-  if (!pid || pid === process.pid) return;
+  if (!pid || pid === process.pid) return false;
   let snapshot = null;
   try {
     snapshot = inspect(pid);
   } catch {
     snapshot = null;
   }
-  if (!snapshot) return;
+  if (!snapshot) return false;
   if (!SERVE_COMMAND_RE.test(snapshot.command)) {
     console.warn(
       `bridge stop: not signalling opencode server pid ${pid} \u2014 pid now belongs to an unrelated process: ${snapshot.command.slice(0, 120)}`
     );
-    return;
+    return false;
   }
   if (startedAt !== void 0 && snapshot.startedAt !== void 0 && snapshot.startedAt > startedAt + PID_START_SLACK_MS) {
     console.warn(`bridge stop: not signalling opencode server pid ${pid} \u2014 it started after this share was registered`);
-    return;
+    return false;
   }
   try {
     process.kill(pid, "SIGTERM");
+    return true;
   } catch {
+    return false;
   }
 }
 var BRIDGE_ENTRY_RE = /(remote-control-bridge(\.cjs)?|remote-control[/\\]bin[/\\]index\.(js|cjs|mjs)|bridge[/\\](dist[/\\])?index\.(js|cjs|mjs|ts)|[/\\]\.bin[/\\]bridge(\s|$))/;
@@ -8572,19 +8646,33 @@ program2.command("status").description("Probe relay health, local opencode detec
   }
   const sessionId = resolveSessionId(opts.sessionId);
   if (sessionId) {
-    const ownerToken = loadSessionState(sessionId)?.bridge_token;
+    const local = loadSessionState(sessionId);
+    let bridgeProcess;
+    if (local?.pid) {
+      if (shareBridgeRunning(local)) {
+        bridgeProcess = `  bridge process: running (pid ${local.pid})`;
+      } else {
+        bridgeProcess = `  bridge process: not running (pid ${local.pid}) \u2014 this share is stale, run stop to end it`;
+        ok = false;
+      }
+    }
+    const ownerToken = local?.bridge_token;
     const { status, body } = await new RelayClient(opts.relay, opts.apiKey).getSession(sessionId, ownerToken);
     if (status === 404) {
       console.log(`session ${sessionId}: not found`);
+      if (bridgeProcess) console.log(bridgeProcess);
       ok = false;
     } else if (status !== 200 || !body) {
       console.log(`session ${sessionId}: HTTP ${status}`);
+      if (bridgeProcess) console.log(bridgeProcess);
       ok = false;
     } else {
       const ageMs = Date.now() - body.created_at;
       const age = formatDuration(ageMs);
       console.log(`session ${sessionId}: ${body.status}`);
       console.log(`  bridge: ${body.bridge_connected ? "connected" : "disconnected"}`);
+      if (bridgeProcess) console.log(bridgeProcess);
+      if (!body.bridge_connected) ok = false;
       console.log(`  viewers: ${body.viewer_count}`);
       console.log(`  alive: ${age}`);
       if (body.title !== void 0) console.log(`  title: ${body.title || "(untitled)"}`);

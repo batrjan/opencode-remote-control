@@ -7,7 +7,7 @@
 // `tui()` / `server()` — hence two entries over one shared implementation.
 
 import { spawn, execFile } from "node:child_process"
-import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -92,6 +92,40 @@ export function openLog(file = logPath()) {
   // openSync's mode only applies to a NEW file; tighten an existing one too.
   chmodSync(file, 0o600)
   return fd
+}
+
+let startLogCount = 0
+
+/**
+ * The log one start's bridge writes to until it is up, beside bridge.log.
+ *
+ * Every start used to open bridge.log itself, truncating it before the bridge
+ * had even run — including a start that then failed. A second start of a share
+ * that was still running got a 409 and left the log holding only that failure,
+ * while the running share's URL and code were gone from it. Only a start that
+ * printed its code replaces bridge.log now; a failed or cancelled one leaves it
+ * as it was.
+ */
+function startLogPath(log) {
+  return path.join(path.dirname(log), `bridge.starting-${process.pid}-${++startLogCount}.log`)
+}
+
+/** Remove a start log that will not become bridge.log. Best effort, never throws. */
+function discardStartLog(file) {
+  try {
+    rmSync(file, { force: true })
+  } catch {
+    // Nothing more to do; it holds no code of a live share.
+  }
+}
+
+/**
+ * Where the output of the last start that failed is kept — the bridge's error
+ * and the tail of a server that would not come up, which bridge.log used to
+ * hold. Never a code: a start that printed one did not fail.
+ */
+export function failedLogPath(log = logPath()) {
+  return path.join(path.dirname(log), "bridge.failed.log")
 }
 
 // The bridge CLI ships prebuilt INSIDE this package (bridge/remote-control-bridge.cjs)
@@ -226,8 +260,9 @@ async function cancelStart(child, exited) {
   }
 }
 
-/** Start the bridge detached, logging to LOG; resolve once it prints URL+CODE.
- * `sessionID` pins the share to the user's current session, never another. */
+/** Start the bridge detached, logging to a start log that becomes LOG once it
+ * prints URL+CODE; resolve then. `sessionID` pins the share to the user's
+ * current session, never another. */
 function startBridge(sessionID) {
   return new Promise((resolve, reject) => {
     const bin = bridgeBin()
@@ -241,11 +276,12 @@ function startBridge(sessionID) {
     // while the bridge runs. Without the pid the share outlived OpenCode.
     args.push("--owner-pid", String(process.pid))
     const LOG = logPath()
+    const STARTING = startLogPath(LOG)
     let out
     try {
-      out = openLog(LOG)
+      out = openLog(STARTING)
     } catch (err) {
-      return reject(new Error(`cannot open the bridge log ${LOG}: ${String(err?.message ?? err)}`))
+      return reject(new Error(`cannot open the bridge log ${STARTING}: ${String(err?.message ?? err)}`))
     }
     const child = spawn("node", args, {
       detached: true,
@@ -260,12 +296,17 @@ function startBridge(sessionID) {
       settled = true
       clearTimeout(timer)
       clearInterval(poll)
+      try {
+        renameSync(STARTING, failedLogPath(LOG))
+      } catch {
+        discardStartLog(STARTING)
+      }
       reject(new Error(msg))
     }
     const check = () => {
       let text = ""
       try {
-        text = readFileSync(LOG, "utf8")
+        text = readFileSync(STARTING, "utf8")
       } catch {
         return false
       }
@@ -274,6 +315,13 @@ function startBridge(sessionID) {
         settled = true
         clearInterval(poll)
         clearTimeout(timer)
+        // The share is up: its log is now bridge.log. The bridge keeps writing
+        // to the same file under the new name (how its share ended, later).
+        try {
+          renameSync(STARTING, LOG)
+        } catch {
+          // The share works regardless; its log just keeps the starting name.
+        }
         resolve(ready)
         return true
       }
@@ -290,13 +338,15 @@ function startBridge(sessionID) {
       if (check()) return
       settled = true
       clearInterval(poll)
-      void cancelStart(child, exited).then((outcome) =>
+      void cancelStart(child, exited).then((outcome) => {
+        // Whatever it printed belongs to a share that no longer exists.
+        discardStartLog(STARTING)
         reject(
           new Error(
             `start cancelled: the bridge did not come up within ${timeoutMs / 1000} s and was stopped. ${outcome}`,
           ),
-        ),
-      )
+        )
+      })
     }, timeoutMs)
     const poll = setInterval(() => {
       if (settled) return clearInterval(poll)
