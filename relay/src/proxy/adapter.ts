@@ -168,6 +168,30 @@ const MAX_STREAMS_PER_SESSION = 64
  */
 const ANCESTRY_CACHE_MAX = 10_000
 
+/**
+ * How many of the latest messages a bridge re-dial replays to open viewer
+ * streams (see resyncViewers). The web UI's own first page: the replay then
+ * costs the owner's slow uplink what one viewer reload does, which was the only
+ * way to recover before — and an outage of a few seconds to a keep-alive kill
+ * (~40 s) does not produce more messages than that.
+ */
+const RESYNC_MESSAGE_LIMIT = 20
+
+/**
+ * How long a replay waits for one viewer to take its backlog before giving up
+ * on that viewer. A viewer that is reading drains within seconds; one that is
+ * not is left to the stuck-viewer cap, exactly as without a replay.
+ */
+const RESYNC_DRAIN_TIMEOUT_MS = 30_000
+
+/** What a bridge re-dial needs from one open viewer stream. */
+interface ViewerStream {
+  /** Re-send opencode's handshake frame; ends the stream instead if the viewer was revoked. */
+  handshake(): void
+  /** Write each event (bare opencode JSON, already filtered to the session), keeping the viewer's backlog under its cap. */
+  replay(events: string[]): Promise<void>
+}
+
 export function proxyAdapter(store: Store, bridge: BridgeClient) {
   const router = express.Router()
 
@@ -234,8 +258,8 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
    * to /new-session. The viewer has exactly one session and exactly one
    * project, so we ALWAYS overwrite the directory param with the session's.
    */
-  function queryForSession(req: Request, session: Session): string {
-    const params = new URLSearchParams(queryOf(req))
+  function queryForSession(query: string, session: Session): string {
+    const params = new URLSearchParams(query)
     // Overwrite every spelling of the directory/location param the opencode
     // server may read, so a garbage or home-dir value from the UI bootstrap
     // cannot leak the wrong workspace through.
@@ -259,7 +283,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     const session = requireViewer(req, res)
     if (!session) return
     void (async () => {
-      const query = queryForSession(req, session)
+      const query = queryForSession(queryOf(req), session)
       try {
         const out = await bridge.request(
           session.id,
@@ -510,7 +534,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           res,
           session.id,
           method,
-          path + queryForSession(req, session),
+          path + queryForSession(queryOf(req), session),
           method === 'POST' ? req.body : undefined,
           sanitize ? stripParentId : undefined,
         )
@@ -545,15 +569,21 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     res.flushHeaders()
     const envelope = (payload: string) =>
       global ? `{"directory":${JSON.stringify(session.directory)},"payload":${payload}}` : payload
-    // opencode omits the directory on its own handshake frame; match it.
+    // opencode omits the directory on its own handshake frame; match it. The
+    // web UI only takes a frame without one as the global `server.connected`.
+    const handshakeFrame = () =>
+      `data: ${global ? `{"payload":${JSON.stringify(serverConnectedEvent())}}` : JSON.stringify(serverConnectedEvent())}\n\n`
+    // SSE-safe: prefix every line of a (possibly multi-line) payload.
+    const eventFrame = (data: string) =>
+      envelope(data)
+        .split('\n')
+        .map((line) => `data: ${line}`)
+        .join('\n') + '\n\n'
     // The `retry:` field rides ALONG WITH the handshake rather than in a frame
     // of its own: a data-less frame is the same shape that broke the web UI's
     // reader before (it parsed a bare `: connected` comment as an event), so
     // every frame this stream emits still carries a data line.
-    res.write(
-      `retry: ${sseRetryMs()}\n` +
-        `data: ${global ? `{"payload":${JSON.stringify(serverConnectedEvent())}}` : JSON.stringify(serverConnectedEvent())}\n\n`,
-    )
+    res.write(`retry: ${sseRetryMs()}\n` + handshakeFrame())
     // Keep-alive: opencode's own heartbeats only arrive while the bridge is
     // reachable, so on a flaky link the viewer's stream would sit silent —
     // long enough for proxies to close it and with no way to tell a quiet
@@ -610,7 +640,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     heartbeat.unref?.()
     res.on('close', () => clearInterval(heartbeat))
 
-    unsubscribe = bridge.subscribeEvents(session.id, (data) => {
+    const unsubscribeEvents = bridge.subscribeEvents(session.id, (data) => {
       // Belt and braces for the ordering above: whatever path ended the
       // response, never write to it afterwards.
       if (res.writableEnded || res.destroyed) return
@@ -620,17 +650,140 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       // / status) — otherwise viewers would watch the owner's OTHER sessions
       // live. Fail closed on unparseable payloads.
       if (!eventBelongsToSession(data, session.id)) return
-      // SSE-safe: prefix every line of a (possibly multi-line) payload.
-      send(
-        envelope(data)
-          .split('\n')
-          .map((line) => `data: ${line}`)
-          .join('\n') + '\n\n',
-      )
+      send(eventFrame(data))
     })
+    const untrack = trackStream(session.id, {
+      handshake: () => {
+        if (res.writableEnded || res.destroyed) return
+        // A replay hands over the transcript, so check the credentials first
+        // rather than up to one heartbeat later.
+        if (!viewerToken || !store.verifyViewer(session.id, viewerToken)) {
+          endStream()
+          return
+        }
+        send(handshakeFrame())
+      },
+      replay: async (events) => {
+        for (const data of events) {
+          if (res.writableEnded || res.destroyed) return
+          send(eventFrame(data))
+          // Paced by the viewer's backlog. A transcript is megabytes of tool
+          // output and diffs; written in one burst it would trip the stuck-
+          // viewer cap above and destroy the stream of every viewer, reading
+          // or not. Half the cap leaves room for live events meanwhile.
+          if (!(await backlogAtMost(res, maxBuffer / 2, RESYNC_DRAIN_TIMEOUT_MS))) return
+        }
+      },
+    })
+    unsubscribe = () => {
+      unsubscribeEvents()
+      untrack()
+    }
     req.on('close', unsubscribe)
     res.on('close', unsubscribe)
   }
+
+  /** Open viewer streams per session — what a bridge re-dial resyncs. */
+  const viewerStreams = new Map<string, Set<ViewerStream>>()
+
+  /** Register an open stream; returns an idempotent unregister. */
+  function trackStream(session_id: string, stream: ViewerStream): () => void {
+    let set = viewerStreams.get(session_id)
+    if (!set) {
+      set = new Set()
+      viewerStreams.set(session_id, set)
+    }
+    const streams = set
+    streams.add(stream)
+    return () => {
+      streams.delete(stream)
+      if (streams.size === 0 && viewerStreams.get(session_id) === streams) viewerStreams.delete(session_id)
+    }
+  }
+
+  /**
+   * Catch open viewers up after the session's bridge re-dialled.
+   *
+   * Whatever opencode emitted while the link was down never reached the relay
+   * (see BridgeClient.onReconnect), and the web UI cannot notice the hole: it
+   * drops a part whose message it never saw, the relay's own heartbeats kept
+   * its stream looking healthy, and nothing in it re-reads a transcript short
+   * of a page reload. So a message begun in the outage arrived at the end with
+   * no text, a session that went busy looked busy forever, and a permission
+   * prompt raised meanwhile never appeared. Two things, both events the
+   * unmodified UI already acts on:
+   *
+   *  1. The handshake again, so the UI reloads session status, permissions and
+   *     questions. The stream stays OPEN: closing it instead would drop what
+   *     follows into the UI's own reconnect gap.
+   *  2. The latest messages, fetched through the bridge, replayed as
+   *     `message.updated` + `message.part.updated` — the UI inserts or updates
+   *     them like live ones.
+   *
+   * What it does not do: a message or part REMOVED during the outage stays on
+   * screen (a snapshot cannot replay a deletion); subagent (child) sessions are
+   * not resynced; and a part streaming across the re-dial can briefly lose the
+   * text of the deltas that raced the snapshot, until that part's next update
+   * rewrites it whole.
+   */
+  async function resyncViewers(session_id: string): Promise<void> {
+    const session = store.getSession(session_id)
+    if (!session) return
+    const streams = () => [...(viewerStreams.get(session_id) ?? [])]
+    for (const stream of streams()) stream.handshake()
+    let events: string[]
+    try {
+      const out = await bridge.request(
+        session_id,
+        {
+          method: 'GET',
+          path: `/session/${encodeURIComponent(session_id)}/message${queryForSession(`?limit=${RESYNC_MESSAGE_LIMIT}`, session)}`,
+        },
+        config.proxyTimeoutMs,
+      )
+      if (out.status !== 200) return
+      // Through the same filter as live events, so a replay never shows more
+      // than the live stream would have. Once here rather than per stream: a
+      // transcript is megabytes, and a session may have 64 streams.
+      events = replayEvents(out.body, session_id).filter((data) => eventBelongsToSession(data, session_id))
+    } catch {
+      // Dropped again, or too slow: the next re-dial tries again.
+      return
+    }
+    // Streams opened since the handshake get the replay too: their UI did not
+    // reload the transcript either.
+    await Promise.all(streams().map((stream) => stream.replay(events)))
+  }
+
+  /** Sessions with a resync under way; a re-dial landing meanwhile sets `again`. */
+  const resyncing = new Map<string, { again: boolean }>()
+
+  // One resync per session at a time: two interleaved snapshots could put an
+  // older one's text over a newer one's. Re-dials during a pass collapse into
+  // one more pass after it, so a flapping link cannot stack them up.
+  bridge.onReconnect((session_id) => {
+    if (!viewerStreams.has(session_id)) return
+    const running = resyncing.get(session_id)
+    if (running) {
+      running.again = true
+      return
+    }
+    const state = { again: true }
+    resyncing.set(session_id, state)
+    void (async () => {
+      try {
+        while (state.again && viewerStreams.has(session_id)) {
+          state.again = false
+          await resyncViewers(session_id)
+        }
+      } catch (err) {
+        // Never an unhandled rejection: that would end the relay process.
+        console.warn(`[relay] viewer resync failed: ${err instanceof Error ? err.message : String(err)}`)
+      } finally {
+        resyncing.delete(session_id)
+      }
+    })()
+  })
 
   /** Live SSE streams per session id — the counter behind MAX_STREAMS_PER_SESSION. */
   const streamCount = new Map<string, number>()
@@ -765,6 +918,52 @@ function stripParentId(raw: string, contentType?: string): string {
   } catch {
     return raw
   }
+}
+
+/**
+ * Turn a GET /session/:id/message answer (`[{ info, parts }]`) into the events
+ * opencode would have streamed for it: `message.updated` for each message,
+ * then `message.part.updated` for each of its parts. Only what provably belongs
+ * to `sessionId` is kept — a message of another session, or a part that does
+ * not name its own message and session — and anything unparseable yields no
+ * events at all.
+ */
+export function replayEvents(body: string, sessionId: string): string[] {
+  let items: unknown
+  try {
+    items = JSON.parse(body)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(items)) return []
+  const events: string[] = []
+  for (const item of items) {
+    const info = (item as { info?: Record<string, unknown> } | null)?.info
+    if (!info || typeof info.id !== 'string' || info.sessionID !== sessionId) continue
+    events.push(JSON.stringify({ type: 'message.updated', properties: { sessionID: sessionId, info } }))
+    const parts = (item as { parts?: unknown }).parts
+    if (!Array.isArray(parts)) continue
+    for (const part of parts as Array<Record<string, unknown> | null>) {
+      if (!part || typeof part.id !== 'string' || part.messageID !== info.id || part.sessionID !== sessionId) continue
+      events.push(JSON.stringify({ type: 'message.part.updated', properties: { part } }))
+    }
+  }
+  return events
+}
+
+/**
+ * Resolves true once `res` holds at most `limit` unsent bytes; false if it
+ * ends first or `ms` passes. Polled, like the bridge's own send-room wait:
+ * 'drain' only fires after a write that crossed the socket's high-water mark
+ * (64 KiB by default), so a limit below that would wait for it forever.
+ */
+async function backlogAtMost(res: Response, limit: number, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms
+  while (res.writableLength > limit) {
+    if (res.writableEnded || res.destroyed || Date.now() >= deadline) return false
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  return !res.writableEnded && !res.destroyed
 }
 
 /**

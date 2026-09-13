@@ -78,6 +78,8 @@ export class BridgeClient {
   private droppedAt: Map<string, number> = new Map()
   /** A drop older than this is an absent bridge, not one that is re-dialling. */
   private static readonly RECENT_DROP_MS = 60_000
+  /** Told when a session's bridge comes back after losing its link — see onReconnect. */
+  private reconnectListeners: Set<(session_id: string) => void> = new Set()
 
   constructor(server: Server, private store: Store) {
     this.wss = new WebSocketServer({
@@ -106,6 +108,10 @@ export class BridgeClient {
       }
       // One bridge per session: a reconnect replaces the old socket.
       const replaced = this.clients.get(session_id)
+      // A re-dial, not a first connection: the old link either dropped or is
+      // still here, dead, because the bridge noticed before the relay did.
+      // Either way the bridge read opencode's events into the void meanwhile.
+      const redial = replaced !== undefined || this.droppedAt.has(session_id)
       replaced?.terminate()
       this.clients.set(session_id, ws)
       this.droppedAt.delete(session_id)
@@ -166,6 +172,7 @@ export class BridgeClient {
       // reconnect can go now.
       const waiters = this.connectWaiters.get(session_id)
       if (waiters) for (const wake of [...waiters]) wake()
+      if (redial) this.notifyReconnect(session_id)
     })
     // Same reasoning one level up: an 'error' on the server itself (a failed
     // upgrade, a socket that dies mid-handshake before 'connection' fires) has
@@ -382,6 +389,38 @@ export class BridgeClient {
     return () => {
       set.delete(listener)
       if (set.size === 0 && this.eventListeners.get(session_id) === set) this.eventListeners.delete(session_id)
+    }
+  }
+
+  /**
+   * Be told whenever a session's bridge comes back after losing its link —
+   * never for its first connection. Returns an unsubscribe function.
+   *
+   * Everything opencode emitted while the link was down is gone: the bridge
+   * keeps reading its /event stream through an outage and has nowhere to send
+   * what it reads, and whatever sat in the dead socket's buffer went with it.
+   * The event stream itself has no way to say so, which is why the viewer
+   * side needs this signal (see the proxy adapter's resync).
+   */
+  onReconnect(listener: (session_id: string) => void): () => void {
+    this.reconnectListeners.add(listener)
+    return () => {
+      this.reconnectListeners.delete(listener)
+    }
+  }
+
+  /**
+   * Runs inside the WebSocket server's 'connection' handler, where an
+   * exception would escape as an uncaught error and end the process — so a
+   * listener that throws is logged, never rethrown.
+   */
+  private notifyReconnect(session_id: string): void {
+    for (const listener of [...this.reconnectListeners]) {
+      try {
+        listener(session_id)
+      } catch (err) {
+        console.warn(`[bridge] reconnect listener failed: ${err instanceof Error ? err.message : String(err)}`)
+      }
     }
   }
 
