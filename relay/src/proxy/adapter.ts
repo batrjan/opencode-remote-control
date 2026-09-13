@@ -221,6 +221,21 @@ const RESYNC_MESSAGE_LIMIT = 20
  */
 const RESYNC_DRAIN_TIMEOUT_MS = 30_000
 
+/**
+ * Set on the 401 the relay answers for a viewer it does not know: a token that
+ * expired, was evicted, or belongs to a deleted share.
+ *
+ * The web UI knows nothing of 401 — its event reader retries one for ever and a
+ * prompt only toasts — so a revoked viewer was left on a dead page. The UI
+ * shell the relay serves carries a guard that sends them back to their share's
+ * page on this header (see AUTH_GUARD in server.ts). It has to be a marker, not
+ * the status: the owner's own opencode answers 401 too (provider auth) while
+ * the viewer's cookie is fine, and navigating on that would loop. proxy() never
+ * forwards upstream headers, so an upstream 401 cannot carry it.
+ */
+export const VIEWER_AUTH_HEADER = 'X-OC-Relay-Auth'
+export const VIEWER_AUTH_INVALID = 'viewer-invalid'
+
 /** What the relay needs from one open viewer stream: a bridge re-dial resyncs it, a shutdown ends it. */
 interface ViewerStream {
   /** Re-send opencode's handshake frame; ends the stream instead if the viewer was revoked. */
@@ -239,6 +254,9 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     const token = extractViewerToken(req)
     const session = token ? store.getSessionByViewerToken(token) : undefined
     if (!session) {
+      // Marked, so the UI shell's guard can tell this 401 from one the owner's
+      // opencode answered (see VIEWER_AUTH_HEADER).
+      res.setHeader(VIEWER_AUTH_HEADER, VIEWER_AUTH_INVALID)
       res.status(401).json({ error: 'invalid viewer token' })
       return undefined
     }

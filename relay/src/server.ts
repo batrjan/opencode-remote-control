@@ -9,7 +9,7 @@ import { activateRouter } from './api/activate.js'
 import { healthRouter } from './api/health.js'
 import { skillRouter } from './api/skill.js'
 import { BridgeClient } from './ws/bridge.js'
-import { proxyAdapter } from './proxy/adapter.js'
+import { proxyAdapter, VIEWER_AUTH_HEADER, VIEWER_AUTH_INVALID } from './proxy/adapter.js'
 import { config, stateFile, trustProxy } from './config.js'
 import { FileStateStore } from './persist.js'
 
@@ -59,12 +59,79 @@ const SERVER_URL_RESET = `<script id="oc-relay-server-url">
 })()
 </script>`
 
+/**
+ * Guard injected into the UI shell: send a viewer whose access ended back to
+ * their share's page.
+ *
+ * The relay revokes correctly — an expired, evicted or deleted-share token gets
+ * its event stream ended on the next heartbeat and 401 on every request — but
+ * the web UI has no idea what a 401 means. Its event reader counts one as a
+ * failed attempt and retries for as long as the tab lives, backing off to 30 s;
+ * a prompt toasts "401 Unauthorized" and stays in the input. The page just sat
+ * there, while the one thing that helps (entering the code again) was a page
+ * load away: /<session_id> answers the share's code-entry page, or says the
+ * share has ended. Nothing in the UI ever made that load.
+ *
+ * So wrap fetch, which the UI resolves at call time for its API calls and its
+ * event stream alike, and on a 401 carrying the relay's own marker (see
+ * VIEWER_AUTH_HEADER — a 401 from the owner's opencode has none, and navigating
+ * on that would loop) replace the page with /<session_id>. That id comes from
+ * the path this shell was served at: the relay serves it only at URLs naming
+ * the share (/<dir>/session/<id>, /server/<key>/session/<id>), while the path
+ * the UI has moved to since may name another session, a subagent's, which no
+ * share answers. Not / or /join: a cookie that names no share gets the generic
+ * page there, whose code field is disabled. /terminal names nothing; / is all
+ * that is left.
+ *
+ * The response is handed back untouched and its body never read, so the event
+ * stream is not disturbed. At most one navigation per tab per AUTH_GUARD_WINDOW_MS
+ * (sessionStorage outlives the load): a marked 401 on a page loaded with a
+ * working cookie can only mean the cookie changed in between, and bouncing
+ * between pages would not help. Classic inline in <head>, so it runs before
+ * the UI's deferred module bundle makes its first request.
+ */
+const AUTH_GUARD_WINDOW_MS = 30_000
+const AUTH_GUARD = `<script id="oc-relay-auth-guard">
+;(() => {
+  try {
+    const original = window.fetch
+    if (typeof original !== 'function') return
+    const share = /\\/session\\/(ses_[A-Za-z0-9_]+)/.exec(location.pathname)
+    const home = share ? '/' + share[1] : '/'
+    const key = 'oc-relay-auth-redirect-at'
+    let left = false
+    const leave = () => {
+      if (left) return
+      const now = Date.now()
+      try {
+        const last = Number(sessionStorage.getItem(key))
+        if (last && now - last >= 0 && now - last < ${AUTH_GUARD_WINDOW_MS}) return
+        sessionStorage.setItem(key, String(now))
+      } catch {}
+      left = true
+      location.replace(home)
+    }
+    window.fetch = function (...args) {
+      // Called on window whatever the caller's receiver: native fetch called
+      // on any other object throws "Illegal invocation".
+      return original.apply(window, args).then((res) => {
+        try {
+          const marker = res && res.status === 401 ? res.headers.get(${JSON.stringify(VIEWER_AUTH_HEADER)}) : null
+          if (marker === ${JSON.stringify(VIEWER_AUTH_INVALID)}) leave()
+        } catch {}
+        return res
+      })
+    }
+  } catch {}
+})()
+</script>`
+
 function terminalHtml(): string {
   if (cachedTerminalHtml === undefined) {
     const html = readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8')
     const anchor = html.indexOf('</head>')
-    cachedTerminalHtml =
-      anchor === -1 ? html + SERVER_URL_RESET : html.slice(0, anchor) + SERVER_URL_RESET + html.slice(anchor)
+    const inject = SERVER_URL_RESET + AUTH_GUARD
+    cachedTerminalHtml = anchor === -1 ? html + inject : html.slice(0, anchor) + inject + html.slice(anchor)
   }
   return cachedTerminalHtml
 }
