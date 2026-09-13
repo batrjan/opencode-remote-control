@@ -182,6 +182,19 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     return session
   }
 
+  /**
+   * Answer a failed bridge request with what actually failed. Every route uses
+   * this: a few used to say "bridge not connected" for any error, so a bridge
+   * that was connected but slow — the congested-uplink case — was reported as
+   * down while the relay's own log showed it up.
+   */
+  function sendProxyError(res: Response, err: unknown): void {
+    const message = err instanceof Error ? err.message : ''
+    if (message === 'bridge not connected') res.status(502).json({ error: 'bridge not connected' })
+    else if (message === 'proxy timeout') res.status(504).json({ error: 'proxy timeout' })
+    else res.status(502).json({ error: 'proxy failed' })
+  }
+
   /** Forward one request through the session's bridge; never throws. */
   async function proxy(
     res: Response,
@@ -202,14 +215,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
         .type(out.contentType ?? 'application/json')
         .send(payload)
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'proxy failed'
-      if (message === 'bridge not connected') {
-        res.status(502).json({ error: 'bridge not connected' })
-      } else if (message === 'proxy timeout') {
-        res.status(504).json({ error: 'proxy timeout' })
-      } else {
-        res.status(502).json({ error: 'proxy failed' })
-      }
+      sendProxyError(res, err)
     }
   }
 
@@ -282,10 +288,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
         }
         res.status(out.status).type(out.contentType ?? 'application/json').send(filtered)
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'proxy failed'
-        if (message === 'bridge not connected') res.status(502).json({ error: 'bridge not connected' })
-        else if (message === 'proxy timeout') res.status(504).json({ error: 'proxy timeout' })
-        else res.status(502).json({ error: 'proxy failed' })
+        sendProxyError(res, err)
       }
     })()
   })
@@ -310,8 +313,8 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           .status(out.status)
           .type(out.contentType ?? 'application/json')
           .send(`[${out.body}]`)
-      } catch {
-        res.status(502).json({ error: 'bridge not connected' })
+      } catch (err) {
+        sendProxyError(res, err)
       }
     })()
   })
@@ -340,8 +343,8 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           // upstream not a JSON array — pass through verbatim
         }
         res.status(out.status).type(out.contentType ?? 'application/json').send(body)
-      } catch {
-        res.status(502).json({ error: 'bridge not connected' })
+      } catch (err) {
+        sendProxyError(res, err)
       }
     })()
   })
@@ -366,8 +369,8 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           // upstream not JSON — pass through verbatim
         }
         res.status(out.status).type(out.contentType ?? 'application/json').send(body)
-      } catch {
-        res.status(502).json({ error: 'bridge not connected' })
+      } catch (err) {
+        sendProxyError(res, err)
       }
     })()
   })

@@ -353,6 +353,12 @@ export class BridgeClient {
     return new Promise<ProxyResponse>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(request_id)
+        // Logged (budgeted) because a timeout on a CONNECTED bridge is the
+        // congested-uplink signature, and nothing else would record it. The
+        // path only, never the query or body.
+        this.logLifecycle(
+          `proxy timeout session=${JSON.stringify(session_id)} ${req.method} ${JSON.stringify(req.path.split('?')[0])} after ${timeoutMs}ms`,
+        )
         reject(new Error('proxy timeout'))
       }, timeoutMs)
       this.pending.set(request_id, { session_id, resolve, reject, timer })
