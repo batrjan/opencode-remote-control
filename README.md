@@ -44,6 +44,7 @@ anyone holding the link *and* the code acts on the machine running OpenCode, as 
 | Start arbitrary agent turns — editing files, running tools, spending your model credits | `POST /session/:id/message`, `POST /session/:id/prompt_async` |
 | Read and search any file the project can reach | `GET /file/content`, `GET /find`, `GET /find/file`, `GET /find/symbol` |
 | Answer permission prompts raised by that session | `POST /session/:id/permissions/:permissionID` |
+| Answer or dismiss questions the agent asks in that session | `POST /question/:requestID/reply`, `POST /question/:requestID/reject` |
 
 So the access code is a credential to the project directory. Hand it only to someone you
 would let sit at your keyboard, and stop the share when they are done.

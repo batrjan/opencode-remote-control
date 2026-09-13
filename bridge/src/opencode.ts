@@ -46,6 +46,17 @@ export class OpencodeClient {
     return res.json()
   }
 
+  /**
+   * Pending question requests (instance-wide list; callers must filter).
+   * `query` ('' or '?…') picks the instance — pass the query of the request
+   * being checked so the list comes from the instance that request reaches.
+   */
+  async listQuestions(query = '') {
+    const res = await fetch(`${this.url}/question${query}`, { headers: this.auth() })
+    if (!res.ok) throw new Error(`listQuestions failed: ${res.status}`)
+    return res.json()
+  }
+
   async getAgents() {
     const res = await fetch(`${this.url}/agent`, { headers: this.auth() })
     return res.json()

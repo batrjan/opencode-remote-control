@@ -61,7 +61,9 @@ const ACCEPTED: Array<[string, string]> = [
   ['GET', '/global/health?directory=%2Fp'],
   ['GET', '/global/config?directory=%2Fp'],
   ['GET', '/question?directory=%2Fp'],
-  ['POST', '/question?directory=%2Fp'],
+  // Answering / dismissing an agent question — ':requestID' is one opaque segment.
+  ['POST', '/question/que_1/reply?directory=%2Fp'],
+  ['POST', '/question/que_1/reject?directory=%2Fp'],
   ['GET', '/experimental/resource?directory=%2Fp'],
   ['GET', '/experimental/capabilities?directory=%2Fp'],
   ['GET', '/experimental/workspace?directory=%2Fp'],
@@ -84,6 +86,7 @@ const ACCEPTED: Array<[string, string]> = [
   ['GET', `/api/session/${SES}/message/msg_7c1`],
   ['POST', `/api/session/${SES}/prompt_async`],
   ['POST', `/api/session/${SES}/permissions/per_9ab`],
+  ['POST', '/api/question/que_1/reply'],
   ['GET', '/api/session/status'],
   ['GET', '/api/permission'],
   ['GET', '/api/project'],
@@ -126,6 +129,11 @@ const REJECTED: Array<[string, string]> = [
   ['GET', '/session/not_a_session_id/message'], // ':id' must look like a session
   ['GET', 'http://evil.example/config'], // absolute URL, would re-target the host
   ['GET', '/session//message'], // empty id segment
+  ['POST', '/question'], // not an opencode route at all
+  ['GET', '/question/que_1/reply'], // right path, wrong verb
+  ['POST', '/question/que_1/answer'], // only reply and reject exist
+  ['POST', '/question/que%2F..%2Fx/reply'], // encoded slash in the requestID segment
+  ['POST', '/question//reply'], // empty requestID segment
 ]
 
 test.each(REJECTED)('rejects %s %s', (method, path) => {
@@ -193,4 +201,77 @@ test('the socket handler answers a disallowed request with 403 and never calls o
   // An allowed request still goes through untouched, query and all.
   await deliver({ type: 'proxy', request_id: 'r2', method: 'GET', path: `/session/${SES}/message?directory=%2Fp` })
   expect(calls).toEqual([`GET /session/${SES}/message?directory=%2Fp`])
+})
+
+/**
+ * opencode's question reply and reject routes take nothing but a request id,
+ * and its handlers never ask which session the question belongs to — so an
+ * allowlisted path alone would let a viewer (or a hostile relay) answer or
+ * dismiss a question from ANY of the owner's sessions. The bridge answers only
+ * ids that are pending questions of its own bound session, looked up in the
+ * same instance (the forwarded ?directory=…) the reply will act on.
+ */
+function questionClient(listQuestions: (query: string) => Promise<unknown>) {
+  const calls: string[] = []
+  const lists: string[] = []
+  const opencode = {
+    request: async (method: string, path: string) => {
+      calls.push(`${method} ${path}`)
+      return { status: 200, contentType: 'application/json', body: 'true' }
+    },
+    listPermissions: async () => [],
+    listQuestions: async (query: string) => {
+      lists.push(query)
+      return listQuestions(query)
+    },
+  }
+  const client = new RelayWSClient('http://relay.invalid', opencode as unknown as OpencodeClient)
+  const sent: Array<{ request_id: string; status: number; body: string }> = []
+  ;(client as unknown as { ws: unknown }).ws = { readyState: 1, send: (raw: string) => sent.push(JSON.parse(raw)) }
+  ;(client as unknown as { boundSessionId: string }).boundSessionId = SES
+  const deliver = (msg: unknown) =>
+    (client as unknown as { onMessage(raw: unknown): Promise<void> }).onMessage(JSON.stringify(msg))
+  return { calls, lists, sent, deliver }
+}
+
+const PENDING = [
+  { id: 'que_mine', sessionID: SES },
+  { id: 'que_other', sessionID: 'ses_otherOwnerWork' },
+]
+
+test('a question of the bound session is answered and dismissed', async () => {
+  const q = questionClient(async () => PENDING)
+  await q.deliver({ type: 'proxy', request_id: 'r1', method: 'POST', path: '/question/que_mine/reply?directory=%2Fp', body: { answers: [['yes']] } })
+  await q.deliver({ type: 'proxy', request_id: 'r2', method: 'POST', path: '/api/question/que_mine/reject?directory=%2Fp' })
+  expect(q.calls).toEqual(['POST /question/que_mine/reply?directory=%2Fp', 'POST /api/question/que_mine/reject?directory=%2Fp'])
+  expect(q.sent.map((m) => m.status)).toEqual([200, 200])
+  // Checked in the instance the reply is sent to.
+  expect(q.lists).toEqual(['?directory=%2Fp', '?directory=%2Fp'])
+})
+
+test("another session's question is refused before opencode is asked to act", async () => {
+  const q = questionClient(async () => PENDING)
+  await q.deliver({ type: 'proxy', request_id: 'r1', method: 'POST', path: '/question/que_other/reply?directory=%2Fp', body: { answers: [['yes']] } })
+  await q.deliver({ type: 'proxy', request_id: 'r2', method: 'POST', path: '/question/que_gone/reject?directory=%2Fp' })
+  expect(q.calls).toEqual([])
+  expect(q.sent.map((m) => [m.status, JSON.parse(m.body)])).toEqual([
+    [403, { error: 'question request not found for this session' }],
+    [403, { error: 'question request not found for this session' }],
+  ])
+})
+
+test('question ownership that cannot be checked fails closed', async () => {
+  const unreachable = questionClient(async () => {
+    throw new Error('listQuestions failed: 500')
+  })
+  await unreachable.deliver({ type: 'proxy', request_id: 'r1', method: 'POST', path: '/question/que_mine/reply?directory=%2Fp' })
+  expect(unreachable.calls).toEqual([])
+  expect(unreachable.sent[0]).toMatchObject({ status: 403 })
+  expect(JSON.parse(unreachable.sent[0]!.body)).toEqual({ error: 'question verification unavailable' })
+
+  // A list that is not a list proves nothing either.
+  const garbled = questionClient(async () => ({ que_mine: { sessionID: SES } }))
+  await garbled.deliver({ type: 'proxy', request_id: 'r2', method: 'POST', path: '/question/que_mine/reply?directory=%2Fp' })
+  expect(garbled.calls).toEqual([])
+  expect(garbled.sent[0]).toMatchObject({ status: 403 })
 })

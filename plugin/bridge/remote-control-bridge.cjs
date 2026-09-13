@@ -7262,6 +7262,16 @@ var OpencodeClient = class {
     if (!res.ok) throw new Error(`listPermissions failed: ${res.status}`);
     return res.json();
   }
+  /**
+   * Pending question requests (instance-wide list; callers must filter).
+   * `query` ('' or '?…') picks the instance — pass the query of the request
+   * being checked so the list comes from the instance that request reaches.
+   */
+  async listQuestions(query = "") {
+    const res = await fetch(`${this.url}/question${query}`, { headers: this.auth() });
+    if (!res.ok) throw new Error(`listQuestions failed: ${res.status}`);
+    return res.json();
+  }
   async getAgents() {
     const res = await fetch(`${this.url}/agent`, { headers: this.auth() });
     return res.json();
@@ -7433,9 +7443,14 @@ var RELAY_PROXY_ROUTES = [
   // relay doing its job.
   ["GET", "/global/health"],
   ["GET", "/global/config"],
-  // Question / resource / reference APIs the UI bootstrap resolves.
+  // Question API: the pending list (the relay filters it to the viewer's
+  // session) and the question dock's answer / dismiss. opencode has no
+  // POST /question. Reply and reject are additionally ownership-checked in
+  // guardRequest: upstream acts on any request id, whatever its session.
   ["GET", "/question"],
-  ["POST", "/question"],
+  ["POST", "/question/:requestID/reply"],
+  ["POST", "/question/:requestID/reject"],
+  // Resource / reference APIs the UI bootstrap resolves.
   ["GET", "/experimental/resource"],
   ["GET", "/experimental/capabilities"],
   ["GET", "/experimental/workspace"],
@@ -7902,11 +7917,16 @@ var RelayWSClient = class {
    * check that the permission request belongs to that session — a viewer
    * could approve a prompt raised by ANOTHER session of the owner. Verify
    * the permission request belongs to the bound session before forwarding.
+   * Question replies and rejections are checked the same way (see
+   * guardQuestion).
    */
   async guardRequest(method, path3) {
     const pathname = path3.split(/[?#]/)[0];
+    if (method !== "POST") return null;
+    const question = /^(?:\/api)?\/question\/([^/]+)\/(?:reply|reject)$/.exec(pathname);
+    if (question) return this.guardQuestion(decodeURIComponent(question[1]), path3);
     const m = /^\/session\/[^/]+\/permissions\/([^/]+)$/.exec(pathname);
-    if (method !== "POST" || !m) return null;
+    if (!m) return null;
     const permissionID = decodeURIComponent(m[1]);
     if (!this.boundSessionId) return null;
     try {
@@ -7919,6 +7939,34 @@ var RelayWSClient = class {
       return owned ? null : "permission request not found for this session";
     } catch {
       return "permission verification unavailable";
+    }
+  }
+  /**
+   * Answer or dismiss only a question of the bound session.
+   *
+   * opencode's POST /question/:requestID/reply and /reject take nothing but
+   * the id and act on whichever pending question has it, from any session —
+   * so without this a viewer, or a hostile relay, could answer or dismiss a
+   * question the agent put to the owner in another session. The pending list
+   * is read with the forwarded request's own query: questions are held per
+   * instance (the ?directory=… the relay pins), and that is the instance the
+   * reply will act on. Anything that does not prove ownership is refused.
+   */
+  async guardQuestion(requestID, path3) {
+    const notFound = "question request not found for this session";
+    if (!this.boundSessionId) return "question verification unavailable";
+    const queryStart = path3.indexOf("?");
+    const query = queryStart === -1 ? "" : path3.slice(queryStart).split("#")[0];
+    try {
+      const pending = await this.opencode.listQuestions(query);
+      if (!Array.isArray(pending)) return notFound;
+      const owned = pending.some((q) => {
+        const rec = q;
+        return rec?.id === requestID && rec.sessionID === this.boundSessionId;
+      });
+      return owned ? null : notFound;
+    } catch {
+      return "question verification unavailable";
     }
   }
 };

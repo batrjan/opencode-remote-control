@@ -79,9 +79,17 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   // /event subscription (see the sseEvents handlers below).
   ['GET', '/global/health'],
   ['GET', '/global/config'],
-  // Question/resource/reference APIs the UI bootstrap resolves
-  ['GET', '/question'],
-  ['POST', '/question'],
+  // Question API: the question dock's two buttons. These are opencode's only
+  // question writes — there is no POST /question, which is what used to be
+  // listed here, so a viewer's answer met the catch-all 404, the dock stayed up
+  // and the composer stayed blocked until the owner answered locally.
+  // SECURITY: both take only an instance-global request id and upstream does
+  // not check which session it belongs to, so the bridge refuses ids that are
+  // not pending questions of the bound session. The list (GET /question) is
+  // instance-wide too and gets a filtered handler below, like /permission.
+  ['POST', '/question/:requestID/reply'],
+  ['POST', '/question/:requestID/reject'],
+  // Resource/reference APIs the UI bootstrap resolves
   ['GET', '/experimental/resource'],
   ['GET', '/experimental/capabilities'],
   ['GET', '/experimental/workspace'],
@@ -454,6 +462,39 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     })()
   })
 
+  // GET /question — pending agent questions, FILTERED to the viewer's own
+  // session. Upstream lists every pending question on the instance, so the
+  // raw list showed a viewer the question text of the owner's OTHER sessions
+  // in the same project. The UI only reads it at bootstrap to restore the
+  // question dock. Unlike /permission it keeps the directory query: questions
+  // are held by the instance of the directory, the same one the dock's reply
+  // is sent to.
+  router.get(['/question', '/api/question'], (req, res) => {
+    const session = requireViewer(req, res)
+    if (!session) return
+    void (async () => {
+      try {
+        const out = await bridge.request(
+          session.id,
+          { method: 'GET', path: `/question${queryForSession(queryOf(req), session)}` },
+          config.proxyTimeoutMs,
+        )
+        let body = out.body
+        try {
+          const all = JSON.parse(out.body) as Array<Record<string, unknown> | null>
+          if (Array.isArray(all)) {
+            body = JSON.stringify(all.filter((q) => q?.sessionID === session.id))
+          }
+        } catch {
+          // upstream not a JSON array — pass through verbatim
+        }
+        res.status(out.status).type(out.contentType ?? 'application/json').send(body)
+      } catch (err) {
+        sendProxyError(res, err)
+      }
+    })()
+  })
+
   // GET /session/status — global status map, filtered to the viewer's
   // session only (other sessions' statuses are not the viewer's business).
   router.get(['/session/status', '/api/session/status'], (req, res) => {
@@ -597,6 +638,9 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       }
       if (typeof req.params.messageID === 'string') {
         path = path.replaceAll(':messageID', encodeURIComponent(req.params.messageID))
+      }
+      if (typeof req.params.requestID === 'string') {
+        path = path.replaceAll(':requestID', encodeURIComponent(req.params.requestID))
       }
       // Sanitize session-detail reads: strip parentID so the UI never walks
       // a parent chain (which would loop under forced :id binding).
