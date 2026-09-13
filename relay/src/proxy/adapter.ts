@@ -3,7 +3,7 @@ import express from 'express'
 import type { Request, Response } from 'express'
 import type { Store, Session } from '../store.js'
 import type { BridgeClient } from '../ws/bridge.js'
-import { config, sseHeartbeatMs, sseMaxBufferBytes, sseRetryMs } from '../config.js'
+import { bridgeReconnectWaitMs, config, promptTimeoutMs, sseHeartbeatMs, sseMaxBufferBytes, sseRetryMs } from '../config.js'
 
 /**
  * HTTP → WS → opencode proxy adapter, mounted at the server ROOT.
@@ -141,6 +141,23 @@ const SESSION_ID_RE = /^ses_[A-Za-z0-9_]+$/
 const LONG_POLL_PREFIXES = ['/permission/request', '/question']
 const LONG_POLL_TIMEOUT_MS = 120_000
 
+/** The prompt route whose lost answers are checked with opencode — see proxyPrompt. */
+const PROMPT_ROUTE = '/session/:id/prompt_async'
+
+/**
+ * A message id as the web UI mints it for a prompt (Identifier.ascending:
+ * `msg_` + hex time + base62). Only this shape is ever put into the checking
+ * GET's path; anything else is not looked up.
+ */
+const MESSAGE_ID_RE = /^msg_[A-Za-z0-9]{1,64}$/
+
+/**
+ * Failures that can happen AFTER a prompt was sent to the bridge — so it may
+ * well have reached opencode. 'bridge not connected' is not one: that prompt
+ * never left the relay.
+ */
+const LOST_ANSWER_ERRORS = new Set(['proxy timeout', 'bridge closed', 'bridge unreachable'])
+
 /**
  * Body cap for proxied POSTs. A viewer's prompt legitimately carries pasted
  * code, a stack trace or a whole file, which express's 100 KB default turned
@@ -240,6 +257,70 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
         .send(payload)
     } catch (err) {
       sendProxyError(res, err)
+    }
+  }
+
+  /**
+   * POST /session/:id/prompt_async, answered by what opencode actually did.
+   *
+   * opencode takes a prompt, starts the turn and answers 204 within tens of
+   * milliseconds, so a prompt whose wait fails after it was sent has almost
+   * always landed: its 204 queued on the owner's slow uplink until the relay's
+   * timer ran out, or died in the socket of a link that dropped. The relay
+   * answered those with 504 / 502 anyway, and the web UI takes any error as
+   * "not sent" — it removes the message, puts the text back in the input and
+   * toasts — so the viewer pressed send again and opencode ran the same turn a
+   * second time (a resend carries a new message id).
+   *
+   * The prompt is never sent again, not even under the same id: opencode then
+   * appends a second copy of the text to the message. Instead the relay asks
+   * whether the message the UI named in `messageID` exists and, if it does,
+   * answers the 204 opencode gave. Everything else — no usable id, a prompt
+   * that never left the relay, no such message, or no way to ask — gets the
+   * original error, as before.
+   */
+  async function proxyPrompt(res: Response, session: Session, path: string, query: string, body: unknown): Promise<void> {
+    try {
+      const out = await bridge.request(session.id, { method: 'POST', path: path + query, body }, promptTimeoutMs())
+      res
+        .status(out.status)
+        .type(out.contentType ?? 'application/json')
+        .send(out.body)
+    } catch (err) {
+      const messageID = (body as { messageID?: unknown } | null | undefined)?.messageID
+      const lostAnswer = err instanceof Error && LOST_ANSWER_ERRORS.has(err.message)
+      if (lostAnswer && typeof messageID === 'string' && MESSAGE_ID_RE.test(messageID)) {
+        if (await promptLanded(session, messageID, query)) {
+          res.status(204).end()
+          return
+        }
+      }
+      sendProxyError(res, err)
+    }
+  }
+
+  /**
+   * Whether opencode holds the prompt message `messageID` in the viewer's
+   * session. A dropped link is waited out first (the bridge re-dials within
+   * about a second), and the GET itself survives one more re-dial. Anything
+   * short of a 200 naming this very message is "no".
+   */
+  async function promptLanded(session: Session, messageID: string, query: string): Promise<boolean> {
+    if (!(await bridge.waitForConnection(session.id, bridgeReconnectWaitMs()))) return false
+    try {
+      const out = await bridge.request(
+        session.id,
+        {
+          method: 'GET',
+          path: `/session/${encodeURIComponent(session.id)}/message/${encodeURIComponent(messageID)}${query}`,
+        },
+        config.proxyTimeoutMs,
+      )
+      if (out.status !== 200) return false
+      const info = (JSON.parse(out.body) as { info?: { id?: unknown; sessionID?: unknown } } | null)?.info
+      return info?.id === messageID && info?.sessionID === session.id
+    } catch {
+      return false
     }
   }
 
@@ -529,6 +610,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           if (typeof req.params.messageID === 'string') {
             path = path.replaceAll(':messageID', encodeURIComponent(req.params.messageID))
           }
+        }
+        if (method === 'POST' && template === PROMPT_ROUTE) {
+          await proxyPrompt(res, session, path, queryForSession(queryOf(req), session), req.body)
+          return
         }
         await proxy(
           res,

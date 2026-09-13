@@ -150,10 +150,25 @@ export function wsPingIntervalMs(): number {
  * How long a GET whose bridge dropped mid-request waits for that bridge to come
  * back before failing. A bridge re-dials within about a second of losing its
  * link, so a network blip on the owner's side becomes a short delay for the
- * viewer instead of a 502. Only GETs: repeating a prompt is not harmless.
+ * viewer instead of a 502. Only GETs: repeating a prompt is not harmless. A
+ * prompt caught by a drop waits as long, but only to ask opencode whether it
+ * landed (see proxyPrompt in the proxy adapter).
  */
 export function bridgeReconnectWaitMs(): number {
   return envInt('RELAY_BRIDGE_RECONNECT_WAIT_MS', 5_000)
+}
+
+/**
+ * How long the relay waits for opencode's answer to a viewer's prompt
+ * (POST /session/:id/prompt_async). opencode answers a prompt in tens of
+ * milliseconds — it starts the turn and returns — so the rest of any wait is
+ * the owner's uplink, where the answer queues behind whatever the bridge is
+ * already sending (a file preview, a transcript). Neither the web UI's fetch
+ * nor nginx gives up on it, so the ordinary 30 s proxy timeout was the only
+ * clock, and it ran out on answers that were on their way.
+ */
+export function promptTimeoutMs(): number {
+  return envInt('RELAY_PROMPT_TIMEOUT_MS', 120_000)
 }
 
 /**
