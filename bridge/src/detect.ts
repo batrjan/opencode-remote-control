@@ -4,24 +4,39 @@ import { config, opencodeAuthHeader } from './config.js'
 
 const execP = promisify(exec)
 
+/** A TCP listener owned by a node/opencode process. */
+export interface Listener {
+  port: number
+  pid: number
+}
+
 /**
- * TCP ports listened on by node/opencode processes (case-insensitive — the
- * desktop app reports its command as "OpenCode"). lsof prints the address as
- * `127.0.0.1:4096`, `*:4096` or `[::1]:4096`, so the port is read after the
- * LAST colon — splitting on the first one dropped every IPv6 listener.
+ * TCP listeners of node/opencode processes (case-insensitive — the desktop app
+ * reports its command as "OpenCode"), with the pid that owns each. lsof prints
+ * the address as `127.0.0.1:4096`, `*:4096` or `[::1]:4096`, so the port is
+ * read after the LAST colon — splitting on the first one dropped every IPv6
+ * listener.
  */
-export async function listCandidatePorts(): Promise<number[]> {
+export async function listListeners(): Promise<Listener[]> {
   const { stdout } = await execP(
-    "lsof -iTCP -sTCP:LISTEN -P 2>/dev/null | awk 'tolower($1) ~ /opencode|node/ {print $9}'",
+    "lsof -iTCP -sTCP:LISTEN -P 2>/dev/null | awk 'tolower($1) ~ /opencode|node/ {print $2, $9}'",
   )
-  const ports: number[] = []
+  const listeners: Listener[] = []
   for (const line of stdout.split('\n')) {
-    const address = line.trim()
-    if (!address) continue
+    const [pidField, address] = line.trim().split(/\s+/)
+    if (!pidField || !address) continue
+    const pid = Number(pidField)
     const port = Number(address.slice(address.lastIndexOf(':') + 1))
-    if (Number.isInteger(port) && port > 0 && !ports.includes(port)) ports.push(port)
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(port) || port <= 0) continue
+    // IPv4 and IPv6 sockets of one server are two lines for the same pair.
+    if (!listeners.some((l) => l.port === port && l.pid === pid)) listeners.push({ port, pid })
   }
-  return ports
+  return listeners
+}
+
+/** TCP ports listened on by node/opencode processes, each once. */
+export async function listCandidatePorts(): Promise<number[]> {
+  return [...new Set((await listListeners()).map((l) => l.port))]
 }
 
 /**
@@ -36,6 +51,16 @@ export async function detectOpenCodePort(candidates?: number[]): Promise<number>
   throw new Error('opencode not found')
 }
 
+export interface EnsureServerOptions {
+  /** Listening node/opencode processes — test hook; defaults to listListeners(). */
+  listListeners?: () => Promise<Listener[]>
+  /**
+   * Whether the process behind a listener belongs to a share that is already
+   * running on this machine. Such a server is never attached to.
+   */
+  ownedByShare?: (pid: number) => boolean
+}
+
 /**
  * Detect an already-running server, or spawn `opencode serve` when none is
  * listening (plain `opencode run`/`--mini` use an in-process server with no
@@ -43,12 +68,31 @@ export async function detectOpenCodePort(candidates?: number[]): Promise<number>
  * we spawned it, the child process so the caller can tie its lifetime to the
  * bridge.
  */
-export async function ensureOpenCodeServer(): Promise<{ port: number; spawned?: import('node:child_process').ChildProcess }> {
+export async function ensureOpenCodeServer(
+  opts: EnsureServerOptions = {},
+): Promise<{ port: number; spawned?: import('node:child_process').ChildProcess }> {
+  let listeners: Listener[] = []
   try {
-    return { port: await detectOpenCodePort() }
+    listeners = await (opts.listListeners ?? listListeners)()
   } catch {
-    // No running server — start a headless one bound to the current project.
+    // No lsof (or no awk): nothing to attach to — start our own below.
   }
+  for (const { port, pid } of listeners) {
+    if (!(await isHealthy(port))) continue
+    // A server another share spawned is not the user's: its lifetime belongs to
+    // that share, which kills it on every way it ends (stop, the relay revoking
+    // it, a signal, its bridge exiting). Attaching to it made this share run on
+    // borrowed time — ending the first share cut the second one's viewers off
+    // and then ended it too. Start a server of our own instead.
+    if (opts.ownedByShare?.(pid)) {
+      console.warn(
+        `bridge: not attaching to the opencode server on port ${port} (pid ${pid}) — another share started it and ends it with that share; starting a separate one`,
+      )
+      continue
+    }
+    return { port }
+  }
+  // No running server we may use — start a headless one bound to the current project.
   const { spawn } = await import('node:child_process')
   // Capture the server's own logs instead of inheriting our stderr: the TUI
   // plugin reads the bridge's output to show the share URL + code, and the

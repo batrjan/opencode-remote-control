@@ -36,7 +36,7 @@ export interface StartBridgeOptions {
   opencodeUrl?: string
   /** Watchdog poll interval — test hook; defaults to watchdogIntervalMs(). */
   healthIntervalMs?: number
-  /** Server spawner — test hook; defaults to ensureOpenCodeServer(). */
+  /** Server spawner — test hook; defaults to ensureOpenCodeServer(), skipping servers other shares spawned. */
   serverSpawner?: () => Promise<{ port: number; spawned?: import('node:child_process').ChildProcess }>
   /**
    * PID of the OpenCode process the share was started from (the plugin passes
@@ -83,7 +83,11 @@ export async function startBridge(
   } else if (opts.port !== undefined) {
     resolvedPort = opts.port
   } else {
-    const ensured = await (opts.serverSpawner ?? ensureOpenCodeServer)()
+    // Never attach to a server another share on this machine spawned: that
+    // share kills it when it ends, and this one would go down with it.
+    const ensured = await (
+      opts.serverSpawner ?? (() => ensureOpenCodeServer({ ownedByShare: (pid) => belongsToRunningShare(pid) }))
+    )()
     resolvedPort = ensured.port
     spawnedServer = ensured.spawned
   }
@@ -437,6 +441,75 @@ function describeProcess(pid: number): ProcessSnapshot | null {
 function isBridgeCommand(command: string): boolean {
   const exec = command.trim().split(/\s+/)[0] ?? ''
   return NODE_EXEC_RE.test(exec) && BRIDGE_ENTRY_RE.test(command)
+}
+
+/** A live pid's parent pid and command line. */
+export interface ProcessParent {
+  ppid: number
+  command: string
+}
+
+/** Read a pid's parent and command line; null if the pid is gone or `ps` cannot answer. Never throws. */
+function describeParent(pid: number): ProcessParent | null {
+  try {
+    const out = execFileSync('ps', ['-p', String(pid), '-o', 'ppid=,command='], {
+      encoding: 'utf8',
+      timeout: 2000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    const m = /^\s*(\d+)\s+(\S.*)$/.exec(out.split('\n')[0] ?? '')
+    return m ? { ppid: Number(m[1]), command: m[2]!.trim() } : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * How many generations above a listening process to look for the bridge that
+ * spawned it. The bridge's child is normally the listener itself; an `opencode`
+ * on PATH that is a wrapper starting the real binary puts the listener a level
+ * or two further down.
+ */
+const SHARE_ANCESTRY_DEPTH = 4
+
+/**
+ * Whether the process listening on a port was started by a share that is still
+ * running on this machine: a bridge process — or this very process, for a
+ * library caller running several shares — is among its ancestors.
+ *
+ * Two concurrent shares used to end up on ONE server: the second `start`
+ * detected the first share's `opencode serve` like any user-run server and
+ * attached to it, and ending the first share killed that server under the
+ * second. The parent link answers "whose is this server" where the state files
+ * cannot: it exists from the moment of the spawn, while a share's state is
+ * written only after the relay accepted it (seconds later on a slow uplink); it
+ * reaches the listener even when the pid the bridge spawned was a wrapper; and
+ * it cannot go stale — a server whose bridge was killed with -9 is re-parented
+ * away and is no longer claimed by anyone.
+ *
+ * Never throws: without `ps` nothing is claimed, which is detection's old
+ * behaviour. `inspect` is injectable so the walk can be tested deterministically.
+ */
+export function belongsToRunningShare(
+  pid: number,
+  inspect: (pid: number) => ProcessParent | null = describeParent,
+): boolean {
+  const lookup = (p: number): ProcessParent | null => {
+    try {
+      return inspect(p)
+    } catch {
+      return null
+    }
+  }
+  let entry = lookup(pid)
+  for (let depth = 0; entry && depth < SHARE_ANCESTRY_DEPTH; depth++) {
+    const parentPid = entry.ppid
+    if (!(parentPid > 1)) return false // init/launchd: nobody's child any more
+    if (parentPid === process.pid) return true
+    entry = lookup(parentPid)
+    if (entry && isBridgeCommand(entry.command)) return true
+  }
+  return false
 }
 
 /** Why this pid must not be signalled, or null when it is safe to. */

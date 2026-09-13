@@ -3704,6 +3704,7 @@ var require_websocket_server = __commonJS({
 // src/index.ts
 var src_exports = {};
 __export(src_exports, {
+  belongsToRunningShare: () => belongsToRunningShare,
   startBridge: () => startBridge,
   stopBridge: () => stopBridge,
   terminateBridgeProcess: () => terminateBridgeProcess,
@@ -7156,18 +7157,23 @@ function opencodeAuthHeader() {
 var import_node_child_process2 = require("node:child_process");
 var import_node_util3 = require("node:util");
 var execP = (0, import_node_util3.promisify)(import_node_child_process2.exec);
-async function listCandidatePorts() {
+async function listListeners() {
   const { stdout } = await execP(
-    "lsof -iTCP -sTCP:LISTEN -P 2>/dev/null | awk 'tolower($1) ~ /opencode|node/ {print $9}'"
+    "lsof -iTCP -sTCP:LISTEN -P 2>/dev/null | awk 'tolower($1) ~ /opencode|node/ {print $2, $9}'"
   );
-  const ports = [];
+  const listeners = [];
   for (const line of stdout.split("\n")) {
-    const address = line.trim();
-    if (!address) continue;
+    const [pidField, address] = line.trim().split(/\s+/);
+    if (!pidField || !address) continue;
+    const pid = Number(pidField);
     const port = Number(address.slice(address.lastIndexOf(":") + 1));
-    if (Number.isInteger(port) && port > 0 && !ports.includes(port)) ports.push(port);
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(port) || port <= 0) continue;
+    if (!listeners.some((l) => l.port === port && l.pid === pid)) listeners.push({ port, pid });
   }
-  return ports;
+  return listeners;
+}
+async function listCandidatePorts() {
+  return [...new Set((await listListeners()).map((l) => l.port))];
 }
 async function detectOpenCodePort(candidates) {
   for (const port of candidates ?? await listCandidatePorts()) {
@@ -7175,10 +7181,21 @@ async function detectOpenCodePort(candidates) {
   }
   throw new Error("opencode not found");
 }
-async function ensureOpenCodeServer() {
+async function ensureOpenCodeServer(opts = {}) {
+  let listeners = [];
   try {
-    return { port: await detectOpenCodePort() };
+    listeners = await (opts.listListeners ?? listListeners)();
   } catch {
+  }
+  for (const { port: port2, pid } of listeners) {
+    if (!await isHealthy(port2)) continue;
+    if (opts.ownedByShare?.(pid)) {
+      console.warn(
+        `bridge: not attaching to the opencode server on port ${port2} (pid ${pid}) \u2014 another share started it and ends it with that share; starting a separate one`
+      );
+      continue;
+    }
+    return { port: port2 };
   }
   const { spawn } = await import("node:child_process");
   const child = spawn("opencode", ["serve", "--hostname", "127.0.0.1"], {
@@ -8168,7 +8185,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
   } else if (opts.port !== void 0) {
     resolvedPort = opts.port;
   } else {
-    const ensured = await (opts.serverSpawner ?? ensureOpenCodeServer)();
+    const ensured = await (opts.serverSpawner ?? (() => ensureOpenCodeServer({ ownedByShare: (pid) => belongsToRunningShare(pid) })))();
     resolvedPort = ensured.port;
     spawnedServer = ensured.spawned;
   }
@@ -8376,6 +8393,38 @@ function isBridgeCommand(command) {
   const exec2 = command.trim().split(/\s+/)[0] ?? "";
   return NODE_EXEC_RE.test(exec2) && BRIDGE_ENTRY_RE.test(command);
 }
+function describeParent(pid) {
+  try {
+    const out = (0, import_node_child_process3.execFileSync)("ps", ["-p", String(pid), "-o", "ppid=,command="], {
+      encoding: "utf8",
+      timeout: 2e3,
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+    const m = /^\s*(\d+)\s+(\S.*)$/.exec(out.split("\n")[0] ?? "");
+    return m ? { ppid: Number(m[1]), command: m[2].trim() } : null;
+  } catch {
+    return null;
+  }
+}
+var SHARE_ANCESTRY_DEPTH = 4;
+function belongsToRunningShare(pid, inspect = describeParent) {
+  const lookup = (p) => {
+    try {
+      return inspect(p);
+    } catch {
+      return null;
+    }
+  };
+  let entry = lookup(pid);
+  for (let depth = 0; entry && depth < SHARE_ANCESTRY_DEPTH; depth++) {
+    const parentPid = entry.ppid;
+    if (!(parentPid > 1)) return false;
+    if (parentPid === process.pid) return true;
+    entry = lookup(parentPid);
+    if (entry && isBridgeCommand(entry.command)) return true;
+  }
+  return false;
+}
 function refuseToSignal(snapshot, startedAt) {
   if (!snapshot) return "no such process (already gone)";
   if (!isBridgeCommand(snapshot.command)) {
@@ -8563,6 +8612,7 @@ if (invokedDirectly) {
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
+  belongsToRunningShare,
   startBridge,
   stopBridge,
   terminateBridgeProcess,
