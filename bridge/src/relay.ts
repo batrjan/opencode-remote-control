@@ -2,7 +2,7 @@ import type { Socket } from 'node:net'
 import { gzip } from 'node:zlib'
 import WebSocket from 'ws'
 import type { OpencodeClient } from './opencode.js'
-import { backoffDelay, eventHighWaterBytes, eventRetryMs, wsPingIntervalMs } from './config.js'
+import { backoffDelay, eventHighWaterBytes, eventRetryMs, wsHandshakeTimeoutMs, wsPingIntervalMs } from './config.js'
 
 /**
  * Client for the public relay's bridge-facing session API.
@@ -308,6 +308,17 @@ function warnFailedRelayMessage(err: unknown): void {
 }
 
 /**
+ * Log a failed re-dial of the relay. Failures used to be silent, which is how
+ * a share that stopped reconnecting left nothing in the log. A relay that is
+ * down for hours must not flood it either, so only attempts 1, 2, 4, 8, … of
+ * one outage are reported; the count starts over once a dial succeeds.
+ */
+function warnFailedRedial(attempt: number, err: unknown): void {
+  if (attempt < 1 || (attempt & (attempt - 1)) !== 0) return
+  console.warn(`bridge: relay re-dial #${attempt} failed: ${err instanceof Error ? err.message : 'unknown error'} — retrying`)
+}
+
+/**
  * Report a refused proxy request exactly once. A relay that asks for something
  * outside the contract is either compromised or newer than this bridge — both
  * are worth seeing in the terminal instead of failing silently.
@@ -461,6 +472,16 @@ export class RelayWSClient {
     return new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(url, {
         headers: { 'x-bridge-token': this.bridgeToken! },
+        // Nothing else watches a socket that has not opened: keep-alive starts
+        // at 'open', ws sets no deadline unless asked, and the next re-dial is
+        // only scheduled once this one fails. A dial whose bytes were delivered
+        // but never answered (the laptop slept or switched networks right
+        // after, a captive portal holding :443, an upgrade nginx accepted and
+        // sat on) stayed CONNECTING for good, and the share with it, silently.
+        // Timing out makes it an ordinary transport error the backoff retries.
+        // ws clears the timeout once the upgrade succeeds, so an open link,
+        // however quiet, is never cut by it.
+        handshakeTimeout: wsHandshakeTimeoutMs(),
       })
       this.ws = ws
       // Per socket: a relay announces what it understands in its first frame,
@@ -627,7 +648,10 @@ export class RelayWSClient {
           if (!this.forwardingEvents) this.startEventForwarding().catch(() => this.scheduleEventRestart())
           this.onReconnect?.()
         })
-        .catch(() => this.scheduleReconnect())
+        .catch((err) => {
+          warnFailedRedial(this.reconnectAttempt, err)
+          this.scheduleReconnect()
+        })
     }, backoffDelay(this.reconnectAttempt))
     timer.unref?.()
     this.reconnectTimer = timer

@@ -7100,6 +7100,10 @@ function watchdogIntervalMs() {
   const v = Number(process.env.REMOTE_CONTROL_WATCHDOG_INTERVAL_MS);
   return Number.isFinite(v) && v > 0 ? v : config.watchdogIntervalMs;
 }
+function wsHandshakeTimeoutMs() {
+  const v = Number(process.env.REMOTE_CONTROL_WS_HANDSHAKE_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : 15e3;
+}
 function reconnectBaseMs() {
   return Number(process.env.REMOTE_CONTROL_RECONNECT_BASE_MS ?? 1e3);
 }
@@ -7521,6 +7525,10 @@ function warnFailedRelayMessage(err) {
   if (++failedRelayMessages > MAX_LOGGED_REJECTIONS) return;
   console.warn(`bridge: failed to handle a relay message: ${err instanceof Error ? err.message : "unknown error"}`);
 }
+function warnFailedRedial(attempt, err) {
+  if (attempt < 1 || (attempt & attempt - 1) !== 0) return;
+  console.warn(`bridge: relay re-dial #${attempt} failed: ${err instanceof Error ? err.message : "unknown error"} \u2014 retrying`);
+}
 function warnRejectedProxyRequest(method, path3) {
   const key = `${method} ${path3.split(/[?#]/)[0] ?? ""}`;
   if (warnedRejections.has(key) || warnedRejections.size >= MAX_LOGGED_REJECTIONS) return;
@@ -7593,7 +7601,17 @@ var RelayWSClient = class {
     const url = `${base}/bridge?session_id=${encodeURIComponent(session_id)}`;
     return new Promise((resolve, reject) => {
       const ws = new wrapper_default(url, {
-        headers: { "x-bridge-token": this.bridgeToken }
+        headers: { "x-bridge-token": this.bridgeToken },
+        // Nothing else watches a socket that has not opened: keep-alive starts
+        // at 'open', ws sets no deadline unless asked, and the next re-dial is
+        // only scheduled once this one fails. A dial whose bytes were delivered
+        // but never answered (the laptop slept or switched networks right
+        // after, a captive portal holding :443, an upgrade nginx accepted and
+        // sat on) stayed CONNECTING for good, and the share with it, silently.
+        // Timing out makes it an ordinary transport error the backoff retries.
+        // ws clears the timeout once the upgrade succeeds, so an open link,
+        // however quiet, is never cut by it.
+        handshakeTimeout: wsHandshakeTimeoutMs()
       });
       this.ws = ws;
       this.relayAcceptsGzip = false;
@@ -7724,7 +7742,10 @@ var RelayWSClient = class {
       this.dial().then(() => {
         if (!this.forwardingEvents) this.startEventForwarding().catch(() => this.scheduleEventRestart());
         this.onReconnect?.();
-      }).catch(() => this.scheduleReconnect());
+      }).catch((err) => {
+        warnFailedRedial(this.reconnectAttempt, err);
+        this.scheduleReconnect();
+      });
     }, backoffDelay(this.reconnectAttempt));
     timer.unref?.();
     this.reconnectTimer = timer;

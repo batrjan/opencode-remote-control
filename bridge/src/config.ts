@@ -36,6 +36,19 @@ export function watchdogIntervalMs(): number {
   return Number.isFinite(v) && v > 0 ? v : config.watchdogIntervalMs
 }
 
+/**
+ * Deadline for the relay WebSocket's opening handshake: DNS, TCP connect, TLS
+ * and the HTTP upgrade. ws applies it as an idle timeout on the socket, so it
+ * only fires once nothing has crossed it for this long. The whole handshake is
+ * a few kilobytes, which even a 0.7 Mbit/s uplink moves in well under a
+ * second; it stays below the plugin's 30 s wait for a starting bridge, so a
+ * stalled first dial fails and cleans up before the plugin gives up on it.
+ */
+export function wsHandshakeTimeoutMs(): number {
+  const v = Number(process.env.REMOTE_CONTROL_WS_HANDSHAKE_TIMEOUT_MS)
+  return Number.isFinite(v) && v > 0 ? v : 15_000
+}
+
 /** First reconnect delay; doubles per attempt up to reconnectMaxMs. */
 export function reconnectBaseMs(): number {
   return Number(process.env.REMOTE_CONTROL_RECONNECT_BASE_MS ?? 1_000)
