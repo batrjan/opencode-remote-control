@@ -270,6 +270,12 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     try {
       const out = await bridge.request(session_id, { method, path, body }, timeout)
       const payload = transform ? transform(out.body, out.contentType) : out.body
+      // A paged transcript names its older page only in this header; without
+      // it the web UI shows the newest page as the whole history and never
+      // offers to load more. Same-origin, so no Access-Control-Expose-Headers.
+      // Link is not forwarded (the bridge keeps it: it names the owner's local
+      // opencode URL and project directory).
+      if (out.nextCursor) res.set('X-Next-Cursor', out.nextCursor)
       res
         .status(out.status)
         .type(out.contentType ?? 'application/json')

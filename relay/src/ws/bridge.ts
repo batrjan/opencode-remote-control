@@ -12,14 +12,17 @@ import { bridgeReconnectWaitMs, wsPingIntervalMs, wsPongGraceRounds } from '../c
  * against the salted hash in the store). Afterwards the socket carries:
  *
  *   relay → bridge: { type: 'proxy', request_id, method, path, body? }
- *   bridge → relay: { type: 'proxy_response', request_id, status, contentType, body }
+ *   bridge → relay: { type: 'proxy_response', request_id, status, contentType, nextCursor?, body }
  *   bridge → relay: { type: 'event', data }   (opencode SSE event, re-emitted
  *                                            to viewers by the SSE endpoint)
  *   relay → bridge: { type: 'hello', features: ['gzip-body'] }   (first frame)
  *   bridge → relay: binary [u32 header length][header JSON][gzip body], header
  *                   { type: 'proxy_response', request_id, status, contentType,
- *                     encoding: 'gzip' }   — only after the hello; see
- *                   onCompressedResponse
+ *                     nextCursor?, encoding: 'gzip' }   — only after the hello;
+ *                   see onCompressedResponse
+ *
+ * nextCursor is opencode's X-Next-Cursor (see ProxyResponse). An older bridge
+ * never sends it and an older relay ignores it.
  */
 
 /**
@@ -47,7 +50,25 @@ export interface ProxyRequest {
 export interface ProxyResponse {
   status: number
   contentType?: string
+  /**
+   * opencode's X-Next-Cursor: the one place a paged transcript names its older
+   * page (the body is a bare array). Already checked by nextCursorOf.
+   */
+  nextCursor?: string
   body: string
+}
+
+/**
+ * A pagination cursor as opencode mints it: base64(url) of a small JSON
+ * object, well under a hundred characters. The value comes from a bridge,
+ * which can be anyone, and is reflected into the viewer's response headers —
+ * so anything that is not a plain token of sane length is dropped rather than
+ * forwarded (a CR/LF would inject a header or make the response throw).
+ */
+const NEXT_CURSOR_RE = /^[A-Za-z0-9_\-+/=.]{1,1024}$/
+
+function nextCursorOf(value: unknown): string | undefined {
+  return typeof value === 'string' && NEXT_CURSOR_RE.test(value) ? value : undefined
 }
 
 interface PendingRequest {
@@ -464,7 +485,14 @@ export class BridgeClient {
     if (!Buffer.isBuffer(raw) || raw.length < 4) return
     const headerLength = raw.readUInt32BE(0)
     if (headerLength > GZIP_MAX_HEADER_BYTES || 4 + headerLength > raw.length) return
-    let header: { type?: unknown; request_id?: unknown; status?: unknown; contentType?: unknown; encoding?: unknown }
+    let header: {
+      type?: unknown
+      request_id?: unknown
+      status?: unknown
+      contentType?: unknown
+      nextCursor?: unknown
+      encoding?: unknown
+    }
     try {
       header = JSON.parse(raw.subarray(4, 4 + headerLength).toString('utf8'))
     } catch {
@@ -489,6 +517,7 @@ export class BridgeClient {
       pending.resolve({
         status: typeof header.status === 'number' ? header.status : 502,
         contentType: typeof header.contentType === 'string' ? header.contentType : undefined,
+        nextCursor: nextCursorOf(header.nextCursor),
         body: body.toString('utf8'),
       })
     } catch (err) {
@@ -535,6 +564,7 @@ export class BridgeClient {
       pending.resolve({
         status: typeof msg.status === 'number' ? msg.status : 502,
         contentType: typeof msg.contentType === 'string' ? msg.contentType : undefined,
+        nextCursor: nextCursorOf(msg.nextCursor),
         body: typeof msg.body === 'string' ? msg.body : JSON.stringify(msg.body ?? null),
       })
       return

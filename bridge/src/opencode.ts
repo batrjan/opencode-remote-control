@@ -103,6 +103,13 @@ export class OpencodeClient {
    * Generic pass-through used by the relay WS proxy: executes an arbitrary
    * allowlisted request and returns the raw body plus content-type so the
    * relay can forward them verbatim.
+   *
+   * Of the other response headers only X-Next-Cursor goes along. opencode
+   * pages a transcript (GET /session/:id/message?limit=N) and names the older
+   * page nowhere else — the body is a bare array — so without it the web UI
+   * takes the newest page for the whole history and a viewer never sees past
+   * it. Link carries the same cursor but also this machine's opencode URL and
+   * the absolute project directory, so it stays here.
    */
   async request(method: string, path: string, body?: unknown) {
     // Long-poll endpoints (opencode holds them open until an event arrives)
@@ -123,6 +130,7 @@ export class OpencodeClient {
       return {
         status: res.status,
         contentType: res.headers.get('content-type') ?? 'application/json',
+        nextCursor: res.headers.get('x-next-cursor') ?? undefined,
         body: await res.text(),
       }
     } finally {

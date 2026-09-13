@@ -7314,6 +7314,13 @@ var OpencodeClient = class {
    * Generic pass-through used by the relay WS proxy: executes an arbitrary
    * allowlisted request and returns the raw body plus content-type so the
    * relay can forward them verbatim.
+   *
+   * Of the other response headers only X-Next-Cursor goes along. opencode
+   * pages a transcript (GET /session/:id/message?limit=N) and names the older
+   * page nowhere else — the body is a bare array — so without it the web UI
+   * takes the newest page for the whole history and a viewer never sees past
+   * it. Link carries the same cursor but also this machine's opencode URL and
+   * the absolute project directory, so it stays here.
    */
   async request(method, path3, body) {
     const isLongPoll = path3.startsWith("/permission/request") || path3.startsWith("/question");
@@ -7332,6 +7339,7 @@ var OpencodeClient = class {
       return {
         status: res.status,
         contentType: res.headers.get("content-type") ?? "application/json",
+        nextCursor: res.headers.get("x-next-cursor") ?? void 0,
         body: await res.text()
       };
     } finally {
@@ -7920,7 +7928,14 @@ var RelayWSClient = class {
       const worthIt = compressed !== null && compressed.length < raw.length * 0.9 && raw.length <= compressed.length * GZIP_MAX_RATIO && raw.length <= GZIP_MAX_OUTPUT_BYTES;
       if (worthIt && this.relayAcceptsGzip && this.ws?.readyState === wrapper_default.OPEN) {
         const header = Buffer.from(
-          JSON.stringify({ type: "proxy_response", request_id, status: out.status, contentType: out.contentType, encoding: "gzip" })
+          JSON.stringify({
+            type: "proxy_response",
+            request_id,
+            status: out.status,
+            contentType: out.contentType,
+            nextCursor: out.nextCursor,
+            encoding: "gzip"
+          })
         );
         const prefix = Buffer.alloc(4);
         prefix.writeUInt32BE(header.length, 0);

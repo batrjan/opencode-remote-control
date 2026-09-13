@@ -438,7 +438,7 @@ function outboundCounters(socket: Socket | null): { pending: number; flushed: nu
  * After connect() the socket carries (see relay/src/ws/bridge.ts):
  *   relay → bridge: { type: 'hello', features }  (first frame; newer relays only)
  *   relay → bridge: { type: 'proxy', request_id, method, path, body? }
- *   bridge → relay: { type: 'proxy_response', request_id, status, contentType, body }
+ *   bridge → relay: { type: 'proxy_response', request_id, status, contentType, nextCursor?, body }
  *                   or, once the hello offered 'gzip-body', a binary frame
  *                   (see sendProxyResponse)
  *   bridge → relay: { type: 'event', data }  (from startEventForwarding)
@@ -816,7 +816,7 @@ export class RelayWSClient {
    */
   private async sendProxyResponse(
     request_id: string,
-    out: { status: number; contentType?: string; body: string },
+    out: { status: number; contentType?: string; nextCursor?: string; body: string },
   ): Promise<void> {
     if (this.relayAcceptsGzip && out.body.length >= GZIP_MIN_BYTES) {
       const raw = Buffer.from(out.body, 'utf8')
@@ -832,7 +832,14 @@ export class RelayWSClient {
       // whose relay has not (or not yet) announced support.
       if (worthIt && this.relayAcceptsGzip && this.ws?.readyState === WebSocket.OPEN) {
         const header = Buffer.from(
-          JSON.stringify({ type: 'proxy_response', request_id, status: out.status, contentType: out.contentType, encoding: 'gzip' }),
+          JSON.stringify({
+            type: 'proxy_response',
+            request_id,
+            status: out.status,
+            contentType: out.contentType,
+            nextCursor: out.nextCursor,
+            encoding: 'gzip',
+          }),
         )
         const prefix = Buffer.alloc(4)
         prefix.writeUInt32BE(header.length, 0)

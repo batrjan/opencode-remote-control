@@ -26,6 +26,17 @@ beforeAll(async () => {
       res.end(JSON.stringify([{ id: 'sess1', directory: '/path' }]))
       return
     }
+    // opencode 1.18.30 names the next (older) page of a transcript only here.
+    if (req.url === '/session/sess1/message?limit=2') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'X-Next-Cursor': 'CUR' })
+      res.end(JSON.stringify([{ info: { id: 'm2' }, parts: [] }]))
+      return
+    }
+    if (req.url === '/session/sess1/message?limit=200') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify([{ info: { id: 'm1' }, parts: [] }]))
+      return
+    }
     res.writeHead(404)
     res.end()
   })
@@ -41,4 +52,19 @@ test('get sessions', async () => {
   const client = new OpencodeClient(url, 'opencode', 'password')
   const sessions = await client.getSessions()
   expect(sessions.length).toBeGreaterThan(0)
+})
+
+/**
+ * The web UI learns that older messages exist only from X-Next-Cursor, so the
+ * pass-through must hand it on; without it a viewer never saw past the last
+ * 20 messages of a shared session (see relay/test/next-cursor.test.ts).
+ */
+test('request passes on the pagination cursor of a message page', async () => {
+  const client = new OpencodeClient(url, 'opencode', 'password')
+  const paged = await client.request('GET', '/session/sess1/message?limit=2')
+  expect(paged.status).toBe(200)
+  expect(paged.nextCursor).toBe('CUR')
+  const last = await client.request('GET', '/session/sess1/message?limit=200')
+  expect(last.status).toBe(200)
+  expect(last.nextCursor).toBeUndefined()
 })
