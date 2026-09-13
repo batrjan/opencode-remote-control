@@ -23,6 +23,10 @@ import { BridgeClient } from '../src/ws/bridge'
 
 process.env.RELAY_SSE_HEARTBEAT_MS = '50'
 process.env.ACTIVATE_FAIL_DELAY_MS = '0'
+// The backlog this test builds is far past the per-viewer cap, which would drop
+// the slow viewer before its revocation and skip the path under test. The cap
+// has its own test (sse-backpressure.test.ts); lift it out of the way here.
+process.env.RELAY_SSE_MAX_BUFFER_BYTES = String(1024 ** 3)
 
 let relay: http.Server
 let relayUrl: string

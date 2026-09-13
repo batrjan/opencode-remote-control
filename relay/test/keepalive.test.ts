@@ -147,10 +147,12 @@ test('heartbeats on /global/event use the wrapped envelope', async () => {
 }, 10_000)
 
 test('an empty or garbage keep-alive env var falls back to the default, never 0', async () => {
-  const { sseRetryMs, sseHeartbeatMs, wsPingIntervalMs, wsPongGraceRounds } = await import('../src/config')
+  const { sseRetryMs, sseHeartbeatMs, sseMaxBufferBytes, wsPingIntervalMs, wsPongGraceRounds } = await import('../src/config')
   for (const [key, fn, def] of [
     ['RELAY_SSE_RETRY_MS', sseRetryMs, 3000],
     ['RELAY_SSE_HEARTBEAT_MS', sseHeartbeatMs, 15_000],
+    // 0 here would drop every viewer on its first event.
+    ['RELAY_SSE_MAX_BUFFER_BYTES', sseMaxBufferBytes, 2 * 1024 * 1024],
     ['RELAY_WS_PING_INTERVAL_MS', wsPingIntervalMs, 25_000],
     ['RELAY_WS_PONG_GRACE_ROUNDS', wsPongGraceRounds, 2],
   ] as const) {

@@ -3,7 +3,7 @@ import express from 'express'
 import type { Request, Response } from 'express'
 import type { Store, Session } from '../store.js'
 import type { BridgeClient } from '../ws/bridge.js'
-import { config, sseHeartbeatMs, sseRetryMs } from '../config.js'
+import { config, sseHeartbeatMs, sseMaxBufferBytes, sseRetryMs } from '../config.js'
 
 /**
  * HTTP → WS → opencode proxy adapter, mounted at the server ROOT.
@@ -581,13 +581,31 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       unsubscribe()
       if (!res.writableEnded) res.end()
     }
+    // A viewer that stops reading is dropped, not buffered for. Nothing here
+    // used to look at whether the viewer kept up: every event it did not take
+    // waited in this process, so one stuck phone grew by the full rate of the
+    // owner's output and 64 stuck streams on one token ran the relay out of
+    // memory — every share on it went down. Check after each write, so no
+    // stream ever holds more than the cap. Destroy rather than endStream():
+    // end() only queues the closing chunk BEHIND the backlog, so a peer that is
+    // not reading keeps every queued byte, and its stream slot, for as long as
+    // its TCP connection lives. Destroying frees both at once, and the viewer
+    // sees its stream fail and reconnects.
+    const maxBuffer = sseMaxBufferBytes()
+    const send = (frame: string) => {
+      res.write(frame)
+      if (res.writableLength <= maxBuffer) return
+      clearInterval(heartbeat)
+      unsubscribe()
+      res.destroy()
+    }
     const heartbeat = setInterval(() => {
-      if (res.writableEnded) return
+      if (res.writableEnded || res.destroyed) return
       if (!viewerToken || !store.verifyViewer(session.id, viewerToken)) {
         endStream()
         return
       }
-      res.write(`data: ${envelope(JSON.stringify(heartbeatEvent()))}\n\n`)
+      send(`data: ${envelope(JSON.stringify(heartbeatEvent()))}\n\n`)
     }, sseHeartbeatMs())
     heartbeat.unref?.()
     res.on('close', () => clearInterval(heartbeat))
@@ -603,7 +621,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       // live. Fail closed on unparseable payloads.
       if (!eventBelongsToSession(data, session.id)) return
       // SSE-safe: prefix every line of a (possibly multi-line) payload.
-      res.write(
+      send(
         envelope(data)
           .split('\n')
           .map((line) => `data: ${line}`)

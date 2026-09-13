@@ -176,6 +176,27 @@ export function sseHeartbeatMs(): number {
 }
 
 /**
+ * Most one viewer's SSE stream may hold queued in the relay, unread, before
+ * that viewer is dropped (it reconnects on its own).
+ *
+ * Behind nginx with proxy_buffering off, a viewer that stops reading pushes
+ * back straight onto the relay, and every event it has not taken waits in
+ * this process. Without a cap one stuck phone grew by the full rate of the
+ * owner's output, and 64 streams on a single viewer token multiplied that
+ * into an out-of-memory crash of the relay and every share on it.
+ *
+ * The cap is also the largest single event a viewer can still be sent, so it
+ * cannot be tiny; but a session's 64 streams can all sit just under it at once,
+ * so it cannot be generous either. At 4 MiB those 64 streams alone filled a
+ * 256 MB heap and the relay still died; 2 MiB held under the same sustained
+ * attack. Counted the way Node counts a write backlog (string length), so it
+ * is approximate in bytes.
+ */
+export function sseMaxBufferBytes(): number {
+  return envInt('RELAY_SSE_MAX_BUFFER_BYTES', 2 * 1024 * 1024)
+}
+
+/**
  * Optional admin key. No longer required for the public session API
  * (registration is public + rate-limited; deletion requires the session's
  * bridge_token). Kept only for backward compatibility with older bridges.
