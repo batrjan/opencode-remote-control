@@ -3,6 +3,7 @@ import express from 'express'
 import type { Request, Response } from 'express'
 import type { Store, Session } from '../store.js'
 import type { BridgeClient } from '../ws/bridge.js'
+import { setViewerCookie } from '../api/viewerCookie.js'
 import { bridgeReconnectWaitMs, config, promptTimeoutMs, sseHeartbeatMs, sseMaxBufferBytes, sseRetryMs } from '../config.js'
 
 /**
@@ -253,13 +254,20 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   function requireViewer(req: Request, res: Response): Session | undefined {
     const token = extractViewerToken(req)
     const session = token ? store.getSessionByViewerToken(token) : undefined
-    if (!session) {
+    if (!token || !session) {
       // Marked, so the UI shell's guard can tell this 401 from one the owner's
       // opencode answered (see VIEWER_AUTH_HEADER).
       res.setHeader(VIEWER_AUTH_HEADER, VIEWER_AUTH_INVALID)
       res.status(401).json({ error: 'invalid viewer token' })
       return undefined
     }
+    // The lookup just slid the token's idle window; slide the cookie with it,
+    // or the browser drops it a fixed time after the join however active the
+    // viewer is (see setViewerCookie). Nothing is written yet, so an event
+    // stream's headers carry it too. Only a token that came from the cookie:
+    // a caller using the header never had one, and the header's token must not
+    // replace a cookie that client holds for another activation.
+    if (!req.get('x-viewer-token')) setViewerCookie(res, token)
     return session
   }
 

@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { Store } from './store.js'
 import { activateRouter } from './api/activate.js'
+import { setViewerCookie } from './api/viewerCookie.js'
 import { healthRouter } from './api/health.js'
 import { skillRouter } from './api/skill.js'
 import { BridgeClient } from './ws/bridge.js'
@@ -244,6 +245,10 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
     if (!session) return res.status(404).type('html').send(endedHtml())
     const token = cookieViewerToken(req)
     if (token && store.verifyViewer(session.id, token)) {
+      // verifyViewer slid the token's idle window: send the cookie again so it
+      // slides too, as the proxy does on every API call. Same on the two UI
+      // routes below (see setViewerCookie).
+      setViewerCookie(res, token)
       return res.redirect(sessionUiUrl(session))
     }
     return res.type('html').send(joinHtml(session.id))
@@ -257,6 +262,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
     if (!session) return res.status(404).type('html').send(endedHtml())
     const token = cookieViewerToken(req)
     if (token && store.verifyViewer(session.id, token)) {
+      setViewerCookie(res, token)
       return res.type('html').send(terminalHtml())
     }
     return res.redirect(`/${session.id}`)
@@ -270,6 +276,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
     if (!session) return res.status(404).type('html').send(endedHtml())
     const token = cookieViewerToken(req)
     if (token && store.verifyViewer(session.id, token)) {
+      setViewerCookie(res, token)
       return res.type('html').send(terminalHtml())
     }
     return res.redirect(`/${session.id}`)

@@ -1,10 +1,14 @@
 import { afterEach, expect, test, vi } from 'vitest'
+import http from 'node:http'
+import type { AddressInfo } from 'node:net'
 import express from 'express'
 import request from 'supertest'
 import { Store } from '../src/store'
 import { config } from '../src/config'
 import { skillRouter } from '../src/api/skill'
 import { activateRouter } from '../src/api/activate'
+import { createApp } from '../src/server'
+import type { BridgeClient } from '../src/ws/bridge'
 
 /**
  * Viewer-token lifecycle.
@@ -313,13 +317,157 @@ test('the viewer cookie carries an explicit lifetime and path', async () => {
   const setCookie = res.headers['set-cookie'] as unknown as string[]
   const cookie = setCookie.find((c) => c.startsWith('viewer_token='))!
   // Was a browser-session cookie: it died on browser restart while the token
-  // stayed valid server-side, bouncing the viewer back to the join page.
-  expect(cookie).toContain(`Max-Age=${Math.round(config.viewerIdleTtlMs / 1000)}`)
+  // stayed valid server-side, bouncing the viewer back to the join page. It
+  // outlives the token's idle window: an open event stream slides the token
+  // with no response to renew the cookie on.
+  expect(maxAgeMs(cookie)).toBeGreaterThan(config.viewerIdleTtlMs)
   expect(cookie).toContain('Path=/')
   expect(cookie).toContain('HttpOnly')
   expect(cookie).toContain('Secure')
   expect(cookie).toContain('SameSite=Strict')
 })
+
+/**
+ * A viewer who keeps using a share must keep their way in.
+ *
+ * The token slides at the relay: every use moves its expiry forward. The
+ * cookie that carries it was set exactly once, at activation, with a Max-Age
+ * equal to that window, and a browser counts Max-Age from the moment the cookie
+ * arrives. Nothing ever sent it again, so a viewer who used the share every
+ * hour lost the cookie exactly 24 h after joining, while the token in it was
+ * still valid. From then on every request answered 401 and a reload landed on
+ * the code-entry page; only the event stream, opened with the token before the
+ * cookie went, kept the page looking alive. Someone coming back to a share each
+ * day was asked for the code again a day after first joining, an hour after
+ * they last used it.
+ */
+test('a viewer who keeps using the share keeps their cookie past the lifetime it was issued with', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  const store = new Store()
+  const app = createApp(store, stubBridge())
+  const { access_code } = store.createSession('ses_renew', '/work', 'title', '1.1.1.1')
+  const shell = `/${Buffer.from('/work', 'utf8').toString('base64url')}/session/ses_renew`
+  const jar = new CookieJar()
+
+  const joined = await request(app).post('/api/activate').send({ code: access_code, session_id: 'ses_renew' })
+  expect(joined.status).toBe(200)
+  jar.take(joined)
+  const issuedUntil = jar.expires!
+
+  // What a returning viewer does: load the UI shell, read, send a prompt.
+  const visit = [
+    { name: 'UI shell', status: 200, send: () => request(app).get(shell) },
+    { name: 'GET /session', status: 200, send: () => request(app).get('/session/ses_renew') },
+    {
+      name: 'POST prompt_async',
+      status: 204,
+      send: () => request(app).post('/session/ses_renew/prompt_async').send({ parts: [] }),
+    },
+  ]
+  // One visit every 23 h, always inside the token's idle window, until well
+  // past the moment the cookie issued at join would have lapsed.
+  while (Date.now() <= issuedUntil + 2 * config.viewerIdleTtlMs) {
+    vi.setSystemTime(Date.now() + config.viewerIdleTtlMs - 3_600_000)
+    const at = `${Math.round((Date.now() - issuedUntil) / 3_600_000)} h after the join cookie's expiry`
+    for (const step of visit) {
+      const cookie = jar.header()
+      expect(cookie, `${step.name}, ${at}: the browser still has the cookie`).toBeDefined()
+      const res = await step.send().set('Cookie', cookie!)
+      expect(res.status, `${step.name}, ${at}`).toBe(step.status)
+      // Renewed once per response (the POST path checks the viewer twice),
+      // and never for less than the token's own idle window.
+      const renewed = viewerCookies(res.headers['set-cookie'])
+      expect(renewed, `${step.name}, ${at}: cookie renewed`).toHaveLength(1)
+      expect(maxAgeMs(renewed[0]!)).toBeGreaterThanOrEqual(config.viewerIdleTtlMs)
+      jar.take(res)
+    }
+  }
+  expect(store.verifyViewer('ses_renew', decodeURIComponent(jar.header()!.slice('viewer_token='.length)))).toBe(true)
+})
+
+/**
+ * The event stream renews the cookie as well: a tab's stream reconnects are
+ * requests like any other, and its headers go out before the first frame.
+ * A caller that authenticates with x-viewer-token never had the cookie, and
+ * is not handed one: the header's token must not replace whatever cookie that
+ * client may hold for another activation.
+ */
+test('the event stream renews the viewer cookie; a request authenticated by header gets none', async () => {
+  const store = new Store()
+  const app = createApp(store, stubBridge())
+  const { access_code } = store.createSession('ses_renew2', '/work', 'title', '1.1.1.1')
+  const { viewer_token } = store.activate(access_code, 'ses_renew2')
+
+  const byHeader = await request(app).get('/session/ses_renew2').set('x-viewer-token', viewer_token)
+  expect(byHeader.status).toBe(200)
+  expect(byHeader.headers['set-cookie']).toBeUndefined()
+
+  const server = http.createServer(app)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const { port } = server.address() as AddressInfo
+    const headers = await new Promise<http.IncomingHttpHeaders>((resolve, reject) => {
+      const req = http.get(
+        { host: '127.0.0.1', port, path: '/global/event', headers: { cookie: `viewer_token=${viewer_token}` } },
+        (res) => {
+          resolve(res.headers)
+          res.destroy()
+        },
+      )
+      req.on('error', reject)
+    })
+    expect(headers['content-type']).toContain('text/event-stream')
+    const renewed = viewerCookies(headers['set-cookie'])
+    expect(renewed).toHaveLength(1)
+    expect(renewed[0]).toContain(`viewer_token=${encodeURIComponent(viewer_token)};`)
+  } finally {
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})
+
+/**
+ * Just enough of a browser's cookie store for viewer_token: Max-Age counts from
+ * the moment the cookie arrives (RFC 6265 5.2.2), an expired cookie is not
+ * sent, and a later Set-Cookie replaces the earlier one.
+ */
+class CookieJar {
+  private value?: string
+  expires?: number
+  take(res: request.Response): void {
+    for (const c of viewerCookies(res.headers['set-cookie'])) {
+      this.value = c.slice('viewer_token='.length, c.indexOf(';'))
+      const maxAge = maxAgeMs(c)
+      this.expires = maxAge === undefined ? undefined : Date.now() + maxAge
+    }
+  }
+  header(): string | undefined {
+    if (this.value === undefined) return undefined
+    if (this.expires !== undefined && Date.now() >= this.expires) return undefined
+    return `viewer_token=${this.value}`
+  }
+}
+
+function viewerCookies(header: string | string[] | undefined): string[] {
+  if (header === undefined) return []
+  return (Array.isArray(header) ? header : [header]).filter((c) => c.startsWith('viewer_token='))
+}
+
+function maxAgeMs(cookie: string): number | undefined {
+  const m = /;\s*Max-Age=(\d+)/i.exec(cookie)
+  return m ? Number(m[1]) * 1000 : undefined
+}
+
+/** Answers every proxied request the way opencode would; no socket, no events. */
+function stubBridge(): BridgeClient {
+  return {
+    request: async (_session: string, req: { method: string }) =>
+      req.method === 'POST' ? { status: 204, body: '' } : { status: 200, contentType: 'application/json', body: '{}' },
+    subscribeEvents: () => () => {},
+    onReconnect: () => () => {},
+    waitForConnection: async () => true,
+  } as unknown as BridgeClient
+}
 
 function skillApp(store: Store) {
   const app = express()
