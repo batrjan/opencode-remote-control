@@ -566,11 +566,22 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // stream within one heartbeat. It also slides last_used, which is correct:
     // a viewer holding an open stream is present, not idle.
     const viewerToken = extractViewerToken(req)
+    let unsubscribe: () => void = () => {}
+    // Stop feeding the stream BEFORE ending it. The subscription used to be
+    // dropped only on the request's 'close', which follows the response's
+    // flush — seconds away for a slow client — and an event arriving in that
+    // gap was written to an ended response. Node raises that as an 'error' on
+    // the response, nothing listens, and an unhandled 'error' ends the process:
+    // one revoked viewer on a slow link took down the relay and every share.
+    const endStream = () => {
+      clearInterval(heartbeat)
+      unsubscribe()
+      if (!res.writableEnded) res.end()
+    }
     const heartbeat = setInterval(() => {
       if (res.writableEnded) return
       if (!viewerToken || !store.verifyViewer(session.id, viewerToken)) {
-        clearInterval(heartbeat)
-        res.end()
+        endStream()
         return
       }
       res.write(`data: ${envelope(JSON.stringify(heartbeatEvent()))}\n\n`)
@@ -578,7 +589,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     heartbeat.unref?.()
     res.on('close', () => clearInterval(heartbeat))
 
-    const unsubscribe = bridge.subscribeEvents(session.id, (data) => {
+    unsubscribe = bridge.subscribeEvents(session.id, (data) => {
+      // Belt and braces for the ordering above: whatever path ended the
+      // response, never write to it afterwards.
+      if (res.writableEnded || res.destroyed) return
       // The bridge forwards the instance-wide /event stream (filtered by
       // directory upstream, NOT by session). Forward only events that belong
       // to the viewer's session or carry no session at all (server heartbeats
@@ -594,6 +608,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       )
     })
     req.on('close', unsubscribe)
+    res.on('close', unsubscribe)
   }
 
   /** Live SSE streams per session id — the counter behind MAX_STREAMS_PER_SESSION. */

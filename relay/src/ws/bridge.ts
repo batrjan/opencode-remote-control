@@ -371,9 +371,11 @@ export class BridgeClient {
       this.eventListeners.set(session_id, set)
     }
     set.add(listener)
+    // Idempotent: a stream unsubscribes from more than one 'close' event, and a
+    // repeat call must not delete a set that has since replaced this one.
     return () => {
       set.delete(listener)
-      if (set.size === 0) this.eventListeners.delete(session_id)
+      if (set.size === 0 && this.eventListeners.get(session_id) === set) this.eventListeners.delete(session_id)
     }
   }
 

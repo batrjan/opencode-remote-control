@@ -256,3 +256,102 @@ test("frames the relay sends right after accepting are not lost to the liveness 
     relay.wss.close()
   }
 }, 10_000)
+
+test('a reconnect while opencode is down does not crash the bridge, and events resume once it is back', async () => {
+  // On every re-dial the client restarts event forwarding. That start used to
+  // be fired and forgotten: with opencode unreachable at that moment (restarting,
+  // or the machine waking up) its rejection went unhandled — and Node ends the
+  // process on an unhandled rejection. The share died on the very network blip
+  // the reconnect was there to survive.
+  const rejections: unknown[] = []
+  const onRejection = (reason: unknown) => rejections.push(reason)
+  process.on('unhandledRejection', onRejection)
+
+  const probe = createServer()
+  await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve))
+  const port = (probe.address() as AddressInfo).port
+  await new Promise((resolve) => probe.close(resolve)) // nothing listens there now
+
+  const wss = new WebSocketServer({ port: 0, path: '/bridge' })
+  await new Promise<void>((resolve) => wss.once('listening', resolve))
+  let connections = 0
+  wss.on('connection', (socket) => {
+    connections += 1
+    if (connections === 1) setTimeout(() => socket.terminate(), 30) // the blip
+  })
+  const ws = new RelayWSClient(
+    `http://127.0.0.1:${(wss.address() as AddressInfo).port}`,
+    new OpencodeClient(`http://127.0.0.1:${port}`, 'opencode', process.env.OPENCODE_SERVER_PASSWORD ?? ''),
+  )
+  let opencodeBack: Server | undefined
+  try {
+    await ws.connect('sess-reconnect-opencode-down', 'token')
+    const deadline = Date.now() + 3000
+    while (connections < 2 && Date.now() < deadline) await settle(10)
+    expect(connections).toBeGreaterThanOrEqual(2)
+    await settle(200) // several event-restart attempts against a dead port
+    expect(rejections).toEqual([])
+
+    // opencode comes back on its port: forwarding picks up on its own.
+    let subscribed = 0
+    opencodeBack = createServer((req, res) => {
+      if (req.url?.startsWith('/event')) {
+        subscribed += 1
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+        return
+      }
+      json(res, 200, {})
+    })
+    await new Promise<void>((resolve) => opencodeBack!.listen(port, '127.0.0.1', resolve))
+    const back = Date.now() + 3000
+    while (subscribed === 0 && Date.now() < back) await settle(20)
+    expect(subscribed).toBeGreaterThanOrEqual(1)
+    expect(rejections).toEqual([])
+  } finally {
+    ws.close()
+    wss.close()
+    opencodeBack?.closeAllConnections()
+    await new Promise((resolve) => (opencodeBack ? opencodeBack.close(resolve) : resolve(undefined)))
+    process.off('unhandledRejection', onRejection)
+  }
+}, 15_000)
+
+test('a malformed proxy request from the relay is refused, not a crash', async () => {
+  // The bridge does not trust the relay — that is why it keeps its own
+  // allowlist. But the allowlist itself called method.toUpperCase() outside any
+  // try, from a handler nobody awaited: one frame with a numeric method was an
+  // unhandled rejection, which ends the Node process and every share with it.
+  const rejections: unknown[] = []
+  const onRejection = (reason: unknown) => rejections.push(reason)
+  process.on('unhandledRejection', onRejection)
+  const answers = new Map<string, number>()
+  const wss = new WebSocketServer({ port: 0, path: '/bridge' })
+  await new Promise<void>((resolve) => wss.once('listening', resolve))
+  wss.on('connection', (socket) => {
+    socket.on('message', (raw) => {
+      const msg = JSON.parse(String(raw)) as { type: string; request_id?: string; status?: number }
+      if (msg.type === 'proxy_response') answers.set(msg.request_id!, msg.status!)
+    })
+    for (const [request_id, method, path] of [
+      ['bad-method', 7, '/session/sess-malformed/message'],
+      ['bad-path', 'GET', { toString: null }],
+      ['null-both', null, null],
+      ['array-path', 'GET', ['/session']],
+    ] as const) {
+      socket.send(JSON.stringify({ type: 'proxy', request_id, method, path }))
+    }
+    socket.send(JSON.stringify({ type: 'proxy', request_id: 'good', method: 'GET', path: '/session/sess-malformed/message' }))
+  })
+  const ws = bridge(`http://127.0.0.1:${(wss.address() as AddressInfo).port}`)
+  try {
+    await ws.connect('sess-malformed', 'token')
+    const deadline = Date.now() + 3000
+    while (answers.size < 5 && Date.now() < deadline) await settle(10)
+    expect(Object.fromEntries(answers)).toEqual({ 'bad-method': 403, 'bad-path': 403, 'null-both': 403, 'array-path': 403, good: 200 })
+    expect(rejections).toEqual([])
+  } finally {
+    ws.close()
+    wss.close()
+    process.off('unhandledRejection', onRejection)
+  }
+}, 10_000)

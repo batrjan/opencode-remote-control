@@ -299,6 +299,14 @@ export function isProxyRequestAllowed(
 const warnedRejections = new Set<string>()
 const MAX_LOGGED_REJECTIONS = 50
 
+let failedRelayMessages = 0
+
+/** Log a relay frame whose handling threw — a bug, so visible, but budgeted. */
+function warnFailedRelayMessage(err: unknown): void {
+  if (++failedRelayMessages > MAX_LOGGED_REJECTIONS) return
+  console.warn(`bridge: failed to handle a relay message: ${err instanceof Error ? err.message : 'unknown error'}`)
+}
+
 /**
  * Report a refused proxy request exactly once. A relay that asks for something
  * outside the contract is either compromised or newer than this bridge — both
@@ -526,7 +534,9 @@ export class RelayWSClient {
         this.scheduleReconnect()
       })
       ws.on('message', (raw) => {
-        void this.onMessage(raw)
+        // Never fire-and-forget: an unhandled rejection ends the Node process,
+        // so one frame this handler did not anticipate would take the share down.
+        this.onMessage(raw).catch(warnFailedRelayMessage)
       })
     })
   }
@@ -610,7 +620,11 @@ export class RelayWSClient {
           // The event stream is per-connection state on the relay side: a new
           // socket has no subscribers until we push again, and the local SSE
           // reader may have ended while we were offline.
-          if (!this.forwardingEvents) void this.startEventForwarding()
+          // Never fire-and-forget: opencode may be unreachable right now (it
+          // restarts, the machine wakes up), and an unhandled rejection ends
+          // the Node process — the share would die on the very blip this
+          // reconnect exists to survive. Failures retry like any lost stream.
+          if (!this.forwardingEvents) this.startEventForwarding().catch(() => this.scheduleEventRestart())
           this.onReconnect?.()
         })
         .catch(() => this.scheduleReconnect())
@@ -685,7 +699,7 @@ export class RelayWSClient {
   }
 
   private async onMessage(raw: WebSocket.RawData): Promise<void> {
-    let msg: { type?: string; request_id?: string; method?: string; path?: string; body?: unknown }
+    let msg: { type?: string; request_id?: string; method?: unknown; path?: unknown; body?: unknown }
     try {
       msg = JSON.parse(String(raw))
     } catch {
@@ -697,12 +711,17 @@ export class RelayWSClient {
       return
     }
     if (msg.type !== 'proxy' || typeof msg.request_id !== 'string') return
-    const method = msg.method ?? 'GET'
-    const path = msg.path ?? '/'
+    const method: unknown = msg.method ?? 'GET'
+    const path: unknown = msg.path ?? '/'
     // Check before opencode is touched at all: the relay does not get to pick
     // which verb runs against which local endpoint (see RELAY_PROXY_ROUTES).
-    if (!isProxyRequestAllowed(method, path, this.boundSessionId)) {
-      warnRejectedProxyRequest(method, path)
+    // Types first — both come off the wire from a relay this bridge does not
+    // trust, and the allowlist calls string methods on them.
+    if (typeof method !== 'string' || typeof path !== 'string' || !isProxyRequestAllowed(method, path, this.boundSessionId)) {
+      warnRejectedProxyRequest(
+        typeof method === 'string' ? method : `<${typeof method}>`,
+        typeof path === 'string' ? path : `<${typeof path}>`,
+      )
       this.send({
         type: 'proxy_response',
         request_id: msg.request_id,

@@ -7512,6 +7512,11 @@ function isProxyRequestAllowed(method, path3, boundSessionId) {
 }
 var warnedRejections = /* @__PURE__ */ new Set();
 var MAX_LOGGED_REJECTIONS = 50;
+var failedRelayMessages = 0;
+function warnFailedRelayMessage(err) {
+  if (++failedRelayMessages > MAX_LOGGED_REJECTIONS) return;
+  console.warn(`bridge: failed to handle a relay message: ${err instanceof Error ? err.message : "unknown error"}`);
+}
 function warnRejectedProxyRequest(method, path3) {
   const key = `${method} ${path3.split(/[?#]/)[0] ?? ""}`;
   if (warnedRejections.has(key) || warnedRejections.size >= MAX_LOGGED_REJECTIONS) return;
@@ -7639,7 +7644,7 @@ var RelayWSClient = class {
         this.scheduleReconnect();
       });
       ws.on("message", (raw) => {
-        void this.onMessage(raw);
+        this.onMessage(raw).catch(warnFailedRelayMessage);
       });
     });
   }
@@ -7713,7 +7718,7 @@ var RelayWSClient = class {
       this.reconnectTimer = null;
       if (this.stopped || this.fatal) return;
       this.dial().then(() => {
-        if (!this.forwardingEvents) void this.startEventForwarding();
+        if (!this.forwardingEvents) this.startEventForwarding().catch(() => this.scheduleEventRestart());
         this.onReconnect?.();
       }).catch(() => this.scheduleReconnect());
     }, backoffDelay(this.reconnectAttempt));
@@ -7796,8 +7801,11 @@ var RelayWSClient = class {
     if (msg.type !== "proxy" || typeof msg.request_id !== "string") return;
     const method = msg.method ?? "GET";
     const path3 = msg.path ?? "/";
-    if (!isProxyRequestAllowed(method, path3, this.boundSessionId)) {
-      warnRejectedProxyRequest(method, path3);
+    if (typeof method !== "string" || typeof path3 !== "string" || !isProxyRequestAllowed(method, path3, this.boundSessionId)) {
+      warnRejectedProxyRequest(
+        typeof method === "string" ? method : `<${typeof method}>`,
+        typeof path3 === "string" ? path3 : `<${typeof path3}>`
+      );
       this.send({
         type: "proxy_response",
         request_id: msg.request_id,
