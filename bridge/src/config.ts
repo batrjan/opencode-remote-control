@@ -42,6 +42,16 @@ export function eventRetryMs(): number {
 }
 
 /**
+ * Relay-socket send queue above which event forwarding stops reading from
+ * opencode until the queue drains. Sized for a slow uplink: at 2 Mbit/s one
+ * MiB is about four seconds — the most a viewer's request waits behind events.
+ */
+export function eventHighWaterBytes(): number {
+  const v = Number(process.env.REMOTE_CONTROL_EVENT_HIGH_WATER_BYTES)
+  return Number.isFinite(v) && v > 0 ? v : 1024 * 1024
+}
+
+/**
  * Reconnect delay for an attempt (1-based), doubling with ±20% jitter so a
  * relay coming back up is not hit by every bridge in the same instant.
  */

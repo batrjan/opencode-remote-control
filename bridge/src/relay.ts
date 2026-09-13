@@ -1,6 +1,8 @@
+import type { Socket } from 'node:net'
+import { gzip } from 'node:zlib'
 import WebSocket from 'ws'
 import type { OpencodeClient } from './opencode.js'
-import { backoffDelay, eventRetryMs, wsPingIntervalMs } from './config.js'
+import { backoffDelay, eventHighWaterBytes, eventRetryMs, wsPingIntervalMs } from './config.js'
 
 /**
  * Client for the public relay's bridge-facing session API.
@@ -312,11 +314,90 @@ function warnRejectedProxyRequest(method: string, path: string): void {
 }
 
 /**
+ * Response bodies at least this large are gzipped when the relay supports it.
+ * Below it the saving is a few hundred bytes and not worth a thread-pool trip.
+ */
+const GZIP_MIN_BYTES = 8 * 1024
+/**
+ * Protocol limit, mirrored from the relay (relay/src/ws/bridge.ts
+ * GZIP_MAX_RATIO): the relay refuses to inflate a body past this multiple of
+ * its compressed size, so a body that compresses better goes uncompressed.
+ */
+const GZIP_MAX_RATIO = 32
+/** Nor past what an uncompressed frame could carry. */
+const GZIP_MAX_OUTPUT_BYTES = 100 * 1024 * 1024
+
+/** Consecutive keep-alive intervals with no progress at all before a link is dead. */
+const KEEPALIVE_STRIKES = 2
+
+/** What one keep-alive tick observed about the link since the previous one. */
+export interface LinkSample {
+  /** Our ping was answered. */
+  pongReceived: boolean
+  /** Anything arrived from the relay: a message, its own ping, raw bytes. */
+  inboundActivity: boolean
+  /** Bytes still waiting in our process at the previous tick (socket writableLength). */
+  pendingBefore: number
+  /** Bytes whose socket writes had completed, at the previous tick and now. */
+  flushedBefore: number
+  flushedNow: number
+  /**
+   * Bytes of the write currently inside libuv that the OS has not yet taken,
+   * at the previous tick and now. Undefined where the runtime does not expose it.
+   */
+  osQueueBefore?: number
+  osQueueNow?: number
+}
+
+/**
+ * Did the link move since the last tick?
+ *
+ * Inbound traffic is proof by itself. Outbound is proof only under one
+ * condition, and getting that condition wrong breaks dead-link detection:
+ * the OS takes bytes into its send buffer whether or not the peer is still
+ * there, so on a half-open link our own few-byte pings "leave" forever. What
+ * the OS cannot do on a dead link is make ROOM — only the peer's ACKs free
+ * send-buffer space. So outbound movement counts only if data was already
+ * backed up in our process at the previous tick (the OS buffer was full) and
+ * the OS has taken more of it since.
+ *
+ * "Taken more" cannot be read off `bufferedAmount` either. That number drops
+ * only when a whole socket write completes, and one frame is one write: a
+ * multi-megabyte proxy response on a 2 Mbit/s uplink needs longer than two
+ * keep-alive intervals to leave, and `bufferedAmount` sits still the whole
+ * time. Two counters, together exact:
+ *   - flushed (bytesWritten - writableLength) grows when a write completes;
+ *   - the libuv write queue shrinks while a write is partway through.
+ * A new write starts only after the previous one completed, so the queue can
+ * only grow when `flushed` did — neither moves without bytes leaving.
+ */
+export function linkMadeProgress(s: LinkSample): boolean {
+  if (s.pongReceived || s.inboundActivity) return true
+  if (s.pendingBefore <= 0) return false
+  if (s.flushedNow > s.flushedBefore) return true
+  return s.osQueueBefore !== undefined && s.osQueueNow !== undefined && s.osQueueNow < s.osQueueBefore
+}
+
+/** Outbound counters of a raw socket — see linkMadeProgress. */
+function outboundCounters(socket: Socket | null): { pending: number; flushed: number; osQueue?: number } {
+  if (!socket) return { pending: 0, flushed: 0 }
+  // `_handle.writeQueueSize` is libuv's own count, exposed by Node's stream
+  // wrap on every version this runs on (checked on 18 and 26). Read defensively:
+  // without it only whole-frame progress is seen — still correct, just coarser.
+  const handle = (socket as unknown as { _handle?: { writeQueueSize?: unknown } | null })._handle
+  const osQueue = typeof handle?.writeQueueSize === 'number' ? handle.writeQueueSize : undefined
+  return { pending: socket.writableLength, flushed: socket.bytesWritten - socket.writableLength, osQueue }
+}
+
+/**
  * WebSocket client for the relay's /bridge endpoint.
  *
  * After connect() the socket carries (see relay/src/ws/bridge.ts):
+ *   relay → bridge: { type: 'hello', features }  (first frame; newer relays only)
  *   relay → bridge: { type: 'proxy', request_id, method, path, body? }
  *   bridge → relay: { type: 'proxy_response', request_id, status, contentType, body }
+ *                   or, once the hello offered 'gzip-body', a binary frame
+ *                   (see sendProxyResponse)
  *   bridge → relay: { type: 'event', data }  (from startEventForwarding)
  */
 export class RelayWSClient {
@@ -331,10 +412,16 @@ export class RelayWSClient {
   /** Set when the relay rejected us — retrying can never succeed. */
   private fatal = false
   private keepAlive: NodeJS.Timeout | null = null
-  private awaitingPong = false
+  /** Liveness evidence gathered since the last keep-alive tick — see linkMadeProgress. */
+  private pongSinceTick = false
+  private inboundSinceTick = false
+  /** The socket under the current WebSocket — its counters measure outbound progress. */
+  private rawSocket: Socket | null = null
   private reconnectTimer: NodeJS.Timeout | null = null
   private reconnectAttempt = 0
   private forwardingEvents = false
+  /** The relay on the CURRENT socket said it accepts gzipped response bodies. */
+  private relayAcceptsGzip = false
   /** Called when the relay rejects our credentials — the share is gone. */
   onFatal: ((err: Error) => void) | null = null
   /** Test/diagnostic hook: fired after every successful (re)connection. */
@@ -368,15 +455,36 @@ export class RelayWSClient {
         headers: { 'x-bridge-token': this.bridgeToken! },
       })
       this.ws = ws
+      // Per socket: a relay announces what it understands in its first frame,
+      // and a reconnect may land on a different (older) relay.
+      this.relayAcceptsGzip = false
       let opened = false
       ws.on('open', () => {
         opened = true
         this.reconnectAttempt = 0
+        // Listen for raw bytes only now, never in 'upgrade'. There `ws` has not
+        // attached its own reader yet and still has to hand back the bytes that
+        // arrived with the 101 response (socket.unshift) — a 'data' listener
+        // added first switches the socket to flowing and receives those bytes
+        // ALONE, so the relay's first frames silently vanished.
+        this.rawSocket?.on('data', () => {
+          if (this.ws === ws) this.inboundSinceTick = true
+        })
         this.startKeepAlive(ws)
         resolve()
       })
       ws.on('pong', () => {
-        this.awaitingPong = false
+        this.pongSinceTick = true
+      })
+      // Anything arriving from the relay proves the path works, whether or not
+      // our own ping has been answered: its pings here, and raw bytes (see
+      // 'open') so a large frame still in transit — a viewer posting a big
+      // prompt over a slow downlink — counts as life before it is complete.
+      ws.on('ping', () => {
+        this.inboundSinceTick = true
+      })
+      ws.on('upgrade', (res) => {
+        this.rawSocket = res.socket
       })
       // The relay refuses the UPGRADE (HTTP 401) when the session is gone —
       // it was stopped elsewhere, or the relay restarted and lost it. Every
@@ -424,20 +532,55 @@ export class RelayWSClient {
   }
 
   /**
-   * Prove the link in both directions. A half-open socket still reports OPEN,
-   * so an unanswered ping is the only way to notice the network went away:
-   * terminate() then fires 'close' and starts the reconnect.
+   * Prove the link is alive — by PROGRESS, not by pongs alone.
+   *
+   * A half-open socket still reports OPEN, so something has to notice when the
+   * network is gone. But a saturated uplink is not a gone network, and treating
+   * it as one was the bug: our ping is written to the same socket as the data,
+   * so behind megabytes of queued transcript it simply never reaches the relay
+   * in time. No pong can come back, bytes keep leaving the whole while, and the
+   * old rule — no pong by the next tick means dead — terminated a working link
+   * and discarded every request in flight (the viewer's 502 "proxy failed").
+   *
+   * So a tick asks whether ANYTHING happened: an answer to our ping, any
+   * traffic from the relay, or a backed-up send queue that the peer's ACKs are
+   * still draining. Only KEEPALIVE_STRIKES consecutive ticks with none of those
+   * end the socket — the same two intervals a truly silent link took to detect
+   * before, so dead links are caught no later than they were.
    */
   private startKeepAlive(ws: WebSocket): void {
     this.stopKeepAlive()
-    this.awaitingPong = false
+    const socket = this.rawSocket
+    let strikes = 0
+    let last = outboundCounters(socket)
+    const openedAt = Date.now()
     const timer = setInterval(() => {
       if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return
-      if (this.awaitingPong) {
+      const now = outboundCounters(socket)
+      const progress = linkMadeProgress({
+        pongReceived: this.pongSinceTick,
+        inboundActivity: this.inboundSinceTick,
+        pendingBefore: last.pending,
+        flushedBefore: last.flushed,
+        flushedNow: now.flushed,
+        osQueueBefore: last.osQueue,
+        osQueueNow: now.osQueue,
+      })
+      this.pongSinceTick = false
+      this.inboundSinceTick = false
+      last = now
+      if (progress) {
+        strikes = 0
+      } else if (++strikes >= KEEPALIVE_STRIKES) {
+        // Logged because the alternative is a share that silently cycles: this
+        // line, with the queue size, is what tells "dead" from "congested".
+        console.warn(
+          `bridge: relay link silent for ${strikes} keep-alive intervals ` +
+            `(up ${Math.round((Date.now() - openedAt) / 1000)}s, ${ws.bufferedAmount} bytes queued) — reconnecting`,
+        )
         ws.terminate()
         return
       }
-      this.awaitingPong = true
       try {
         ws.ping()
       } catch {
@@ -451,7 +594,8 @@ export class RelayWSClient {
   private stopKeepAlive(): void {
     if (this.keepAlive) clearInterval(this.keepAlive)
     this.keepAlive = null
-    this.awaitingPong = false
+    this.pongSinceTick = false
+    this.inboundSinceTick = false
   }
 
   /** Re-dial with exponential backoff until it works or close() is called. */
@@ -486,10 +630,39 @@ export class RelayWSClient {
     const stream = await this.opencode.getEvent(this.eventAbortController.signal, this.sessionDirectory)
     if (!stream) throw new Error('opencode /event stream unavailable')
     this.forwardingEvents = true
-    void readSseStream(stream, (data) => this.send({ type: 'event', data })).finally(() => {
+    void readSseStream(
+      stream,
+      (data) => this.send({ type: 'event', data }),
+      () => this.waitForSendRoom(),
+    ).finally(() => {
       this.forwardingEvents = false
       this.scheduleEventRestart()
     })
+  }
+
+  /**
+   * Backpressure for event forwarding: resolves once the relay socket's send
+   * queue is below the high-water mark.
+   *
+   * Without it the queue had no bound at all. opencode emits events as fast as
+   * the model writes, a home uplink carries ~2 Mbit/s, and everything that did
+   * not fit piled up in this process — 4.5 MB was measured in the field. Every
+   * viewer request answered meanwhile queued behind that pile, so a click on
+   * the iPad waited for megabytes of old events to leave first. Pausing the
+   * read pushes the wait back to opencode's stream, where it costs nothing,
+   * and keeps request answers a bounded few seconds from the front.
+   *
+   * With no open socket there is nothing to wait for: send() drops events
+   * while offline, exactly as before.
+   */
+  private async waitForSendRoom(): Promise<void> {
+    const highWater = eventHighWaterBytes()
+    for (;;) {
+      const ws = this.ws
+      if (this.stopped || !ws || ws.readyState !== WebSocket.OPEN) return
+      if (ws.bufferedAmount < highWater) return
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
   }
 
   private scheduleEventRestart(): void {
@@ -516,6 +689,11 @@ export class RelayWSClient {
     try {
       msg = JSON.parse(String(raw))
     } catch {
+      return
+    }
+    if (msg.type === 'hello') {
+      const features = (msg as { features?: unknown }).features
+      this.relayAcceptsGzip = Array.isArray(features) && features.includes('gzip-body')
       return
     }
     if (msg.type !== 'proxy' || typeof msg.request_id !== 'string') return
@@ -547,7 +725,7 @@ export class RelayWSClient {
         return
       }
       const out = await this.opencode.request(method, path, msg.body)
-      this.send({ type: 'proxy_response', request_id: msg.request_id, ...out })
+      await this.sendProxyResponse(msg.request_id, out)
     } catch {
       this.send({
         type: 'proxy_response',
@@ -557,6 +735,45 @@ export class RelayWSClient {
         body: JSON.stringify({ error: 'opencode unreachable' }),
       })
     }
+  }
+
+  /**
+   * Answer a proxy request, gzipping the body when that is worth it.
+   *
+   * The owner's uplink is the narrowest pipe in the whole path — the field
+   * incident was a ~2 Mbit/s home line — and what crosses it is mostly JSON
+   * transcript, which compresses 3-10x. Sent as a binary frame the relay only
+   * accepts after announcing support (see its hello). A body that compresses
+   * better than the relay's inflate limit goes uncompressed: the relay would
+   * rightly refuse to expand it.
+   */
+  private async sendProxyResponse(
+    request_id: string,
+    out: { status: number; contentType?: string; body: string },
+  ): Promise<void> {
+    if (this.relayAcceptsGzip && out.body.length >= GZIP_MIN_BYTES) {
+      const raw = Buffer.from(out.body, 'utf8')
+      const compressed = await new Promise<Buffer | null>((resolve) =>
+        gzip(raw, (err, result) => resolve(err ? null : result)),
+      )
+      const worthIt =
+        compressed !== null &&
+        compressed.length < raw.length * 0.9 &&
+        raw.length <= compressed.length * GZIP_MAX_RATIO &&
+        raw.length <= GZIP_MAX_OUTPUT_BYTES
+      // Re-checked after the await: the socket may have been replaced by one
+      // whose relay has not (or not yet) announced support.
+      if (worthIt && this.relayAcceptsGzip && this.ws?.readyState === WebSocket.OPEN) {
+        const header = Buffer.from(
+          JSON.stringify({ type: 'proxy_response', request_id, status: out.status, contentType: out.contentType, encoding: 'gzip' }),
+        )
+        const prefix = Buffer.alloc(4)
+        prefix.writeUInt32BE(header.length, 0)
+        this.ws.send(Buffer.concat([prefix, header, compressed!]), { binary: true })
+        return
+      }
+    }
+    this.send({ type: 'proxy_response', request_id, ...out })
   }
 
   private send(data: unknown) {
@@ -603,12 +820,14 @@ export class RelayWSClient {
 async function readSseStream(
   stream: ReadableStream<Uint8Array>,
   onEvent: (data: string) => void,
+  waitForRoom: () => Promise<void> = async () => {},
 ): Promise<void> {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
   try {
     for (;;) {
+      await waitForRoom()
       const { done, value } = await reader.read()
       if (done) return
       buffer += decoder.decode(value, { stream: true })

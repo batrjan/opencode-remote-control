@@ -147,6 +147,16 @@ export function wsPingIntervalMs(): number {
 }
 
 /**
+ * How long a GET whose bridge dropped mid-request waits for that bridge to come
+ * back before failing. A bridge re-dials within about a second of losing its
+ * link, so a network blip on the owner's side becomes a short delay for the
+ * viewer instead of a 502. Only GETs: repeating a prompt is not harmless.
+ */
+export function bridgeReconnectWaitMs(): number {
+  return envInt('RELAY_BRIDGE_RECONNECT_WAIT_MS', 5_000)
+}
+
+/**
  * Missed-pong grace: a bridge socket that has not answered within this many
  * ping rounds is terminated, freeing the session for the bridge's reconnect
  * and failing pending proxy requests instead of hanging viewers.

@@ -145,10 +145,11 @@ it is alive:
 
 | Hop | Keep-alive | Env override |
 | --- | ---------- | ------------ |
-| bridge → relay (WS) | Pings every 20 s; an unanswered ping terminates the socket and the bridge re-dials with exponential backoff (1 s → 30 s, ±20% jitter) until it is back. A deliberate close from the relay (session stopped, credentials revoked) shuts the bridge down instead of retrying. | `REMOTE_CONTROL_WS_PING_INTERVAL_MS`, `REMOTE_CONTROL_RECONNECT_BASE_MS`, `REMOTE_CONTROL_RECONNECT_MAX_MS` |
-| relay → bridge (WS) | Pings every 25 s; a bridge that misses two rounds is terminated, so its session slot is freed for the reconnect and viewer requests fail fast instead of waiting out the proxy timeout. A pong also refreshes `last_seen`, so an idle but healthy share is never reaped. | `RELAY_WS_PING_INTERVAL_MS`, `RELAY_WS_PONG_GRACE_ROUNDS` |
+| bridge → relay (WS) | Pings every 20 s. The link counts as dead only after two intervals with no progress at all — no pong, nothing from the relay, and no movement of a backed-up send queue — because on a saturated uplink the ping itself waits behind megabytes of data and a working link would otherwise be cut. The bridge then re-dials with exponential backoff (1 s → 30 s, ±20% jitter) until it is back. A deliberate close from the relay (session stopped, credentials revoked) shuts the bridge down instead of retrying. | `REMOTE_CONTROL_WS_PING_INTERVAL_MS`, `REMOTE_CONTROL_RECONNECT_BASE_MS`, `REMOTE_CONTROL_RECONNECT_MAX_MS` |
+| relay → bridge (WS) | Pings every 25 s; a bridge that shows no sign of life for two rounds — no pong and not a single byte — is terminated, so its session slot is freed for the reconnect. A GET caught by a drop waits up to 5 s for the bridge to come back and is answered then (a POST is never repeated); a bridge that is simply gone fails fast. A pong or incoming data also refreshes `last_seen`, so an idle but healthy share is never reaped. | `RELAY_WS_PING_INTERVAL_MS`, `RELAY_WS_PONG_GRACE_ROUNDS`, `RELAY_BRIDGE_RECONNECT_WAIT_MS` |
 | relay → viewer (SSE) | A `server.heartbeat` event every 15 s, independent of bridge traffic, so intermediate proxies keep the stream open and the browser can tell a quiet session from a dead one. | `RELAY_SSE_HEARTBEAT_MS` |
-| bridge → OpenCode (SSE) | Re-subscribes to `/event` when the local stream ends (server restart), so a reconnected share is never silently event-less. | `REMOTE_CONTROL_EVENT_RETRY_MS` |
+| bridge → OpenCode (SSE) | Re-subscribes to `/event` when the local stream ends (server restart), so a reconnected share is never silently event-less. While the relay socket has more than 1 MiB queued it stops reading events until the queue drains, so a slow uplink delays events instead of burying viewer requests behind them. | `REMOTE_CONTROL_EVENT_RETRY_MS`, `REMOTE_CONTROL_EVENT_HIGH_WATER_BYTES` |
+| bridge → relay (traffic) | Response bodies of 8 KiB and more are gzipped once the relay announces support in its first frame (transcripts shrink 3-10x on the owner's uplink). The relay inflates at most 32x the compressed size, so a hostile "bridge" cannot send a decompression bomb; a body that compresses better than that is simply sent uncompressed. | — |
 | relay restart | The session set is persisted, encrypted at rest (AES-256-GCM) with a key kept off the state volume, so redeploying the relay no longer ends live shares: the bridge reconnects, viewers' cookies still work, and unused join codes keep working too. A stolen copy of the volume is useless without the key. | `RELAY_STATE_FILE`, `RELAY_STATE_KEY` |
 
 A share that really is gone (stopped, or aged out) answers with a page saying
@@ -234,11 +235,11 @@ Env vars (relay defaults also in `relay/.env.example`):
 | --- | ---- | ------ |
 | `PORT` | relay | Listen port (default 8080). |
 | `ACTIVATE_FAIL_DELAY_MS` | relay | Delay before a wrong access code is rejected (brute-force brake, default 1000). |
-| `RELAY_WS_PING_INTERVAL_MS`, `RELAY_WS_PONG_GRACE_ROUNDS`, `RELAY_SSE_HEARTBEAT_MS` | relay | Keep-alive tuning — see the table above. |
+| `RELAY_WS_PING_INTERVAL_MS`, `RELAY_WS_PONG_GRACE_ROUNDS`, `RELAY_SSE_HEARTBEAT_MS`, `RELAY_BRIDGE_RECONNECT_WAIT_MS` | relay | Keep-alive tuning — see the table above. |
 | `RELAY_STATE_FILE`, `RELAY_STATE_KEY` | relay | Where the session set is persisted, and the key it is encrypted with. Empty path = in-memory only. |
 | `RELAY_TRUST_PROXY` | relay | Which proxy hop's `X-Forwarded-For` to believe. Every per-IP limit keys on it, so a wrong value makes them global — see [DEPLOY.md](DEPLOY.md). |
 | `OPENCODE_REMOTE_CONTROL_RELAY`, `REMOTE_CONTROL_RELAY` | plugin, bridge | Point the slash commands at a self-hosted relay instead of the public one (`https://opencode.b4tr.net`); the first set wins. The value reaches a spawned command line, so it must parse as `http://` or `https://` — anything else warns and falls back to the default; trailing slashes are stripped. |
-| `REMOTE_CONTROL_WS_PING_INTERVAL_MS`, `REMOTE_CONTROL_RECONNECT_BASE_MS`, `REMOTE_CONTROL_RECONNECT_MAX_MS`, `REMOTE_CONTROL_EVENT_RETRY_MS` | bridge | Keep-alive tuning — see the table above. |
+| `REMOTE_CONTROL_WS_PING_INTERVAL_MS`, `REMOTE_CONTROL_RECONNECT_BASE_MS`, `REMOTE_CONTROL_RECONNECT_MAX_MS`, `REMOTE_CONTROL_EVENT_RETRY_MS`, `REMOTE_CONTROL_EVENT_HIGH_WATER_BYTES` | bridge | Keep-alive tuning — see the table above. |
 | `REMOTE_CONTROL_ALLOW_ANY_PATH=1` | bridge | Escape hatch: turns off the bridge's own path allowlist (it warns once, loudly), so the bridge runs whatever method and path the relay sends. This removes a safety net and exists only so an older bridge can still serve a newer relay that added a route. Leave it unset. |
 
 ## Deployment

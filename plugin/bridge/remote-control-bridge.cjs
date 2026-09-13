@@ -7105,6 +7105,10 @@ function reconnectMaxMs() {
 function eventRetryMs() {
   return Number(process.env.REMOTE_CONTROL_EVENT_RETRY_MS ?? 1e3);
 }
+function eventHighWaterBytes() {
+  const v = Number(process.env.REMOTE_CONTROL_EVENT_HIGH_WATER_BYTES);
+  return Number.isFinite(v) && v > 0 ? v : 1024 * 1024;
+}
 function backoffDelay(attempt, base = reconnectBaseMs(), max = reconnectMaxMs()) {
   const exponential = Math.min(max, base * 2 ** Math.max(0, attempt - 1));
   const jitter = exponential * 0.2 * (Math.random() * 2 - 1);
@@ -7318,6 +7322,9 @@ var OpencodeClient = class {
   }
 };
 
+// src/relay.ts
+var import_node_zlib = require("node:zlib");
+
 // node_modules/ws/wrapper.mjs
 var import_stream = __toESM(require_stream(), 1);
 var import_extension = __toESM(require_extension(), 1);
@@ -7513,6 +7520,22 @@ function warnRejectedProxyRequest(method, path3) {
     `bridge: refused a relay request outside the allowlist: ${key} (set REMOTE_CONTROL_ALLOW_ANY_PATH=1 only if you trust this relay)`
   );
 }
+var GZIP_MIN_BYTES = 8 * 1024;
+var GZIP_MAX_RATIO = 32;
+var GZIP_MAX_OUTPUT_BYTES = 100 * 1024 * 1024;
+var KEEPALIVE_STRIKES = 2;
+function linkMadeProgress(s) {
+  if (s.pongReceived || s.inboundActivity) return true;
+  if (s.pendingBefore <= 0) return false;
+  if (s.flushedNow > s.flushedBefore) return true;
+  return s.osQueueBefore !== void 0 && s.osQueueNow !== void 0 && s.osQueueNow < s.osQueueBefore;
+}
+function outboundCounters(socket) {
+  if (!socket) return { pending: 0, flushed: 0 };
+  const handle = socket._handle;
+  const osQueue = typeof handle?.writeQueueSize === "number" ? handle.writeQueueSize : void 0;
+  return { pending: socket.writableLength, flushed: socket.bytesWritten - socket.writableLength, osQueue };
+}
 var RelayWSClient = class {
   constructor(relayUrl, opencode) {
     this.relayUrl = relayUrl;
@@ -7529,10 +7552,16 @@ var RelayWSClient = class {
   /** Set when the relay rejected us — retrying can never succeed. */
   fatal = false;
   keepAlive = null;
-  awaitingPong = false;
+  /** Liveness evidence gathered since the last keep-alive tick — see linkMadeProgress. */
+  pongSinceTick = false;
+  inboundSinceTick = false;
+  /** The socket under the current WebSocket — its counters measure outbound progress. */
+  rawSocket = null;
   reconnectTimer = null;
   reconnectAttempt = 0;
   forwardingEvents = false;
+  /** The relay on the CURRENT socket said it accepts gzipped response bodies. */
+  relayAcceptsGzip = false;
   /** Called when the relay rejects our credentials — the share is gone. */
   onFatal = null;
   /** Test/diagnostic hook: fired after every successful (re)connection. */
@@ -7558,15 +7587,25 @@ var RelayWSClient = class {
         headers: { "x-bridge-token": this.bridgeToken }
       });
       this.ws = ws;
+      this.relayAcceptsGzip = false;
       let opened = false;
       ws.on("open", () => {
         opened = true;
         this.reconnectAttempt = 0;
+        this.rawSocket?.on("data", () => {
+          if (this.ws === ws) this.inboundSinceTick = true;
+        });
         this.startKeepAlive(ws);
         resolve();
       });
       ws.on("pong", () => {
-        this.awaitingPong = false;
+        this.pongSinceTick = true;
+      });
+      ws.on("ping", () => {
+        this.inboundSinceTick = true;
+      });
+      ws.on("upgrade", (res) => {
+        this.rawSocket = res.socket;
       });
       ws.on("unexpected-response", (_req, res) => {
         const status = res.statusCode ?? 0;
@@ -7605,20 +7644,52 @@ var RelayWSClient = class {
     });
   }
   /**
-   * Prove the link in both directions. A half-open socket still reports OPEN,
-   * so an unanswered ping is the only way to notice the network went away:
-   * terminate() then fires 'close' and starts the reconnect.
+   * Prove the link is alive — by PROGRESS, not by pongs alone.
+   *
+   * A half-open socket still reports OPEN, so something has to notice when the
+   * network is gone. But a saturated uplink is not a gone network, and treating
+   * it as one was the bug: our ping is written to the same socket as the data,
+   * so behind megabytes of queued transcript it simply never reaches the relay
+   * in time. No pong can come back, bytes keep leaving the whole while, and the
+   * old rule — no pong by the next tick means dead — terminated a working link
+   * and discarded every request in flight (the viewer's 502 "proxy failed").
+   *
+   * So a tick asks whether ANYTHING happened: an answer to our ping, any
+   * traffic from the relay, or a backed-up send queue that the peer's ACKs are
+   * still draining. Only KEEPALIVE_STRIKES consecutive ticks with none of those
+   * end the socket — the same two intervals a truly silent link took to detect
+   * before, so dead links are caught no later than they were.
    */
   startKeepAlive(ws) {
     this.stopKeepAlive();
-    this.awaitingPong = false;
+    const socket = this.rawSocket;
+    let strikes = 0;
+    let last = outboundCounters(socket);
+    const openedAt = Date.now();
     const timer = setInterval(() => {
       if (this.ws !== ws || ws.readyState !== wrapper_default.OPEN) return;
-      if (this.awaitingPong) {
+      const now = outboundCounters(socket);
+      const progress = linkMadeProgress({
+        pongReceived: this.pongSinceTick,
+        inboundActivity: this.inboundSinceTick,
+        pendingBefore: last.pending,
+        flushedBefore: last.flushed,
+        flushedNow: now.flushed,
+        osQueueBefore: last.osQueue,
+        osQueueNow: now.osQueue
+      });
+      this.pongSinceTick = false;
+      this.inboundSinceTick = false;
+      last = now;
+      if (progress) {
+        strikes = 0;
+      } else if (++strikes >= KEEPALIVE_STRIKES) {
+        console.warn(
+          `bridge: relay link silent for ${strikes} keep-alive intervals (up ${Math.round((Date.now() - openedAt) / 1e3)}s, ${ws.bufferedAmount} bytes queued) \u2014 reconnecting`
+        );
         ws.terminate();
         return;
       }
-      this.awaitingPong = true;
       try {
         ws.ping();
       } catch {
@@ -7631,7 +7702,8 @@ var RelayWSClient = class {
   stopKeepAlive() {
     if (this.keepAlive) clearInterval(this.keepAlive);
     this.keepAlive = null;
-    this.awaitingPong = false;
+    this.pongSinceTick = false;
+    this.inboundSinceTick = false;
   }
   /** Re-dial with exponential backoff until it works or close() is called. */
   scheduleReconnect() {
@@ -7659,10 +7731,38 @@ var RelayWSClient = class {
     const stream = await this.opencode.getEvent(this.eventAbortController.signal, this.sessionDirectory);
     if (!stream) throw new Error("opencode /event stream unavailable");
     this.forwardingEvents = true;
-    void readSseStream(stream, (data) => this.send({ type: "event", data })).finally(() => {
+    void readSseStream(
+      stream,
+      (data) => this.send({ type: "event", data }),
+      () => this.waitForSendRoom()
+    ).finally(() => {
       this.forwardingEvents = false;
       this.scheduleEventRestart();
     });
+  }
+  /**
+   * Backpressure for event forwarding: resolves once the relay socket's send
+   * queue is below the high-water mark.
+   *
+   * Without it the queue had no bound at all. opencode emits events as fast as
+   * the model writes, a home uplink carries ~2 Mbit/s, and everything that did
+   * not fit piled up in this process — 4.5 MB was measured in the field. Every
+   * viewer request answered meanwhile queued behind that pile, so a click on
+   * the iPad waited for megabytes of old events to leave first. Pausing the
+   * read pushes the wait back to opencode's stream, where it costs nothing,
+   * and keeps request answers a bounded few seconds from the front.
+   *
+   * With no open socket there is nothing to wait for: send() drops events
+   * while offline, exactly as before.
+   */
+  async waitForSendRoom() {
+    const highWater = eventHighWaterBytes();
+    for (; ; ) {
+      const ws = this.ws;
+      if (this.stopped || !ws || ws.readyState !== wrapper_default.OPEN) return;
+      if (ws.bufferedAmount < highWater) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   }
   scheduleEventRestart() {
     if (this.stopped) return;
@@ -7686,6 +7786,11 @@ var RelayWSClient = class {
     try {
       msg = JSON.parse(String(raw));
     } catch {
+      return;
+    }
+    if (msg.type === "hello") {
+      const features = msg.features;
+      this.relayAcceptsGzip = Array.isArray(features) && features.includes("gzip-body");
       return;
     }
     if (msg.type !== "proxy" || typeof msg.request_id !== "string") return;
@@ -7715,7 +7820,7 @@ var RelayWSClient = class {
         return;
       }
       const out = await this.opencode.request(method, path3, msg.body);
-      this.send({ type: "proxy_response", request_id: msg.request_id, ...out });
+      await this.sendProxyResponse(msg.request_id, out);
     } catch {
       this.send({
         type: "proxy_response",
@@ -7725,6 +7830,35 @@ var RelayWSClient = class {
         body: JSON.stringify({ error: "opencode unreachable" })
       });
     }
+  }
+  /**
+   * Answer a proxy request, gzipping the body when that is worth it.
+   *
+   * The owner's uplink is the narrowest pipe in the whole path — the field
+   * incident was a ~2 Mbit/s home line — and what crosses it is mostly JSON
+   * transcript, which compresses 3-10x. Sent as a binary frame the relay only
+   * accepts after announcing support (see its hello). A body that compresses
+   * better than the relay's inflate limit goes uncompressed: the relay would
+   * rightly refuse to expand it.
+   */
+  async sendProxyResponse(request_id, out) {
+    if (this.relayAcceptsGzip && out.body.length >= GZIP_MIN_BYTES) {
+      const raw = Buffer.from(out.body, "utf8");
+      const compressed = await new Promise(
+        (resolve) => (0, import_node_zlib.gzip)(raw, (err, result) => resolve(err ? null : result))
+      );
+      const worthIt = compressed !== null && compressed.length < raw.length * 0.9 && raw.length <= compressed.length * GZIP_MAX_RATIO && raw.length <= GZIP_MAX_OUTPUT_BYTES;
+      if (worthIt && this.relayAcceptsGzip && this.ws?.readyState === wrapper_default.OPEN) {
+        const header = Buffer.from(
+          JSON.stringify({ type: "proxy_response", request_id, status: out.status, contentType: out.contentType, encoding: "gzip" })
+        );
+        const prefix = Buffer.alloc(4);
+        prefix.writeUInt32BE(header.length, 0);
+        this.ws.send(Buffer.concat([prefix, header, compressed]), { binary: true });
+        return;
+      }
+    }
+    this.send({ type: "proxy_response", request_id, ...out });
   }
   send(data) {
     if (this.ws?.readyState === wrapper_default.OPEN) this.ws.send(JSON.stringify(data));
@@ -7755,12 +7889,14 @@ var RelayWSClient = class {
     }
   }
 };
-async function readSseStream(stream, onEvent) {
+async function readSseStream(stream, onEvent, waitForRoom = async () => {
+}) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   try {
     for (; ; ) {
+      await waitForRoom();
       const { done, value } = await reader.read();
       if (done) return;
       buffer += decoder.decode(value, { stream: true });

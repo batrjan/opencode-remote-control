@@ -18,6 +18,8 @@ process.env.RELAY_API_KEY = API_KEY
 process.env.RELAY_WS_PING_INTERVAL_MS = '60'
 process.env.RELAY_WS_PONG_GRACE_ROUNDS = '1'
 process.env.RELAY_SSE_HEARTBEAT_MS = '80'
+// A dropped bridge is given this long to re-dial before a GET fails.
+process.env.RELAY_BRIDGE_RECONNECT_WAIT_MS = '200'
 
 let relay: Server
 let relayUrl: string
