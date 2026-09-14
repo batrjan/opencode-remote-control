@@ -1,0 +1,14 @@
+{
+  // Type-checks the tests together with the code they call. Nothing else does:
+  // vitest strips types, and tsconfig.json (the build, and CI's Typecheck step)
+  // covers src/ only. test/typecheck.test.ts runs this from the suite;
+  // `npx tsc -p tsconfig.test.json` runs it by hand.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // Several tests drive a real bridge through ../../bridge/src, so the
+    // program reaches outside relay/.
+    "rootDir": ".."
+  },
+  "include": ["src/**/*", "test/**/*"]
+}

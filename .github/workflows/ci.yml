@@ -84,7 +84,9 @@ jobs:
 
       # tsc --noEmit, not `npm run build`: vitest type-checks nothing, so a
       # type error in src/ passes the suite and only surfaces when the relay
-      # image is built on the production host.
+      # image is built on the production host. (The relay suite does include
+      # test/typecheck.test.ts, which checks src/ and test/ together via
+      # tsconfig.test.json; this step stays the src/ check for both packages.)
       - name: Typecheck
         run: npx tsc -p tsconfig.json --noEmit
 

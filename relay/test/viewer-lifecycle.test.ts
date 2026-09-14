@@ -195,7 +195,8 @@ test('a code typed with the letters O or I still activates (the alphabet has nei
     viewer_token: expect.any(String),
   })
   // Folding happens after uppercasing, so the lowercase typo works as well.
-  expect(store.activate(typed!.toLowerCase(), id, 'viewer-ip-2').session_id).toBe(id)
+  // (No caller address: activation keys on the share alone, not on who asks.)
+  expect(store.activate(typed!.toLowerCase(), id).session_id).toBe(id)
 })
 
 test('an empty stored bridge-token hash returns false instead of throwing', () => {
