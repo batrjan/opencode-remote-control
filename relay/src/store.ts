@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
-import { config, maxSessions } from './config.js'
+import { config, departedBridgeMs, maxSessions } from './config.js'
 import type { PersistedState } from './persist.js'
 import { STATE_VERSION } from './persist.js'
 
@@ -103,6 +103,8 @@ export class Store {
   private endListeners: Set<(session_id: string) => void> = new Set()
   /** When the store last marked itself dirty — see noteActivity. */
   private lastDirtyAt = 0
+  /** When restore() last loaded sessions from a previous process — see evictDepartedShare. */
+  private restoredAt = 0
 
   /**
    * @param maxTrackingEntries cap for codeFails/blockedCodes/sessionFails/
@@ -135,7 +137,10 @@ export class Store {
    * A full relay first removes the registrations no bridge connected to in
    * time (config.unboundReapMs) rather than wait up to a sweep interval for
    * the reaper: without that, bare POSTs from a pool of addresses kept every
-   * new share out for as long as they cared to.
+   * new share out for as long as they cared to. If that frees nothing, it
+   * gives up the slot of the share whose bridge has been gone longest (see
+   * evictDepartedShare): one handshake per registration used to keep such a
+   * relay full for a day.
    */
   checkRegistrationLimit(ip: string, session_id?: string): void {
     if (
@@ -143,8 +148,10 @@ export class Store {
       (session_id === undefined || !this.sessions.has(session_id))
     ) {
       // Only the unbound criterion (no idle limit): none of those has a bridge
-      // socket, so nothing is left for the caller to disconnect.
+      // socket, so nothing is left for the caller to disconnect. Nor does the
+      // share evicted next (see departedBridgeMs).
       this.reapOrphans(Number.POSITIVE_INFINITY)
+      if (this.sessions.size >= maxSessions()) this.evictDepartedShare()
       if (this.sessions.size >= maxSessions()) throw new Error('relay full')
     }
     const now = Date.now()
@@ -608,11 +615,7 @@ export class Store {
     for (const [id, session] of this.sessions) {
       const neverBridged = session.unbound_since !== undefined && now - session.unbound_since > maxUnboundMs
       if (now - session.last_seen > maxIdleMs || neverBridged) {
-        this.dropViewers(session) // same revocation as deleteSession
-        this.sessionActivations.delete(id)
-        this.sessionFails.delete(id)
-        this.sessions.delete(id)
-        this.recordClaim(session, now)
+        this.removeSession(session, now)
         removed.push(id)
       }
     }
@@ -621,6 +624,63 @@ export class Store {
     if (removed.length) this.changed()
     for (const id of removed) this.registrationEnded(id)
     return removed
+  }
+
+  /**
+   * Make room on a full relay by ending the one share whose bridge has been
+   * silent longest, provided it has been silent past departedBridgeMs() —
+   * which no share with a bridge socket can be, so there is nothing for the
+   * caller to disconnect. Only for checkRegistrationLimit: the periodic reaper
+   * still leaves a quiet share its day, and exactly one goes, for the one slot
+   * the registration asking needs.
+   *
+   * Registrations still waiting for their first bridge are not candidates; the
+   * unbound rule already decides theirs. A restored share counts as seen at
+   * the restore: its bridge was connected to the previous process and is
+   * re-dialling this one on a backoff the downtime stretched, and last_seen in
+   * the file says nothing about that (the same reasoning as unbound_since).
+   */
+  private evictDepartedShare(): void {
+    const now = Date.now()
+    const silentFor = departedBridgeMs()
+    let victim: Session | undefined
+    let victimSeen = 0
+    for (const session of this.sessions.values()) {
+      if (session.unbound_since !== undefined) continue
+      // A session this process created was seen after any restore anyway.
+      const seen = Math.max(session.last_seen, this.restoredAt)
+      if (now - seen <= silentFor) continue
+      if (victim === undefined || seen < victimSeen) {
+        victim = session
+        victimSeen = seen
+      }
+    }
+    if (victim === undefined) return
+    this.removeSession(victim, now)
+    this.changed()
+    this.registrationEnded(victim.id)
+    // Logged like the refusal it replaces (see maxSessions): a relay that is
+    // merely busy now ends quiet shares instead of refusing new ones, and the
+    // operator is the one who can give it more. The slot stays free until a
+    // registration fills it, so there is at most one line per registration.
+    console.warn(
+      `[store] relay full: ended share session=${JSON.stringify(victim.id)} ` +
+        `(no bridge for ${Math.round((now - victimSeen) / 60_000)} min) to make room (RELAY_MAX_SESSIONS)`,
+    )
+  }
+
+  /**
+   * Take a session out of the store with everything that authenticated or
+   * counted against it — the same revocation as deleteSession — and keep its id
+   * for its owner (see recordClaim). The caller marks the store changed and
+   * tells the end listeners once it is done.
+   */
+  private removeSession(session: Session, now: number): void {
+    this.dropViewers(session)
+    this.sessionActivations.delete(session.id)
+    this.sessionFails.delete(session.id)
+    this.sessions.delete(session.id)
+    this.recordClaim(session, now)
   }
 
   /**
@@ -845,6 +905,7 @@ export class Store {
       }
       restored += 1
     }
+    if (restored > 0) this.restoredAt = now
     // A live session carries its own owner hash; a claim this process already
     // holds is at least as recent as the file.
     for (const c of claims.sort((a, b) => a.at - b.at)) {

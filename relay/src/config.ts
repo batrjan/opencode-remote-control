@@ -103,9 +103,10 @@ export const config = {
    * bridge dials the moment its registration comes back, and deletes the
    * registration when that dial fails (its handshake times out after 15 s), so
    * minutes are plenty. Counted from registration, or from a restart for one
-   * restored before its bridge had connected. A share whose bridge connected
-   * once keeps the day, however long it has been gone since: telling a laptop
-   * that is asleep from one that will never return is not possible here.
+   * restored before its bridge had connected. The reaper leaves a share whose
+   * bridge connected once its day, however long it has been gone since: telling
+   * a laptop that is asleep from one that will never return is not possible
+   * here. A full relay does not wait that day, though (see departedBridgeMs).
    */
   unboundReapMs: 5 * 60_000,
   /**
@@ -273,11 +274,38 @@ export function sseMaxExemptBytes(): number {
  * refusal is logged, so a relay that is merely busy can be given more.
  *
  * Only a share with a bridge keeps its slot for long: a full relay first drops
- * the registrations no bridge connected to in time (config.unboundReapMs), so
- * filling it takes a bridge connection per session, not a bare POST.
+ * the registrations no bridge connected to in time (config.unboundReapMs), and
+ * then gives one new registration the slot of the share whose bridge has been
+ * gone longest (departedBridgeMs). Filling it takes a bridge per session that
+ * keeps answering, not a bare POST, nor one handshake a day.
  */
 export function maxSessions(): number {
   return envInt('RELAY_MAX_SESSIONS', 2000)
+}
+
+/**
+ * How long a share's bridge must have shown no sign of life before a full
+ * relay may give that share's slot to a new registration (see
+ * Store.checkRegistrationLimit).
+ *
+ * A connected bridge touches its session on every pong and every byte it
+ * sends, and one that stays silent for more than wsPongGraceRounds() ping
+ * rounds is terminated. So a share silent for longer than those rounds and one
+ * more has no bridge socket, whatever the ping interval is set to. Never less
+ * than config.unboundReapMs, the time a new registration gets to dial in: a
+ * bridge that lost its link re-dials within seconds, and one on a laptop that
+ * slept for a minute should find its share still there.
+ *
+ * Without this, one WebSocket handshake per registration took a session out of
+ * the unbound rule for the reaper's whole day: 400 addresses registered 2,000
+ * sessions, connected and disconnected once each, and every new share got 503
+ * "relay full" for a day, renewable with one more handshake per session. The
+ * cost is borne only on a full relay, by the share gone quiet longest: its
+ * bridge, if it ever wakes, is refused and must share again (the id stays
+ * reserved for its owner_key).
+ */
+export function departedBridgeMs(): number {
+  return Math.max(config.unboundReapMs, (wsPongGraceRounds() + 2) * wsPingIntervalMs())
 }
 
 /**

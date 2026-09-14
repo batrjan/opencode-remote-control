@@ -381,7 +381,11 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
   // under oc_general, a hundred times looser. Any other spelling is now the
   // JSON 404 before its body is read; the join page posts to exactly this one.
   app.use('/api/activate', exactPathOnly('/api/activate'), express.json({ limit: PUBLIC_BODY_LIMIT }), activateRouter(store))
-  app.use('/api/sessions', express.json({ limit: PUBLIC_BODY_LIMIT }), skillRouter(store, bridge))
+  // The same for the session API, whose oc_register zone nginx applies with
+  // the case-sensitive prefix `location /api/sessions`: /API/sessions used to
+  // register under oc_general, and on a full relay write a warning per
+  // request. It serves /api/sessions/:id too, hence a prefix, not one path.
+  app.use('/api/sessions', pathPrefixOnly('/api/sessions'), express.json({ limit: PUBLIC_BODY_LIMIT }), skillRouter(store, bridge))
   /**
    * Send a viewer who lands here back to their own share, if we can tell which
    * one it is.
@@ -570,11 +574,29 @@ const PUBLIC_BODY_LIMIT = '32kb'
  */
 function exactPathOnly(path: string): express.RequestHandler {
   return (req, res, next) => {
-    const target = req.originalUrl
-    const query = target.indexOf('?')
-    if ((query === -1 ? target : target.slice(0, query)) === path) return next()
+    if (rawPath(req) === path) return next()
     res.status(404).json({ error: 'not found' })
   }
+}
+
+/**
+ * exactPathOnly for a mount that also serves paths below it, matched the way
+ * nginx matches a prefix location: `prefix` itself or `prefix/...`, byte for
+ * byte and case included. Everything else under the mount is the JSON 404.
+ */
+function pathPrefixOnly(prefix: string): express.RequestHandler {
+  return (req, res, next) => {
+    const path = rawPath(req)
+    if (path === prefix || path.startsWith(`${prefix}/`)) return next()
+    res.status(404).json({ error: 'not found' })
+  }
+}
+
+/** The request-target as the client sent it, up to any query string (see exactPathOnly). */
+function rawPath(req: express.Request): string {
+  const target = req.originalUrl
+  const query = target.indexOf('?')
+  return query === -1 ? target : target.slice(0, query)
 }
 
 /**
