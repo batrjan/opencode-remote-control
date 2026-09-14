@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { WebSocket } from 'ws'
 import { shutdown, startServer } from '../src/server'
 
@@ -76,7 +77,7 @@ async function share(relay: Server, session_id: string) {
   expect(created.status).toBe(201)
   const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id })
   expect(activated.status).toBe(200)
-  return { bridgeToken: created.body.bridge_token as string, viewerToken: activated.body.viewer_token as string }
+  return { bridgeToken: created.body.bridge_token as string, viewerToken: viewerTokenFrom(activated) }
 }
 
 /** A hand-driven bridge socket that answers every proxy request with 200 []. */

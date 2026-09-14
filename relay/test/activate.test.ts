@@ -2,6 +2,7 @@ import { expect, test } from 'vitest'
 import { createApp } from '../src/server'
 import { Store } from '../src/store'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 
 // Session API requires the shared key; the failed-activation delay is a
 // runtime brute-force brake and must not slow the test suite (both are read
@@ -10,14 +11,45 @@ const API_KEY = 'test-relay-key'
 process.env.RELAY_API_KEY = API_KEY
 process.env.ACTIVATE_FAIL_DELAY_MS = '0'
 
-test('POST /api/activate returns viewer_token', async () => {
+/**
+ * Where the viewer token goes when a code is accepted.
+ *
+ * The token is the viewer's whole credential, and it is meant to live only in
+ * the HttpOnly cookie, out of reach of any script. Activation set that cookie
+ * but also returned the token in the JSON body, left over from a first design
+ * that kept it in localStorage. Nothing reads it there: the join page checks
+ * res.ok and navigates to /<id>, which authenticates by the cookie. So a
+ * script running in the join page as the code was submitted could read the
+ * victim's own token from the response, and use it without taking a seat or
+ * moving the owner's viewer count, as minting a token of its own would.
+ *
+ * The body now names the session only. The cookie alone completes the join,
+ * the /<id> redirect into the UI.
+ */
+test('POST /api/activate delivers the viewer token only as an HttpOnly cookie', async () => {
   const store = new Store()
   const app = createApp(store)
-  const { access_code } = store.createSession('sess1', '/path', 'title', 'test-ip')
-  const res = await request(app).post('/api/activate').send({ code: access_code, session_id: 'sess1' })
+  const created = await request(app)
+    .post('/api/sessions')
+    .set('x-api-key', API_KEY)
+    .send({ session_id: 'ses_cookieonly', directory: '/path', title: 'title' })
+  expect(created.status).toBe(201)
+
+  const res = await request(app)
+    .post('/api/activate')
+    .send({ code: created.body.access_code, session_id: 'ses_cookieonly' })
   expect(res.status).toBe(200)
-  expect(res.body.session_id).toBe('sess1')
-  expect(res.body.viewer_token).toBeTruthy()
+  expect(res.body).toEqual({ session_id: 'ses_cookieonly' })
+
+  const header = res.headers['set-cookie'] as unknown as string[]
+  const cookie = header.find((c) => c.startsWith('viewer_token='))!
+  expect(cookie).toMatch(/;\s*HttpOnly/i)
+  expect(cookie).toMatch(/;\s*SameSite=Strict/i)
+  const token = viewerTokenFrom(res)
+  expect(store.verifyViewer('ses_cookieonly', token)).toBe(true)
+
+  const redirect = await request(app).get('/ses_cookieonly').set('Cookie', `viewer_token=${token}`)
+  expect(redirect.status).toBe(302)
 })
 
 test('POST /api/activate requires a session_id and binds the code to it', async () => {

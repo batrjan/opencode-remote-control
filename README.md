@@ -216,7 +216,7 @@ instance. Driving a session from the browser works fully either way.
 | `POST /api/sessions`      | public (rate-limited)      | Create a session; returns the access code + bridge token exactly once. |
 | `GET /api/sessions/:id`   | public                        | Session presence check (bridge `status`).        |
 | `DELETE /api/sessions/:id`| `x-bridge-token` (owner only)    | End a session; disconnects its bridge, revokes code + tokens. |
-| `POST /api/activate`      | access code (rate-limited)    | Exchange a code for a viewer token; sets an HttpOnly, SameSite=Strict cookie. |
+| `POST /api/activate`      | access code (rate-limited)    | Exchange a code for a viewer token, sent only as an HttpOnly, SameSite=Strict cookie; the body is `{ session_id }`. |
 | allowlisted OpenCode paths at the root (`/session/:id/…`, `/provider`, …) | viewer cookie or `x-viewer-token` | Proxy to the bridged OpenCode; `:id` is always rewritten to the token's session. |
 | `GET /event`, `GET /global/event` | viewer cookie or `x-viewer-token` | Live SSE fan-out of the session's OpenCode events, filtered to the viewer's session. Each stream reproduces OpenCode's own envelope: `/event` sends the bare event, `/global/event` wraps it as `{ directory, payload }` — the web UI reads `payload` and breaks on anything else. |
 | `GET /join`, `GET /terminal` | none                       | Code-entry page and the viewer UI.               |

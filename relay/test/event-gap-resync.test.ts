@@ -3,6 +3,7 @@ import http from 'node:http'
 import { randomBytes } from 'node:crypto'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { WebSocket } from 'ws'
 import { createApp } from '../src/server'
 import { Store } from '../src/store'
@@ -109,7 +110,7 @@ async function share(session_id: string) {
     .send({ session_id, directory: '/w', title: 'gap' })
   expect(created.status).toBe(201)
   const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id })
-  return { bridgeToken: created.body.bridge_token as string, viewerToken: activated.body.viewer_token as string }
+  return { bridgeToken: created.body.bridge_token as string, viewerToken: viewerTokenFrom(activated) }
 }
 
 /** A real bridge process-in-miniature, forwarding the fake opencode's events. */

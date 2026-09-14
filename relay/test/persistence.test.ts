@@ -6,6 +6,7 @@ import path from 'node:path'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { WebSocket } from 'ws'
 import { Store } from '../src/store'
 import type { PersistedState } from '../src/persist'
@@ -231,7 +232,7 @@ test('a live share survives a full relay restart', async () => {
     .post('/api/activate')
     .send({ code: created.body.access_code, session_id: 'ses_restart' })
   expect(activated.status).toBe(200)
-  const viewerToken: string = activated.body.viewer_token
+  const viewerToken: string = viewerTokenFrom(activated)
 
   // Restart exactly like a redeploy does: close the process, start a new one.
   relay.closeAllConnections()
@@ -342,7 +343,7 @@ test('the shutdown flush handle writes the latest state without waiting for clos
       .send({ code: created.body.access_code, session_id: 'ses_flush' })
     // Hold a live SSE stream open — this is what blocks the 'close' event.
     const stream = await fetch(`http://127.0.0.1:${port}/event`, {
-      headers: { 'x-viewer-token': act.body.viewer_token },
+      headers: { 'x-viewer-token': viewerTokenFrom(act) },
     })
     expect(stream.status).toBe(200)
 
@@ -453,7 +454,7 @@ test('the shutdown flush writes timestamps that moved since the last write', asy
     const usedAt = Date.now()
     await request(relay)
       .get('/ses_flush_fresh')
-      .set('cookie', `viewer_token=${act.body.viewer_token}`)
+      .set('cookie', `viewer_token=${viewerTokenFrom(act)}`)
       .expect(302)
     const link = new WebSocket(`ws://127.0.0.1:${port}/bridge?session_id=ses_flush_fresh`, {
       headers: { 'x-bridge-token': created.body.bridge_token },
@@ -528,7 +529,7 @@ test('a share kept alive by its bridge for over a day survives a redeploy', asyn
       .post('/api/activate')
       .send({ code: created.body.access_code, session_id: 'ses_overnight' })
     expect(act.status).toBe(200)
-    const viewerCookie = `viewer_token=${act.body.viewer_token}`
+    const viewerCookie = `viewer_token=${viewerTokenFrom(act)}`
     const link = await dial(created.body.bridge_token)
     expect(link.outcome).toBe('open')
     // Let the activation's debounced write land now. Left queued, it would

@@ -3,6 +3,7 @@ import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import WebSocket from 'ws'
 import { startServer } from '../src/server'
 import { OpencodeClient } from '../../bridge/src/opencode'
@@ -106,7 +107,7 @@ beforeAll(async () => {
 
   const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'sess1' })
   expect(activated.status).toBe(200)
-  viewerToken = activated.body.viewer_token
+  viewerToken = viewerTokenFrom(activated)
   const setCookie = activated.headers['set-cookie'] as unknown as string[]
   viewerCookie = setCookie.find((c) => c.startsWith('viewer_token='))!.split(';')[0]!
 

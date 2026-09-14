@@ -3,6 +3,7 @@ import http from 'node:http'
 import net from 'node:net'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { WebSocket } from 'ws'
 import { createApp } from '../src/server'
 import { Store } from '../src/store'
@@ -74,7 +75,7 @@ async function share(id: string) {
   expect(created.status).toBe(201)
   const { access_code, bridge_token } = created.body as { access_code: string; bridge_token: string }
   const act = await request(relay).post('/api/activate').send({ code: access_code, session_id: id })
-  const viewerToken = act.body.viewer_token as string
+  const viewerToken = viewerTokenFrom(act)
   const bridge = new WebSocket(`${relayUrl.replace(/^http/, 'ws')}/bridge?session_id=${id}`, {
     headers: { 'x-bridge-token': bridge_token },
   })

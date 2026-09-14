@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from 'vitest'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { WebSocket } from 'ws'
 import { startServer } from '../src/server'
 
@@ -39,7 +40,7 @@ async function share(session_id: string) {
     .send({ session_id, directory: '/path', title: 'retry' })
   expect(created.status).toBe(201)
   const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id })
-  return { bridgeToken: created.body.bridge_token as string, viewerToken: activated.body.viewer_token as string }
+  return { bridgeToken: created.body.bridge_token as string, viewerToken: viewerTokenFrom(activated) }
 }
 
 type Proxy = { request_id: string; method: string; path: string }

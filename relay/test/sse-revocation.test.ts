@@ -4,6 +4,7 @@ import net from 'node:net'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { startServer } from '../src/server'
 import { OpencodeClient } from '../../bridge/src/opencode'
 import { RelayWSClient } from '../../bridge/src/relay'
@@ -63,7 +64,7 @@ beforeAll(async () => {
     .post('/api/activate')
     .send({ code: created.body.access_code, session_id: 'ses_revoke1' })
   expect(activated.status).toBe(200)
-  viewerToken = activated.body.viewer_token
+  viewerToken = viewerTokenFrom(activated)
 
   bridge = new RelayWSClient(
     relayUrl,
@@ -177,7 +178,7 @@ test('a stream aborted before the handler runs does not leak its slot', async ()
   const activated = await request(relay)
     .post('/api/activate')
     .send({ code: created.body.access_code, session_id: 'ses_abort1' })
-  const token = activated.body.viewer_token as string
+  const token = viewerTokenFrom(activated)
 
   const port = (relay.address() as AddressInfo).port
   // Fired in parallel batches and torn down inside the dispatch window.

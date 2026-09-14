@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { WebSocket } from 'ws'
 import { startServer } from '../src/server'
 
@@ -43,7 +44,7 @@ async function createSession(session_id: string) {
   const activated = await request(relay)
     .post('/api/activate')
     .send({ code: created.body.access_code, session_id })
-  return { bridgeToken: created.body.bridge_token as string, viewerToken: activated.body.viewer_token as string }
+  return { bridgeToken: created.body.bridge_token as string, viewerToken: viewerTokenFrom(activated) }
 }
 
 function connectBridge(session_id: string, token: string): Promise<WebSocket> {

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from 'vitest'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { shutdown, startServer } from '../src/server'
 
 /**
@@ -42,7 +43,7 @@ beforeEach(async () => {
     .post('/api/activate')
     .send({ code: created.body.access_code, session_id: 'ses_shutdown' })
   expect(activated.status).toBe(200)
-  viewerToken = activated.body.viewer_token
+  viewerToken = viewerTokenFrom(activated)
 })
 
 afterEach(async () => {

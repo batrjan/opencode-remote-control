@@ -4,6 +4,7 @@ import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import vm from 'node:vm'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { createApp, startServer } from '../src/server'
 import { Store } from '../src/store'
 import { BridgeClient } from '../src/ws/bridge'
@@ -80,7 +81,7 @@ beforeAll(async () => {
     .post('/api/activate')
     .send({ code: created.body.access_code, session_id: 'ses_guard1' })
   expect(activated.status).toBe(200)
-  cookie = `viewer_token=${activated.body.viewer_token}`
+  cookie = `viewer_token=${viewerTokenFrom(activated)}`
 
   bridge = new RelayWSClient(relayUrl, new OpencodeClient(`http://127.0.0.1:${opencodePort}`, 'opencode', ''))
   await bridge.connect('ses_guard1', bridgeToken)

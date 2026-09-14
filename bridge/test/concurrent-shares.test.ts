@@ -121,7 +121,12 @@ async function activate(sessionId: string, code: string): Promise<string> {
     body: JSON.stringify({ code, session_id: sessionId }),
   })
   expect(res.status).toBe(200)
-  return ((await res.json()) as { viewer_token: string }).viewer_token
+  await res.arrayBuffer()
+  // The relay sends the token only as the HttpOnly viewer cookie; the body is
+  // just { session_id }.
+  const cookie = res.headers.getSetCookie().find((c) => c.startsWith('viewer_token='))
+  expect(cookie).toBeTruthy()
+  return decodeURIComponent(cookie!.slice('viewer_token='.length).split(';')[0]!)
 }
 
 async function viewerGet(sessionId: string, token: string): Promise<number> {

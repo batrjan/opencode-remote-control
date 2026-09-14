@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { createApp } from '../src/server'
 import { Store } from '../src/store'
 
@@ -29,7 +30,7 @@ async function shareAndJoin(app: ReturnType<typeof createApp>, id: string) {
     .send({ code: created.body.access_code, session_id: id })
   expect(activated.status).toBe(200)
   return {
-    cookie: `viewer_token=${activated.body.viewer_token}`,
+    cookie: `viewer_token=${viewerTokenFrom(activated)}`,
     code: created.body.access_code as string,
     bridgeToken: created.body.bridge_token as string,
   }

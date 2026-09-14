@@ -3,6 +3,7 @@ import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { startServer } from '../src/server'
 import { OpencodeClient } from '../../bridge/src/opencode'
 import { RelayWSClient } from '../../bridge/src/relay'
@@ -53,7 +54,7 @@ beforeAll(async () => {
     .set('x-api-key', API_KEY)
     .send({ session_id: 'sess1', directory: '/path', title: 'title' })
   const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'sess1' })
-  viewerToken = activated.body.viewer_token
+  viewerToken = viewerTokenFrom(activated)
 
   bridge = new RelayWSClient(
     relayUrl,

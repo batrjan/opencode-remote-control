@@ -3,6 +3,7 @@ import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { startServer } from '../src/server'
 import { filterProjects } from '../src/proxy/adapter'
 import { OpencodeClient } from '../../bridge/src/opencode'
@@ -128,7 +129,7 @@ beforeAll(async () => {
   expect(created.status).toBe(201)
   const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'sess1' })
   expect(activated.status).toBe(200)
-  viewerToken = activated.body.viewer_token
+  viewerToken = viewerTokenFrom(activated)
 
   // sess2 gets a viewer token but no bridge connection (for the 502 case).
   const created2 = await request(relay)
@@ -136,7 +137,7 @@ beforeAll(async () => {
     .set('x-api-key', API_KEY)
     .send({ session_id: 'sess2', directory: '/path', title: 'title' })
   const activated2 = await request(relay).post('/api/activate').send({ code: created2.body.access_code, session_id: 'sess2' })
-  sess2ViewerToken = activated2.body.viewer_token
+  sess2ViewerToken = viewerTokenFrom(activated2)
 
   bridge = new RelayWSClient(
     relayUrl,

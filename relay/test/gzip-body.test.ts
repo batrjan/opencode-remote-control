@@ -3,6 +3,7 @@ import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { gzipSync } from 'node:zlib'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { WebSocket } from 'ws'
 import { startServer } from '../src/server'
 import { GZIP_MAX_RATIO } from '../src/ws/bridge'
@@ -61,7 +62,7 @@ async function share(session_id: string) {
   expect(created.status).toBe(201)
   const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id })
   expect(activated.status).toBe(200)
-  return { bridgeToken: created.body.bridge_token as string, viewerToken: activated.body.viewer_token as string }
+  return { bridgeToken: created.body.bridge_token as string, viewerToken: viewerTokenFrom(activated) }
 }
 
 /** A transcript-shaped body: repetitive structure, varied text. */

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, expect, test } from 'vitest'
 import type { Server } from 'node:http'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { startServer } from '../src/server'
 
 /**
@@ -45,7 +46,7 @@ async function shareAndJoin(id: string, directory: string) {
   expect(activated.status).toBe(200)
   const redirect = await request(relay)
     .get(`/${id}`)
-    .set('Cookie', `viewer_token=${activated.body.viewer_token}`)
+    .set('Cookie', `viewer_token=${viewerTokenFrom(activated)}`)
   expect(redirect.status).toBe(302)
   return { location: redirect.headers.location as string, bridgeToken: created.body.bridge_token as string }
 }

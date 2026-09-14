@@ -1,5 +1,6 @@
 import { expect, test, vi, afterEach } from 'vitest'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { createApp } from '../src/server'
 import { Store } from '../src/store'
 import { config } from '../src/config'
@@ -57,7 +58,7 @@ test('a whole office behind one address can join the same share', async () => {
   for (let i = 0; i < joins; i++) {
     const res = await activate(app, 'ses_office', access_code, OFFICE)
     expect(res.status).toBe(200)
-    tokens.add(res.body.viewer_token)
+    tokens.add(viewerTokenFrom(res))
   }
   expect(tokens.size).toBe(joins)
 })

@@ -5,7 +5,8 @@ import { MAX_SESSION_ID } from './skill.js'
 import { setViewerCookie } from './viewerCookie.js'
 
 /**
- * POST /api/activate — exchange an access code for a viewer token.
+ * POST /api/activate — exchange an access code for a viewer token, issued as
+ * the HttpOnly viewer cookie only; the body is `{ session_id }`.
  * Same error body for unknown/blocked codes; 429 only on per-IP limits.
  * Failed attempts are delayed (activateFailDelayMs, 1s by default) as a
  * brute-force brake; the delay is disabled in tests via the env flag.
@@ -40,7 +41,12 @@ export function activateRouter(store: Store) {
       // the cookie sends it again, so it slides with the token (see
       // setViewerCookie).
       setViewerCookie(res, viewer_token)
-      return res.json({ session_id, viewer_token })
+      // The cookie is the only copy the caller gets. The token used to be in
+      // this body as well, from a design that kept it in localStorage; nothing
+      // reads it (the join page checks res.ok and navigates to /<id>, which
+      // authenticates by the cookie), and a body is readable by any script in
+      // the join page, which an HttpOnly cookie is not.
+      return res.json({ session_id })
     } catch (err) {
       if (err instanceof Error && err.message === 'rate limited') {
         console.warn(`[activate] rate limited ip=${ip}`)

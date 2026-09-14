@@ -3,6 +3,7 @@ import { createServer } from 'node:http'
 import type { Server, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import request from 'supertest'
+import { viewerTokenFrom } from './helpers/viewer-token'
 import { startServer } from '../src/server'
 import { OpencodeClient } from '../../bridge/src/opencode'
 import { RelayWSClient } from '../../bridge/src/relay'
@@ -129,7 +130,7 @@ beforeAll(async () => {
   expect(created.status).toBe(201)
   const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: PARENT })
   expect(activated.status).toBe(200)
-  viewerToken = activated.body.viewer_token
+  viewerToken = viewerTokenFrom(activated)
 
   bridge = new RelayWSClient(relayUrl, new OpencodeClient(opencodeUrl, 'opencode', 'password'))
   await bridge.connect(PARENT, created.body.bridge_token, DIR)
