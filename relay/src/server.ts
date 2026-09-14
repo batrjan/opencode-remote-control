@@ -44,12 +44,13 @@ const SERVER_URL_RESET = `<script id="oc-relay-server-url">
   try {
     // The viewer is bound to exactly one session and one project. Any
     // persisted opencode state from earlier origins/sessions (server URLs,
-    // workspace/directory state, drafts) poisons the bootstrap — observed as
-    // a phantom /api/opencode server and corrupted binary directory params
+    // workspace/directory state) poisons the bootstrap — observed as a
+    // phantom /api/opencode server and corrupted binary directory params
     // that 500 /api/reference and force /new-session. Wipe ALL opencode.*
     // keys, then point the default server at this origin (root-mounted
     // proxy). The viewer_token lives in an HttpOnly cookie, not localStorage,
-    // so this does not log the user out.
+    // so this does not log the user out. Drafts and the prompt history are
+    // not in localStorage: see draftsReset.
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const k = localStorage.key(i)
       if (k && (k.startsWith('opencode.') || k.startsWith('oc-') || k.startsWith('prefix:'))) {
@@ -133,6 +134,87 @@ const authGuard = (shareId: string | undefined) => `<script id="oc-relay-auth-gu
 })()
 </script>`
 
+/**
+ * Clears the UI's drafts when the browser moves on to a different share.
+ *
+ * Every share is served from this one origin, and the UI keeps its drafts in
+ * IndexedDB ("opencode-drafts", stores documents and blobs), which the
+ * localStorage reset above never reached. Unsent drafts there are keyed by
+ * session, but the prompt history is kept per browser — one list of the last
+ * 100 prompts sent, whatever the session or server. So a prompt sent in one
+ * share came back on ArrowUp in the empty input of any share opened later in
+ * the same browser, for as long as the browser kept it: past the end of that
+ * share and the revocation of its tokens. Upstream
+ * opencode web has one owner per origin; the relay puts shares of different
+ * owners on one.
+ *
+ * The share is the one the relay names as it serves the shell, as for
+ * authGuard: a subagent's page of the same share keeps the drafts, which are
+ * the viewer's own. It is recorded in localStorage under a key the reset above
+ * does not remove, once the clear has committed; a reload within the share
+ * finds it and changes nothing. /terminal names no share and clears nothing.
+ *
+ * - Opened without a version, so an existing database is taken as it is. One
+ *   that does not exist would be created empty at version 1, and the UI's own
+ *   open at version 1 would then never create its stores: that upgrade is
+ *   aborted, and there is nothing to clear.
+ * - Cleared, not deleted: the UI never closes its connection on versionchange,
+ *   so a delete would wait on any other tab still open on this origin, and
+ *   this tab's own open would wait behind the delete.
+ * - Classic inline in <head>, so its open is queued ahead of the UI's; the
+ *   clear transaction is then created first and runs before any read the UI
+ *   makes of those stores.
+ *
+ * A tab of the earlier share still open in the same browser keeps its history
+ * in memory and may write it back; only closing it ends that.
+ */
+const DRAFTS_SHARE_KEY = 'relay-drafts-share'
+const draftsReset = (shareId: string) => `<script id="oc-relay-drafts-reset">
+;(() => {
+  try {
+    // "<" escaped so no share id can end this script early.
+    const share = ${JSON.stringify(shareId).replace(/</g, '\\u003c')}
+    const key = ${JSON.stringify(DRAFTS_SHARE_KEY)}
+    if (localStorage.getItem(key) === share) return
+    const mark = () => {
+      try {
+        localStorage.setItem(key, share)
+      } catch {}
+    }
+    const req = indexedDB.open('opencode-drafts')
+    // No database yet, so nothing of an earlier share's either. Any other
+    // failure leaves the record alone, and the next load tries again.
+    let absent = false
+    req.onupgradeneeded = () => {
+      absent = true
+      req.transaction.abort()
+    }
+    req.onerror = () => {
+      if (absent) mark()
+    }
+    req.onsuccess = () => {
+      const db = req.result
+      try {
+        const stores = ['documents', 'blobs'].filter((name) => db.objectStoreNames.contains(name))
+        if (stores.length === 0) {
+          db.close()
+          return mark()
+        }
+        const tx = db.transaction(stores, 'readwrite')
+        for (const name of stores) tx.objectStore(name).clear()
+        tx.oncomplete = () => {
+          db.close()
+          mark()
+        }
+        tx.onabort = () => db.close()
+      } catch {
+        db.close()
+      }
+    }
+  } catch {}
+})()
+</script>`
+
 /** The UI shell for a page of the share `shareId` (none for /terminal). */
 function terminalHtml(shareId?: string): string {
   if (cachedShell === undefined) {
@@ -140,7 +222,8 @@ function terminalHtml(shareId?: string): string {
     const anchor = html.indexOf('</head>')
     cachedShell = anchor === -1 ? { head: html, tail: '' } : { head: html.slice(0, anchor), tail: html.slice(anchor) }
   }
-  return cachedShell.head + SERVER_URL_RESET + authGuard(shareId) + cachedShell.tail
+  const drafts = shareId === undefined ? '' : draftsReset(shareId)
+  return cachedShell.head + SERVER_URL_RESET + drafts + authGuard(shareId) + cachedShell.tail
 }
 
 /**
