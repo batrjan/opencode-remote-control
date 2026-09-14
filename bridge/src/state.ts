@@ -38,8 +38,10 @@ export interface SessionState {
    * the server running forever, holding its port. The next `start` then detects
    * that stale server and attaches to it — a server belonging to a share that
    * ended, possibly for another project. Recording the pid lets `stop` finish
-   * the job even when the bridge never got to. Absent when the bridge attached
-   * to a server it did not start (that one is not ours to kill).
+   * the job even when the bridge never got to. Also the server a dead share of
+   * the same session spawned, when a start kept it running and took it over.
+   * Absent when the bridge attached to a server no share started (that one is
+   * not ours to kill).
    */
   server_pid?: number
 }

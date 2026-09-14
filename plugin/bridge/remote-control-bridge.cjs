@@ -8324,8 +8324,12 @@ var import_meta = {};
 async function startBridge(relayUrl, apiKey, opts = {}) {
   const relay = new RelayClient(relayUrl, apiKey);
   const namedServer = opts.opencodeUrl ? { namedPort: urlPort(opts.opencodeUrl) } : opts.port !== void 0 ? { namedPort: opts.port } : void 0;
+  let keptServerOf;
+  const keepServer = (earlier) => {
+    keptServerOf = earlier;
+  };
   if (opts.sessionId !== void 0) {
-    await settleEarlierShare(relay, opts.sessionId, namedServer ?? true);
+    await settleEarlierShare(relay, opts.sessionId, namedServer ?? true, keepServer);
   }
   let spawnedServer;
   let resolvedPort;
@@ -8365,7 +8369,8 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
       picked?.title ?? "",
       endLeftoverServer,
       // An explicit id was settled above, before anything was spawned.
-      opts.sessionId === void 0
+      opts.sessionId === void 0,
+      keepServer
     ));
     saveSessionState({
       session_id,
@@ -8374,10 +8379,11 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
       relay: relayUrl,
       started_at: Date.now(),
       pid: process.pid,
-      // Only when WE spawned it: a server that was already listening belongs to
-      // the user (their GUI, their own `opencode serve`) and must never be killed
-      // by `stop`.
-      server_pid: spawnedServer?.pid
+      // Only when WE spawned it, or took it over from a dead share of this
+      // session that spawned it (keptServerOf): a server that was already
+      // listening belongs to the user (their GUI, their own `opencode serve`)
+      // and must never be killed by `stop`.
+      server_pid: spawnedServer?.pid ?? keptServerOf?.server_pid
     });
     ws = new RelayWSClient(relayUrl, opencode);
     try {
@@ -8393,6 +8399,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
   } catch (err) {
     process.off("exit", killSpawnedServer);
     killSpawnedServer();
+    if (keptServerOf && loadSessionState(keptServerOf.session_id) === void 0) saveSessionState(keptServerOf);
     throw err;
   }
   let resolveClosed;
@@ -8407,6 +8414,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
     process.off("exit", killSpawnedServer);
     ws.close();
     killSpawnedServer();
+    if (keptServerOf) terminateSpawnedServer(keptServerOf.server_pid, keptServerOf.started_at);
     try {
       await relay.deleteSession(session_id, bridge_token);
     } catch {
@@ -8467,10 +8475,10 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
   watchdog.unref();
   return { session_id, access_code, viewer_url, closed, stop: () => stop() };
 }
-async function registerShare(relay, sessionId, directory, title, endLeftoverServer, settleFirst) {
+async function registerShare(relay, sessionId, directory, title, endLeftoverServer, settleFirst, keepServer) {
   const isConflict = (err) => err instanceof RelayHttpError && err.status === 409;
   const key = ownerKey(relay.url, sessionId);
-  if (settleFirst) await settleEarlierShare(relay, sessionId, endLeftoverServer);
+  if (settleFirst) await settleEarlierShare(relay, sessionId, endLeftoverServer, keepServer);
   let conflict;
   try {
     return await relay.createSession(sessionId, directory, title, key);
@@ -8478,7 +8486,7 @@ async function registerShare(relay, sessionId, directory, title, endLeftoverServ
     if (!isConflict(err)) throw err;
     conflict = err;
   }
-  if (await settleEarlierShare(relay, sessionId, endLeftoverServer)) {
+  if (await settleEarlierShare(relay, sessionId, endLeftoverServer, keepServer)) {
     try {
       return await relay.createSession(sessionId, directory, title, key);
     } catch (err) {
@@ -8495,7 +8503,7 @@ async function registerShare(relay, sessionId, directory, title, endLeftoverServ
     `session ${sessionId} is already registered on the relay (409) by a share this machine has no record of \u2014 end it with /remote-control/stop where it was started, or wait for the relay to expire it (by default after a day without activity)`
   );
 }
-async function settleEarlierShare(relay, sessionId, endLeftoverServer) {
+async function settleEarlierShare(relay, sessionId, endLeftoverServer, keepServer) {
   const state = loadSessionState(sessionId);
   if (!state) return false;
   if (shareBridgeRunning(state)) {
@@ -8518,13 +8526,26 @@ async function settleEarlierShare(relay, sessionId, endLeftoverServer) {
   clearOwnSessionState(sessionId, state.bridge_token);
   console.warn(`bridge: ended the earlier share of session ${sessionId}; its bridge (pid ${state.pid}) was no longer running`);
   const endServer = typeof endLeftoverServer === "boolean" ? endLeftoverServer : state.server_pid !== void 0 && await serverListensOnPort(state.server_pid, endLeftoverServer.namedPort) === false;
-  if (endServer && terminateSpawnedServer(state.server_pid, state.started_at)) {
+  if (!endServer) {
+    if (spawnedServerRunning(state)) keepServer(state);
+  } else if (terminateSpawnedServer(state.server_pid, state.started_at)) {
     const deadline = Date.now() + LEFTOVER_SERVER_EXIT_WAIT_MS;
     while (pidAlive(state.server_pid) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
   return true;
+}
+function spawnedServerRunning(state, inspect = describeProcess) {
+  const pid = state.server_pid;
+  if (!pid || !(pid > 1) || pid === process.pid) return false;
+  let snapshot;
+  try {
+    snapshot = inspect(pid);
+  } catch {
+    snapshot = null;
+  }
+  return snapshot !== null && refuseAsSpawnedServer(snapshot, state.started_at) === null;
 }
 function shareRelay(state, current) {
   const recorded = originOf(state.relay);

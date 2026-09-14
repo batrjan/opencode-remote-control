@@ -331,6 +331,14 @@ test.skipIf(process.platform === 'win32')(
  * running for good, where the next detection took it for the owner's server.
  * The leftover is kept only while it may be the named server: lsof lists it on
  * that port, or does not list it at all (no lsof, nothing to decide from).
+ *
+ * A kept leftover still lost its record: the settle drops the dead share's
+ * state, the only one naming it, and the new share recorded no server_pid. Once
+ * that share stopped — or right away, when the named server was really the
+ * owner's and lsof just could not tell — the leftover ran on unsecured with
+ * nothing to end it, and the next detection took it for the owner's own server.
+ * The new share now takes it over: records it, ends it when it stops, and a
+ * start that fails puts the dead share's record back.
  */
 
 const NAMED = {
@@ -346,7 +354,8 @@ for (const [how, withId, listed] of [
 ] as const) {
   test.skipIf(process.platform === 'win32')(
     `a start ${withId ? 'with' : 'without'} a session id and its server named by ${how} runs on the server a dead share of it left behind` +
-      (listed ? ', which lsof lists on that port' : ', which lsof does not list'),
+      (listed ? ', which lsof lists on that port' : ', which lsof does not list') +
+      ', and takes that server over',
     async () => {
       const id = `ses_named_${how === '--port' ? 'port' : 'url'}_${withId ? 'id' : 'picked'}_${listed ? 'listed' : 'unlisted'}`
       listSessions([id])
@@ -362,18 +371,95 @@ for (const [how, withId, listed] of [
         expect(state?.bridge_token).not.toBe(earlier.bridge_token)
         // The dead share was still ended on the relay...
         expect(await new RelayClient(relayUrl).deleteSession(id, earlier.bridge_token)).toBe(404)
-        // ...but the server this share runs on was kept, and is not recorded as its own.
+        // ...but the server this share runs on was kept, and recorded as its own:
+        // the state just dropped was the only one naming it.
         expect({ leftoverAlive: alive(leftover.pid), recorded: state?.server_pid }).toEqual({
           leftoverAlive: true,
-          recorded: undefined,
+          recorded: leftover.pid,
         })
       } finally {
         await handle.stop()
       }
+      // Ended with the share, as the share that spawned it would have.
+      expect(await until(() => !alive(leftover.pid), 5000)).toBe(true)
     },
     30_000,
   )
 }
+
+for (const [how, withId] of [
+  ['--port', true],
+  ['a URL', true],
+  ['--port', false],
+] as const) {
+  test.skipIf(process.platform === 'win32')(
+    `a start ${withId ? 'with' : 'without'} a session id naming the owner's own server by ${how} keeps a dead share's server that lsof does not list on record, so no later start attaches to it and stopping ends it`,
+    async () => {
+      const id = `ses_owner_unlisted_${how === '--port' ? 'port' : 'url'}_${withId ? 'id' : 'picked'}`
+      const later = `ses_later_${how === '--port' ? 'port' : 'url'}_${withId ? 'id' : 'picked'}`
+      listSessions([id])
+      const ownerPort = await ownerServer()
+      const leftover = await leftoverServer()
+      await deadShare(id, leftover.pid)
+      // Nothing listed: the leftover cannot be told apart from the named server, so it is kept.
+      vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+      const handle = await startBridge(relayUrl, API_KEY, { ...(withId ? { sessionId: id } : {}), ...NAMED[how](ownerPort) })
+      let laterServer: number | undefined
+      try {
+        expect(handle.session_id).toBe(id)
+        expect({ leftoverAlive: alive(leftover.pid), recorded: loadSessionState(id)?.server_pid }).toEqual({
+          leftoverAlive: true,
+          recorded: leftover.pid,
+        })
+
+        // A later start that detects its server finds only the leftover, and must not take it for the owner's.
+        listSessions([later, id])
+        process.env.FAKE_LSOF_LINES = lsofLine(leftover.pid, leftover.port)
+        const next = await startBridge(relayUrl, API_KEY)
+        try {
+          expect(next.session_id).toBe(later)
+          laterServer = loadSessionState(later)?.server_pid
+          expect(typeof laterServer === 'number' && laterServer !== leftover.pid && alive(laterServer)).toBe(true)
+        } finally {
+          await next.stop()
+        }
+      } finally {
+        await handle.stop()
+      }
+      expect(await until(() => !alive(leftover.pid) && !alive(laterServer), 5000)).toBe(true)
+    },
+    30_000,
+  )
+}
+
+test.skipIf(process.platform === 'win32')(
+  'a start with a session id that keeps a dead share\'s server and then fails puts that share\'s record of the server back',
+  async () => {
+    const id = 'ses_named_port_failed'
+    listSessions([id])
+    const leftover = await leftoverServer()
+    const earlier = await deadShare(id, leftover.pid)
+    const recorded = loadSessionState(id)
+    process.env.FAKE_LSOF_LINES = lsofLine(leftover.pid, leftover.port)
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    // The relay this start is pointed at refuses connections; the dead share is
+    // still settled on the relay it was registered on, which its state names.
+    const closed = createServer()
+    await new Promise<void>((resolve) => closed.listen(0, '127.0.0.1', resolve))
+    const deadRelay = `http://127.0.0.1:${(closed.address() as AddressInfo).port}`
+    await new Promise((resolve) => closed.close(resolve))
+
+    await expect(startBridge(deadRelay, API_KEY, { sessionId: id, port: leftover.port })).rejects.toThrow(/relay/)
+    expect(await new RelayClient(relayUrl).deleteSession(id, earlier.bridge_token)).toBe(404)
+    // The server is still running, and still on record: `stop` ends it, and detection leaves it alone.
+    expect({ leftoverAlive: alive(leftover.pid), state: loadSessionState(id) }).toEqual({ leftoverAlive: true, state: recorded })
+    expect(spawnedByRecordedShare(leftover.pid)).toBe(true)
+    expect(await stopBridge(relayUrl, id, API_KEY)).toBeUndefined()
+    expect(await until(() => !alive(leftover.pid), 5000)).toBe(true)
+  },
+  30_000,
+)
 
 for (const [how, withId] of [
   ['--port', true],

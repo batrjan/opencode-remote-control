@@ -94,12 +94,24 @@ export async function startBridge(
     : opts.port !== undefined
       ? { namedPort: opts.port }
       : undefined
+  // The state of a dead share whose `opencode serve` settling it kept running
+  // (see settleEarlierShare). That state was the only record of the server, and
+  // dropping it with nothing in its place left the server running unsecured for
+  // good — right away when the named server was the owner's own and lsof could
+  // not tell, or once this share stopped when it ran on that very server — and
+  // the next detection took it for the owner's. So this share takes it over:
+  // records it as its own server, ends it when it ends, and a start that fails
+  // puts the dead share's record back.
+  let keptServerOf: SessionState | undefined
+  const keepServer = (earlier: SessionState) => {
+    keptServerOf = earlier
+  }
   // An earlier share of this session recorded on this machine is settled
   // before any server is detected or spawned: a live one is refused without
   // anything being started, and the `opencode serve` a dead one left behind
   // has to be gone before detection could mistake it for the user's own.
   if (opts.sessionId !== undefined) {
-    await settleEarlierShare(relay, opts.sessionId, namedServer ?? true)
+    await settleEarlierShare(relay, opts.sessionId, namedServer ?? true, keepServer)
   }
   // When no opencode server is listening (plain console runs use an
   // in-process server with no HTTP port), spawn `opencode serve` ourselves so
@@ -174,6 +186,7 @@ export async function startBridge(
       endLeftoverServer,
       // An explicit id was settled above, before anything was spawned.
       opts.sessionId === undefined,
+      keepServer,
     ))
     // Persist the owner token so `stop` (even from another shell) can delete
     // the session later. 0600 perms; cleared on stop.
@@ -187,10 +200,11 @@ export async function startBridge(
       relay: relayUrl,
       started_at: Date.now(),
       pid: process.pid,
-      // Only when WE spawned it: a server that was already listening belongs to
-      // the user (their GUI, their own `opencode serve`) and must never be killed
-      // by `stop`.
-      server_pid: spawnedServer?.pid,
+      // Only when WE spawned it, or took it over from a dead share of this
+      // session that spawned it (keptServerOf): a server that was already
+      // listening belongs to the user (their GUI, their own `opencode serve`)
+      // and must never be killed by `stop`.
+      server_pid: spawnedServer?.pid ?? keptServerOf?.server_pid,
     })
     ws = new RelayWSClient(relayUrl, opencode)
     try {
@@ -217,6 +231,11 @@ export async function startBridge(
     // without a server_pid, so nothing ever killed it.
     process.off('exit', killSpawnedServer)
     killSpawnedServer()
+    // A server kept from a dead share is not ended: it may be the one the owner
+    // named, and a retry on it would find nothing. Its record goes back instead
+    // (the relay registration it held is ended already), unless a share wrote
+    // one of its own meanwhile, so `stop` or the next start still settles it.
+    if (keptServerOf && loadSessionState(keptServerOf.session_id) === undefined) saveSessionState(keptServerOf)
     throw err
   }
 
@@ -237,8 +256,9 @@ export async function startBridge(
     ws.close()
     // If we spawned the opencode server ourselves (the TUI has no HTTP port,
     // so this is the normal path), stop it too — the share's lifetime owns
-    // the server it created.
+    // the server it created. So does it own one it took over from a dead share.
     killSpawnedServer()
+    if (keptServerOf) terminateSpawnedServer(keptServerOf.server_pid, keptServerOf.started_at)
     try {
       await relay.deleteSession(session_id, bridge_token)
     } catch {
@@ -358,12 +378,13 @@ async function registerShare(
   title: string,
   endLeftoverServer: LeftoverServerPolicy,
   settleFirst: boolean,
+  keepServer: (earlier: SessionState) => void,
 ): Promise<RelaySession> {
   const isConflict = (err: unknown): err is RelayHttpError => err instanceof RelayHttpError && err.status === 409
   // Bound to this relay: the key is sent in the clear, and must prove nothing
   // on any other one (see ownerKey).
   const key = ownerKey(relay.url, sessionId)
-  if (settleFirst) await settleEarlierShare(relay, sessionId, endLeftoverServer)
+  if (settleFirst) await settleEarlierShare(relay, sessionId, endLeftoverServer, keepServer)
   let conflict: RelayHttpError
   try {
     return await relay.createSession(sessionId, directory, title, key)
@@ -371,7 +392,7 @@ async function registerShare(
     if (!isConflict(err)) throw err
     conflict = err
   }
-  if (await settleEarlierShare(relay, sessionId, endLeftoverServer)) {
+  if (await settleEarlierShare(relay, sessionId, endLeftoverServer, keepServer)) {
     try {
       return await relay.createSession(sessionId, directory, title, key)
     } catch (err) {
@@ -410,11 +431,16 @@ async function registerShare(
  *   state and, as `endLeftoverServer` allows, the `opencode serve` it spawned —
  *   what `stop` would have done. Throws when that relay cannot be told, keeping
  *   the state so a retry or `stop` still can.
+ *
+ * A spawned server that is kept running and still is that server is handed to
+ * `keepServer` with the dropped state, the only record of it: the new share
+ * has to take it over (see keptServerOf in startBridge).
  */
 async function settleEarlierShare(
   relay: RelayClient,
   sessionId: string,
   endLeftoverServer: LeftoverServerPolicy,
+  keepServer: (earlier: SessionState) => void,
 ): Promise<boolean> {
   const state = loadSessionState(sessionId)
   if (!state) return false
@@ -447,14 +473,16 @@ async function settleEarlierShare(
   // state already, and a failure of ours further on must not cost it that.
   clearOwnSessionState(sessionId, state.bridge_token)
   console.warn(`bridge: ended the earlier share of session ${sessionId}; its bridge (pid ${state.pid}) was no longer running`)
-  // The state just dropped was the only record of that server: kept here, it
-  // is left running with nothing that would ever end it.
+  // The state just dropped was the only record of that server: a server kept
+  // here is handed on with it, to the share that takes it over.
   const endServer =
     typeof endLeftoverServer === 'boolean'
       ? endLeftoverServer
       : state.server_pid !== undefined &&
         (await serverListensOnPort(state.server_pid, endLeftoverServer.namedPort)) === false
-  if (endServer && terminateSpawnedServer(state.server_pid, state.started_at)) {
+  if (!endServer) {
+    if (spawnedServerRunning(state)) keepServer(state)
+  } else if (terminateSpawnedServer(state.server_pid, state.started_at)) {
     // Detection runs next, and a server still shutting down answers its health
     // probe like any other: the new share would attach to it and lose it a
     // moment later.
@@ -464,6 +492,23 @@ async function settleEarlierShare(
     }
   }
   return true
+}
+
+/**
+ * Whether the `opencode serve` a share recorded as `server_pid` still runs as
+ * that server — the check `stop` makes before signalling it, so a recycled pid
+ * is never taken over. Never throws: without `ps` it answers no.
+ */
+function spawnedServerRunning(state: SessionState, inspect: (pid: number) => ProcessSnapshot | null = describeProcess): boolean {
+  const pid = state.server_pid
+  if (!pid || !(pid > 1) || pid === process.pid) return false
+  let snapshot: ProcessSnapshot | null
+  try {
+    snapshot = inspect(pid)
+  } catch {
+    snapshot = null
+  }
+  return snapshot !== null && refuseAsSpawnedServer(snapshot, state.started_at) === null
 }
 
 /**
@@ -502,7 +547,8 @@ const LEFTOVER_SERVER_EXIT_WAIT_MS = 5_000
  * another port (serverListensOnPort answers false). While it may be the named
  * server (listed on that port, or not listed at all) it is kept: ending it left
  * the start nothing to run on, "local opencode server unreachable" on the port
- * it had just emptied itself.
+ * it had just emptied itself. A kept server is taken over by the new share
+ * (see keptServerOf in startBridge), whichever server that share runs on.
  */
 type LeftoverServerPolicy = boolean | { namedPort: number | undefined }
 
