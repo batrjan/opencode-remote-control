@@ -26,6 +26,7 @@ const STATE_DIR = ['.agents', 'skills', 'remote-control', 'state'] as const
 
 let home: string
 let relay: Server
+let relayUrl: string
 let seen: string[]
 const saved = { HOME: process.env.HOME, PATH: process.env.PATH, RELAY: process.env.OPENCODE_REMOTE_CONTROL_RELAY }
 
@@ -36,6 +37,18 @@ function stateFile(id: string): string {
 /** A made-up access code per fixture share, so a log can be told apart by the code it holds. */
 function codeOf(id: string): string {
   return `CODE${id.slice(-1).toUpperCase()}${id.slice(-1).toUpperCase()}`
+}
+
+/**
+ * A share of `id` recorded the way `start` records one: through the stub relay,
+ * which is the only relay `stop` and `status` send its token to.
+ */
+function share(id: string, started_at: number, fields: Record<string, unknown> = {}) {
+  writeFileSync(
+    stateFile(id),
+    JSON.stringify({ session_id: id, access_code: codeOf(id), bridge_token: `tok-${id}`, relay: relayUrl, started_at, ...fields }),
+    { mode: 0o600 },
+  )
 }
 
 function logFile(): string {
@@ -50,16 +63,6 @@ function logOf(id: string): string {
 beforeEach(async () => {
   home = mkdtempSync(path.join(tmpdir(), 'rc-stop-session-'))
   mkdirSync(path.join(home, ...STATE_DIR), { recursive: true, mode: 0o700 })
-  // A is the older share, B the newest — the one the old fallback always hit.
-  // No pid: stop must not go signalling anything on the test machine.
-  const share = (id: string, started_at: number) =>
-    writeFileSync(
-      stateFile(id),
-      JSON.stringify({ session_id: id, access_code: codeOf(id), bridge_token: `tok-${id}`, relay: '', started_at }),
-      { mode: 0o600 },
-    )
-  share('ses_A', Date.now() - 60_000)
-  share('ses_B', Date.now())
 
   seen = []
   relay = createServer((req, res) => {
@@ -81,6 +84,12 @@ beforeEach(async () => {
     res.end('{}')
   })
   await new Promise<void>((resolve) => relay.listen(0, '127.0.0.1', resolve))
+  relayUrl = `http://127.0.0.1:${(relay.address() as AddressInfo).port}`
+
+  // A is the older share, B the newest — the one the old fallback always hit.
+  // No pid: stop must not go signalling anything on the test machine.
+  share('ses_A', Date.now() - 60_000)
+  share('ses_B', Date.now())
 
   // `status` also scans the machine for an OpenCode server; a stub lsof that
   // lists nothing keeps whatever really runs here out of the test.
@@ -91,7 +100,7 @@ beforeEach(async () => {
 
   process.env.HOME = home
   process.env.PATH = `${bin}${path.delimiter}${saved.PATH ?? ''}`
-  process.env.OPENCODE_REMOTE_CONTROL_RELAY = `http://127.0.0.1:${(relay.address() as AddressInfo).port}`
+  process.env.OPENCODE_REMOTE_CONTROL_RELAY = relayUrl
 })
 
 afterEach(async () => {
@@ -214,11 +223,7 @@ test('stop while the relay cannot be told still ends the share, scrubs the code 
   // the same share, same code, live again. The local share must end regardless,
   // and the owner must hear that the relay was not reached rather than a plain
   // "stopped".
-  writeFileSync(
-    stateFile('ses_down'),
-    JSON.stringify({ session_id: 'ses_down', access_code: 'X', bridge_token: 'tok-ses_down', relay: '', started_at: Date.now() }),
-    { mode: 0o600 },
-  )
+  share('ses_down', Date.now(), { access_code: 'X' })
   const log = path.join(home, ...STATE_DIR, 'bridge.log')
   writeFileSync(log, 'https://relay.invalid/ses_down\nCODE: XXXXXX\n', { mode: 0o600 })
 

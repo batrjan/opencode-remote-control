@@ -12,7 +12,7 @@ import {
   watchdogStrikes,
 } from './config.js'
 import { detectOpenCodePort, ensureOpenCodeServer } from './detect.js'
-import { describeError } from './errors.js'
+import { describeError, originOf } from './errors.js'
 import { OpencodeClient } from './opencode.js'
 import { RelayClient, RelayHttpError, RelayWSClient, type RelaySession } from './relay.js'
 import {
@@ -377,9 +377,10 @@ async function registerShare(
  * - Its bridge still runs: throws, naming the pid and how to end that share.
  *   Taking it over would delete its registration under its viewers.
  * - Its bridge is gone: ends its relay registration with the bridge_token from
- *   its state, drops that state and, with `endLeftoverServer`, the
- *   `opencode serve` it spawned — what `stop` would have done. Throws when the
- *   relay cannot be told, keeping the state so a retry or `stop` still can.
+ *   its state, on the relay it was registered on (see shareRelay), drops that
+ *   state and, with `endLeftoverServer`, the `opencode serve` it spawned — what
+ *   `stop` would have done. Throws when that relay cannot be told, keeping the
+ *   state so a retry or `stop` still can.
  */
 async function settleEarlierShare(relay: RelayClient, sessionId: string, endLeftoverServer: boolean): Promise<boolean> {
   const state = loadSessionState(sessionId)
@@ -392,7 +393,7 @@ async function settleEarlierShare(relay: RelayClient, sessionId: string, endLeft
   }
   let failure: string | undefined
   try {
-    const status = await relay.deleteSession(sessionId, state.bridge_token)
+    const status = await shareRelay(state, relay).deleteSession(sessionId, state.bridge_token)
     // 404: the relay holds nothing under this token any more (expired, or
     // registered again by someone else) — nothing of ours left to end.
     if (status !== 204 && status !== 404) failure = `relay answered ${status}`
@@ -400,9 +401,12 @@ async function settleEarlierShare(relay: RelayClient, sessionId: string, endLeft
     failure = describeRelayError(err)
   }
   if (failure !== undefined) {
+    // `stop` as the way out: the earlier share may sit on a relay the owner
+    // has since moved away from and that will never answer again, and `stop`
+    // drops it on this machine either way.
     throw new Error(
       `session ${sessionId} is still registered by an earlier share whose bridge (pid ${state.pid}) is gone, ` +
-        `and it could not be ended on the relay (${failure}) — try again`,
+        `and it could not be ended on the relay (${failure}) — try again, or run /remote-control/stop to drop it`,
     )
   }
   // By token, not by name: a concurrent start that settled this same dead share
@@ -420,6 +424,32 @@ async function settleEarlierShare(relay: RelayClient, sessionId: string, endLeft
     }
   }
   return true
+}
+
+/**
+ * The relay client a recorded share's bridge_token may be sent with: the one
+ * for the relay that share was registered on, which issued the token.
+ *
+ * `current` is the relay this command was pointed at — `--relay`, or whatever
+ * REMOTE_CONTROL_RELAY says by now — and the owner may have switched it since
+ * the share started. Settling, stopping and probing a share used to send its
+ * token there: a self-hosted or mistyped relay the owner moved to was handed
+ * the live credential of a share on another one, and its operator could
+ * connect to that relay as the share's bridge (serving its viewers, reading
+ * their prompts) or read its directory and title — the very leak the owner_key
+ * is bound to the relay's origin to prevent (see ownerKey). Nor did it end
+ * anything: that relay answered 404, which reads as "already gone".
+ *
+ * Decided by origin, as the owner_key is: a trailing slash or a default port
+ * name the same relay, which keeps the caller's client — its URL as given and
+ * the legacy api key meant for it. Another relay gets a client of its own,
+ * with no key; a state that names no usable relay (hand-edited, truncated)
+ * yields one fetch refuses before any request is made, so its token goes
+ * nowhere.
+ */
+function shareRelay(state: SessionState, current: RelayClient): RelayClient {
+  const recorded = originOf(state.relay)
+  return recorded !== undefined && recorded === originOf(current.url) ? current : new RelayClient(state.relay)
 }
 
 /** How long a start waits for the `opencode serve` of a dead share to exit once signalled. */
@@ -452,8 +482,10 @@ function shareBridgeRunning(state: SessionState, inspect: (pid: number) => Proce
 }
 
 /**
- * End a share: delete the relay session, then take the share down on this
- * machine (state file, bridge process, the server it spawned).
+ * End a share: delete the relay session — on the relay the share was
+ * registered on, which `relayUrl` only is when the owner has not switched
+ * relays since (see shareRelay) — then take the share down on this machine
+ * (state file, bridge process, the server it spawned).
  *
  * Resolves with nothing when the relay confirmed, and with a warning to show
  * the owner when it could not be told — the local teardown happens either way.
@@ -482,7 +514,8 @@ export async function stopBridge(
   // relay's record to a bridge; it proxies nothing and expires on its own.
   let relayFailure: string | undefined
   try {
-    const status = await new RelayClient(relayUrl, apiKey).deleteSession(sessionId, state.bridge_token)
+    // On the relay the share was registered on, whatever `relayUrl` says now (see shareRelay).
+    const status = await shareRelay(state, new RelayClient(relayUrl, apiKey)).deleteSession(sessionId, state.bridge_token)
     // 404 means the session is already gone — stop stays idempotent.
     if (status !== 204 && status !== 404) relayFailure = `relay answered ${status}`
   } catch (err) {
@@ -1010,21 +1043,26 @@ program
         }
       }
       // Pass our own bridge_token so the relay returns the owner-only fields
-      // (directory, title) it withholds from the public presence view.
+      // (directory, title) it withholds from the public presence view — to the
+      // relay the share was registered on, the only one that issued the token
+      // and knows the share, which is named when it is not --relay (see shareRelay).
       const ownerToken = local?.bridge_token
-      const { status, body } = await new RelayClient(opts.relay, opts.apiKey).getSession(sessionId, ownerToken)
+      const current = new RelayClient(opts.relay, opts.apiKey)
+      const probe = local ? shareRelay(local, current) : current
+      const where = probe === current ? '' : ` (relay ${originOf(probe.url) ?? 'unknown'})`
+      const { status, body } = await probe.getSession(sessionId, ownerToken)
       if (status === 404) {
-        console.log(`session ${sessionId}: not found`)
+        console.log(`session ${sessionId}${where}: not found`)
         if (bridgeProcess) console.log(bridgeProcess)
         ok = false
       } else if (status !== 200 || !body) {
-        console.log(`session ${sessionId}: HTTP ${status}`)
+        console.log(`session ${sessionId}${where}: HTTP ${status}`)
         if (bridgeProcess) console.log(bridgeProcess)
         ok = false
       } else {
         const ageMs = Date.now() - body.created_at
         const age = formatDuration(ageMs)
-        console.log(`session ${sessionId}: ${body.status}`)
+        console.log(`session ${sessionId}${where}: ${body.status}`)
         console.log(`  bridge: ${body.bridge_connected ? 'connected' : 'disconnected'}`)
         if (bridgeProcess) console.log(bridgeProcess)
         // A share with no bridge on the relay serves no viewer right now, whatever the reason.

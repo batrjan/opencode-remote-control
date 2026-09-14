@@ -61,7 +61,8 @@ export async function fetchFrom(server: string, url: string, init?: Parameters<t
   }
 }
 
-function originOf(url: string): string | undefined {
+/** `url`'s origin, or undefined when it is no URL or has none to name (an opaque 'null' origin). Never throws. */
+export function originOf(url: string): string | undefined {
   try {
     const { origin } = new URL(url)
     return origin === 'null' ? undefined : origin

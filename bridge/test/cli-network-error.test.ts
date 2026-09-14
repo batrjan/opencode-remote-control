@@ -168,17 +168,18 @@ test('stop with an unreachable relay names the relay and the cause in its warnin
   const home = mkdtempSync(path.join(root, 'home-'))
   const stateDir = path.join(home, '.agents', 'skills', 'remote-control', 'state')
   mkdirSync(stateDir, { recursive: true })
+  const deadRelay = await closedPort()
   writeFileSync(
     path.join(stateDir, 'ses_cli_network_stop.json'),
     JSON.stringify({
       session_id: 'ses_cli_network_stop',
       access_code: 'XXXXXX',
       bridge_token: 'token-the-relay-never-sees',
-      relay: 'unused',
+      // The share's own relay: `stop` sends its token nowhere else.
+      relay: `http://127.0.0.1:${deadRelay}`,
       started_at: Date.now(),
     }),
   )
-  const deadRelay = await closedPort()
   const { code, stdout } = await runCliIn(home, [
     'stop',
     '--relay',

@@ -8484,14 +8484,14 @@ async function settleEarlierShare(relay, sessionId, endLeftoverServer) {
   }
   let failure;
   try {
-    const status = await relay.deleteSession(sessionId, state.bridge_token);
+    const status = await shareRelay(state, relay).deleteSession(sessionId, state.bridge_token);
     if (status !== 204 && status !== 404) failure = `relay answered ${status}`;
   } catch (err) {
     failure = describeRelayError(err);
   }
   if (failure !== void 0) {
     throw new Error(
-      `session ${sessionId} is still registered by an earlier share whose bridge (pid ${state.pid}) is gone, and it could not be ended on the relay (${failure}) \u2014 try again`
+      `session ${sessionId} is still registered by an earlier share whose bridge (pid ${state.pid}) is gone, and it could not be ended on the relay (${failure}) \u2014 try again, or run /remote-control/stop to drop it`
     );
   }
   clearOwnSessionState(sessionId, state.bridge_token);
@@ -8503,6 +8503,10 @@ async function settleEarlierShare(relay, sessionId, endLeftoverServer) {
     }
   }
   return true;
+}
+function shareRelay(state, current) {
+  const recorded = originOf(state.relay);
+  return recorded !== void 0 && recorded === originOf(current.url) ? current : new RelayClient(state.relay);
 }
 var LEFTOVER_SERVER_EXIT_WAIT_MS = 5e3;
 function shareBridgeRunning(state, inspect = describeProcess) {
@@ -8525,7 +8529,7 @@ async function stopBridge(relayUrl, sessionId, apiKey) {
   }
   let relayFailure;
   try {
-    const status = await new RelayClient(relayUrl, apiKey).deleteSession(sessionId, state.bridge_token);
+    const status = await shareRelay(state, new RelayClient(relayUrl, apiKey)).deleteSession(sessionId, state.bridge_token);
     if (status !== 204 && status !== 404) relayFailure = `relay answered ${status}`;
   } catch (err) {
     relayFailure = describeRelayError(err);
@@ -8813,19 +8817,22 @@ program2.command("status").description("Probe relay health, local opencode detec
       }
     }
     const ownerToken = local?.bridge_token;
-    const { status, body } = await new RelayClient(opts.relay, opts.apiKey).getSession(sessionId, ownerToken);
+    const current = new RelayClient(opts.relay, opts.apiKey);
+    const probe = local ? shareRelay(local, current) : current;
+    const where = probe === current ? "" : ` (relay ${originOf(probe.url) ?? "unknown"})`;
+    const { status, body } = await probe.getSession(sessionId, ownerToken);
     if (status === 404) {
-      console.log(`session ${sessionId}: not found`);
+      console.log(`session ${sessionId}${where}: not found`);
       if (bridgeProcess) console.log(bridgeProcess);
       ok = false;
     } else if (status !== 200 || !body) {
-      console.log(`session ${sessionId}: HTTP ${status}`);
+      console.log(`session ${sessionId}${where}: HTTP ${status}`);
       if (bridgeProcess) console.log(bridgeProcess);
       ok = false;
     } else {
       const ageMs = Date.now() - body.created_at;
       const age = formatDuration(ageMs);
-      console.log(`session ${sessionId}: ${body.status}`);
+      console.log(`session ${sessionId}${where}: ${body.status}`);
       console.log(`  bridge: ${body.bridge_connected ? "connected" : "disconnected"}`);
       if (bridgeProcess) console.log(bridgeProcess);
       if (!body.bridge_connected) ok = false;
