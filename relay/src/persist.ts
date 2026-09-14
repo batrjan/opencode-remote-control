@@ -36,8 +36,8 @@ export interface PersistedViewer {
   /**
    * Last time this token authenticated — the store's sliding idle window.
    * OPTIONAL, and STATE_VERSION deliberately stays 1: a version bump makes
-   * load() discard the whole file, which on the deploy that shipped this
-   * change would silently drop every live share. A file written by an older
+   * load() refuse the whole file, which on the deploy that shipped this
+   * change would end every live share. A file written by an older
    * relay simply has no last_used, and restore() falls back to created_at.
    */
   last_used?: number
@@ -245,6 +245,8 @@ export class FileStateStore {
    * older snapshot never lands over the newer one a flush() wrote.
    */
   private generation = 0
+  /** load() found a file it could not use; the first write moves it aside. */
+  private unreadable = false
 
   constructor(
     private readonly file: string,
@@ -259,32 +261,82 @@ export class FileStateStore {
     return this.key !== null
   }
 
-  /** Read the snapshot, or undefined when absent, unreadable or malformed. */
+  /**
+   * Read the snapshot, or undefined when absent, unreadable or malformed.
+   *
+   * Only an absent file is a quiet "no state". Every other failure used to be
+   * one too, so a relay that could not read its file — the wrong
+   * RELAY_STATE_KEY after a lost .env or a rotation, no key at all, a foreign
+   * version — logged exactly what a first run logs, and the first write then
+   * renamed a new snapshot over the only copy. Now the reason is logged, and
+   * the file is moved aside by that first write (see setAsideUnreadable). Not
+   * here: a relay restarted with the right key before anything was written
+   * still finds the file where it was, and restores from it.
+   */
   load(): PersistedState | undefined {
     let raw: string
     try {
       raw = readFileSync(this.file, 'utf8')
-    } catch {
-      return undefined // first run, or the volume is not mounted yet
+    } catch (err) {
+      // First run, or the volume is not mounted yet.
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      return this.unusable(`could not read it (${(err as Error).message})`)
     }
-    let text = raw
+    let state: unknown
     try {
-      const parsed = JSON.parse(raw) as unknown
-      if (isEncrypted(parsed)) {
-        // An encrypted file we cannot decrypt (no key, wrong key, tampering) is
-        // treated as absent — start empty rather than crash or trust garbage.
-        if (!this.key) return undefined
-        text = decrypt(parsed, this.key)
+      state = JSON.parse(raw)
+    } catch {
+      return this.unusable('not valid JSON')
+    }
+    if (isEncrypted(state)) {
+      // An encrypted file we cannot decrypt (no key, wrong key, tampering) is
+      // never trusted — start empty rather than crash or trust garbage.
+      if (!this.key) return this.unusable('encrypted but RELAY_STATE_KEY is not set')
+      let text: string
+      try {
+        text = decrypt(state, this.key)
+      } catch {
+        return this.unusable('could not decrypt (wrong RELAY_STATE_KEY or tampered file)')
       }
-    } catch {
-      return undefined
+      try {
+        state = JSON.parse(text)
+      } catch {
+        return this.unusable('decrypted, but not valid JSON')
+      }
     }
+    const version = (state as { version?: unknown } | null)?.version
+    if (!state || typeof state !== 'object' || typeof version !== 'number') return this.unusable('invalid shape')
+    if (version !== STATE_VERSION) return this.unusable(`unsupported version ${version}`)
+    if (!Array.isArray((state as PersistedState).sessions)) return this.unusable('invalid shape')
+    return state as PersistedState
+  }
+
+  /** load()'s answer for a file that is there but cannot be used: say why, and keep it. */
+  private unusable(reason: string): undefined {
+    this.unreadable = true
+    console.warn(
+      `[persist] ignoring ${this.file}: ${reason}. Starting with no sessions; the file is moved to ` +
+        `${this.file}.unreadable-<epoch ms> before anything is written in its place.`,
+    )
+    return undefined
+  }
+
+  /**
+   * Move a file load() could not use out of the way of the write about to
+   * land in its place. Renamed over, it would be gone for good, and with it
+   * every share a corrected RELAY_STATE_KEY could still have restored. Runs
+   * once, right before that rename and in the same synchronous step.
+   */
+  private setAsideUnreadable(): void {
+    if (!this.unreadable) return
+    this.unreadable = false
+    const aside = `${this.file}.unreadable-${Date.now()}`
     try {
-      const state = JSON.parse(text) as PersistedState
-      if (!state || state.version !== STATE_VERSION || !Array.isArray(state.sessions)) return undefined
-      return state
-    } catch {
-      return undefined
+      renameSync(this.file, aside)
+      console.warn(`[persist] moved the unreadable ${this.file} to ${aside}`)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return // removed meanwhile: nothing to keep
+      console.warn(`[persist] could not set aside the unreadable ${this.file}, writing over it: ${(err as Error).message}`)
     }
   }
 
@@ -339,6 +391,7 @@ export class FileStateStore {
         rmSync(tmp, { force: true })
         return
       }
+      this.setAsideUnreadable()
       renameSync(tmp, this.file)
     } catch (err) {
       console.warn(`[persist] could not write ${this.file}: ${(err as Error).message}`)
@@ -373,6 +426,7 @@ export class FileStateStore {
         : JSON.stringify(stripSensitive(state))
       mkdirSync(path.dirname(this.file), { recursive: true })
       writeFileSync(tmp, body, { mode: 0o600 })
+      this.setAsideUnreadable()
       renameSync(tmp, this.file)
     } catch (err) {
       // Losing persistence degrades a restart; it must never fail a request.

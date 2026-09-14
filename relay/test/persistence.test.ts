@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -39,6 +39,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers()
+  vi.restoreAllMocks()
   delete process.env.RELAY_STATE_FILE
   delete process.env.RELAY_STATE_KEY
   rmSync(dir, { recursive: true, force: true })
@@ -570,3 +571,120 @@ test('a share kept alive by its bridge for over a day survives a redeploy', asyn
     }
   }
 }, 30_000)
+
+/**
+ * A relay that could not read its state file said nothing and then destroyed it.
+ *
+ * load() answered every failure with "no state": an encrypted file and no
+ * RELAY_STATE_KEY, the wrong key (a lost or hand-edited .env, a host move, a
+ * rotation), a foreign version, a malformed file. None of it was logged, and
+ * "restored N session(s)" only appeared for N > 0, so the log read exactly
+ * like a clean first run, and the deploy's health check passed. The first
+ * share started or joined on that relay then renamed its own snapshot over
+ * the file — the only copy — so putting the right key back restored nothing.
+ * Meanwhile every still-running bridge re-dialled, got 401 for a session the
+ * relay no longer knew, and exited: the shares were over either way, and
+ * nothing on the relay said why.
+ */
+
+/** Poll until `condition` holds, or fail after `ms`. */
+async function waitFor(condition: () => boolean, ms = 5_000): Promise<void> {
+  const deadline = Date.now() + ms
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for condition')
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
+test('an unreadable state file is reported, not silently discarded', () => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  const warned = () => warn.mock.calls.map((args) => args.join(' '))
+
+  // No file at all is a first run: nothing to report.
+  expect(new FileStateStore(file, 0, null).load()).toBeUndefined()
+  expect(warn).not.toHaveBeenCalled()
+
+  const keyA = stateKey({ RELAY_STATE_KEY: KEY } as NodeJS.ProcessEnv)
+  const store = new Store()
+  store.createSession('ses_reported', '/work', 't', '1.2.3.4')
+  const write = new FileStateStore(file, 0, keyA)
+  write.schedule(() => store.snapshot())
+  write.flush()
+
+  const cases: Array<{ content?: string; key: Buffer | null; reason: RegExp }> = [
+    {
+      key: stateKey({ RELAY_STATE_KEY: randomBytes(32).toString('hex') } as NodeJS.ProcessEnv),
+      reason: /could not decrypt/,
+    },
+    { key: null, reason: /encrypted but RELAY_STATE_KEY is not set/ },
+    { content: '{ this is not json', key: null, reason: /not valid JSON/ },
+    { content: JSON.stringify({ version: 2, saved_at: 1, sessions: [] }), key: null, reason: /unsupported version 2/ },
+    { content: JSON.stringify({ version: 1, saved_at: 1, sessions: {} }), key: null, reason: /invalid shape/ },
+  ]
+  for (const { content, key, reason } of cases) {
+    if (content !== undefined) writeFileSync(file, content)
+    warn.mockClear()
+    expect(new FileStateStore(file, 0, key).load()).toBeUndefined()
+    expect(warned()).toEqual([expect.stringContaining(file)])
+    expect(warned()[0]).toMatch(reason)
+  }
+})
+
+test.each(['the debounced write', 'the shutdown flush'])(
+  'an unreadable state file is set aside, not overwritten by %s',
+  async (writer) => {
+    process.env.RELAY_STATE_FILE = file
+    process.env.RELAY_STATE_KEY = KEY
+    let relay: Server = await startServer(0)
+    const register = (id: string) =>
+      request(relay).post('/api/sessions').set('x-api-key', API_KEY).send({ session_id: id, directory: '/w', title: 't' })
+    const setAside = () => readdirSync(path.dirname(file)).filter((name) => name.startsWith('sessions.json.unreadable-'))
+    try {
+      expect((await register('ses_alpha')).status).toBe(201)
+      await shutdown(relay)
+      const before = readFileSync(file)
+
+      // Redeployed with a different key.
+      process.env.RELAY_STATE_KEY = randomBytes(32).toString('hex')
+      vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+      relay = await startServer(0)
+      expect(log.mock.calls.map((args) => args.join(' '))).toContain('[relay] restored 0 session(s)')
+      expect((await request(relay).get('/api/sessions/ses_alpha')).status).toBe(404)
+      // Until something is written, the file stays where it is, so a relay
+      // restarted with the right key in time still restores from it.
+      expect(setAside()).toEqual([])
+      expect(readFileSync(file)).toEqual(before)
+
+      expect((await register('ses_beta')).status).toBe(201)
+      if (writer === 'the shutdown flush') await shutdown(relay)
+      else {
+        await waitFor(() => {
+          try {
+            return !readFileSync(file).equals(before)
+          } catch {
+            return false
+          }
+        })
+      }
+
+      const aside = setAside()
+      expect(aside).toHaveLength(1)
+      const asidePath = path.join(path.dirname(file), aside[0]!)
+      // The old snapshot, byte for byte, still readable with its own key...
+      expect(readFileSync(asidePath)).toEqual(before)
+      const keyA = stateKey({ RELAY_STATE_KEY: KEY } as NodeJS.ProcessEnv)
+      expect(new Store().restore(new FileStateStore(asidePath, 0, keyA).load())).toBe(1)
+      // ...and the new relay's own state went to the configured path as usual.
+      const keyB = stateKey(process.env)
+      await waitFor(() => new FileStateStore(file, 0, keyB).load() !== undefined)
+      expect(new FileStateStore(file, 0, keyB).load()!.sessions.map((s) => s.id)).toEqual(['ses_beta'])
+    } finally {
+      if (relay.listening) {
+        relay.closeAllConnections()
+        await new Promise((resolve) => relay.close(resolve))
+      }
+    }
+  },
+  20_000,
+)

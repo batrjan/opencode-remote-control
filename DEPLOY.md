@@ -174,8 +174,36 @@ before writing (the safe fallback: a redeploy then invalidates an unused code).
 The rate-limit counters are never persisted. Leaving `RELAY_STATE_FILE` empty
 restores the old in-memory-only behaviour.
 
-Rotating the key (e.g. after exposure) is safe: an old encrypted file simply
-fails to decrypt and the relay starts empty — every share re-registers.
+Shares survive a redeploy only while `RELAY_STATE_KEY` stays the same. Rotating
+the key (e.g. after exposure) ENDS EVERY LIVE SHARE, and so does a relay started
+with a different key or none by mistake (a lost or hand-edited `.env`, a new
+host, `docker compose` run from another directory). Such a relay cannot
+decrypt the old file, starts empty and says so in its log:
+
+```
+[relay] session state: /data/state.json (encrypted)
+[persist] ignoring /data/state.json: could not decrypt (wrong RELAY_STATE_KEY or tampered file). …
+[relay] restored 0 session(s)
+```
+
+`/health` stays green, so the deploy's health check does not catch it. Nothing
+re-registers: each running bridge re-dials, is refused with 401 because the
+relay no longer knows its session, and exits. Every owner has to run
+`/remote-control/start` again and hand out the new link and code.
+
+The old file is not destroyed. Until the relay first writes its state (a share
+started or joined), it stays where it is, so restarting with the right key in
+that window restores it. The first write moves it aside to
+`<RELAY_STATE_FILE>.unreadable-<epoch ms>` in the same volume
+(`/data/state.json.unreadable-…` by default), logged as
+`[persist] moved the unreadable …`. Putting it back (stop the relay, restore the
+old key, move the file to `RELAY_STATE_FILE`, start) brings back the sessions
+and viewer cookies, but not the bridges that have already exited. Delete it once
+it is no longer needed:
+
+```bash
+docker compose exec relay sh -c 'rm -f /data/state.json.unreadable-*'
+```
 
 To wipe every share (e.g. after a security incident):
 
