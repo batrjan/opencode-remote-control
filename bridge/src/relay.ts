@@ -11,6 +11,7 @@ import {
   wsHandshakeTimeoutMs,
   wsPingIntervalMs,
 } from './config.js'
+import { fetchFrom } from './errors.js'
 
 /**
  * Client for the public relay's bridge-facing session API.
@@ -91,7 +92,9 @@ export class RelayClient {
     timeoutMs = relayRegisterTimeoutMs(),
   ): Promise<RelaySession> {
     try {
-      const res = await fetch(`${this.url}/api/sessions`, {
+      // fetchFrom: a relay that cannot be reached is named, with the reason —
+      // "fetch failed" alone read the same as a dead local opencode.
+      const res = await fetchFrom('relay', `${this.url}/api/sessions`, {
         method: 'POST',
         headers: this.headers(),
         body: JSON.stringify({
@@ -120,7 +123,7 @@ export class RelayClient {
    * able to hold that shutdown open.
    */
   async deleteSession(sessionId: string, bridgeToken: string, timeoutMs = relayDeleteTimeoutMs()): Promise<number> {
-    const res = await fetch(`${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
+    const res = await fetchFrom('relay', `${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
       method: 'DELETE',
       headers: { ...this.headers(), 'x-bridge-token': bridgeToken },
       signal: AbortSignal.timeout(timeoutMs),
@@ -130,7 +133,7 @@ export class RelayClient {
 
   /** Session status probe for `bridge status`. Returns parsed body + HTTP status. */
   async getSession(sessionId: string, bridgeToken?: string): Promise<{ status: number; body?: SessionStatus }> {
-    const res = await fetch(`${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
+    const res = await fetchFrom('relay', `${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
       // The bridge_token unlocks the owner-only fields (directory, title) that
       // the public presence view withholds.
       headers: { ...this.headers(), ...(bridgeToken ? { 'x-bridge-token': bridgeToken } : {}) },

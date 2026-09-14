@@ -1,4 +1,8 @@
 import { basicAuthHeader } from './config.js'
+import { fetchFrom } from './errors.js'
+
+/** How an unreachable opencode is named to the owner — see fetchFrom. */
+const LOCAL_SERVER = 'local opencode server'
 
 /**
  * Minimal client for the local OpenCode server HTTP API.
@@ -17,7 +21,9 @@ export class OpencodeClient {
 
   async getSessions(directory?: string) {
     const query = directory ? `?directory=${encodeURIComponent(directory)}` : ''
-    const res = await fetch(`${this.url}/session${query}`, { headers: this.auth() })
+    // `start` picks its session with this, so a local opencode that is not
+    // listening is where a start fails: it must not read like a relay failure.
+    const res = await fetchFrom(LOCAL_SERVER, `${this.url}/session${query}`, { headers: this.auth() })
     return res.json()
   }
 
@@ -95,7 +101,9 @@ export class OpencodeClient {
    */
   async getEvent(signal?: AbortSignal, directory?: string) {
     const query = directory ? `?directory=${encodeURIComponent(directory)}` : ''
-    const res = await fetch(`${this.url}/event${query}`, { headers: this.auth(), signal })
+    // Named like getSessions: with an explicit session id this is the first
+    // call a `start` makes to opencode that is allowed to fail it.
+    const res = await fetchFrom(LOCAL_SERVER, `${this.url}/event${query}`, { headers: this.auth(), signal })
     return res.body
   }
 

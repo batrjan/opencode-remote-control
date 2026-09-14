@@ -12,6 +12,7 @@ import {
   watchdogStrikes,
 } from './config.js'
 import { detectOpenCodePort, ensureOpenCodeServer } from './detect.js'
+import { describeError } from './errors.js'
 import { OpencodeClient } from './opencode.js'
 import { RelayClient, RelayHttpError, RelayWSClient, type RelaySession } from './relay.js'
 import {
@@ -482,10 +483,9 @@ function describeRelayError(err: unknown): string {
   if (err instanceof Error && err.name === 'TimeoutError') {
     return `relay did not answer within ${Math.round(relayDeleteTimeoutMs() / 1000)} s`
   }
-  // fetch reports every network failure as "fetch failed"; the errno (refused,
-  // DNS, reset) is on its cause.
-  const code = (err as { cause?: { code?: unknown } } | undefined)?.cause?.code
-  return `relay unreachable: ${typeof code === 'string' ? code : errorMessage(err)}`
+  // RelayClient already names the relay and the network cause (see fetchFrom):
+  // its errno alone said neither which relay nor, for TLS, what was wrong.
+  return describeError(err)
 }
 
 /** Command lines that belong to an `opencode serve` the bridge started. */
@@ -785,15 +785,11 @@ async function probeOpencode(opencodeUrl: string): Promise<string | undefined> {
     if (err instanceof Error && err.name === 'TimeoutError') return `no answer within ${timeoutMs} ms`
     // fetch reports every network failure as "fetch failed"; the errno is on its cause.
     const code = (err as { cause?: { code?: unknown } } | undefined)?.cause?.code
-    return `unreachable: ${typeof code === 'string' ? code : errorMessage(err)}`
+    return `unreachable: ${typeof code === 'string' ? code : describeError(err)}`
   }
 }
 
 /* ---------------------------------- CLI ---------------------------------- */
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
-}
 
 /** Resolve the session id: explicit flag wins, else the most recent state
  * written by `start`. */
@@ -831,7 +827,10 @@ program
     try {
       handle = await startBridge(opts.relay, opts.apiKey, { port, sessionId: opts.sessionId, ownerPid })
     } catch (err) {
-      console.error(`bridge start failed: ${errorMessage(err)}`)
+      // describeError, not the message: every network failure's message is
+      // "fetch failed", and what failed is on its cause. One line, so the
+      // plugin's toast carries all of it.
+      console.error(`bridge start failed: ${describeError(err)}`)
       process.exitCode = 1
       return
     }
@@ -880,7 +879,7 @@ program
       const warning = await stopBridge(opts.relay, sessionId, opts.apiKey)
       console.log(warning ?? 'Remote control stopped.')
     } catch (err) {
-      console.error(`bridge stop failed: ${errorMessage(err)}`)
+      console.error(`bridge stop failed: ${describeError(err)}`)
       process.exitCode = 1
     }
   })
@@ -897,8 +896,8 @@ program
       const res = await fetch(`${opts.relay}/health`, { signal: AbortSignal.timeout(5000) })
       console.log(`relay: ${res.ok ? 'ok' : `HTTP ${res.status}`} (${opts.relay})`)
       if (!res.ok) ok = false
-    } catch {
-      console.log(`relay: unreachable (${opts.relay})`)
+    } catch (err) {
+      console.log(`relay: unreachable (${opts.relay}): ${describeError(err)}`)
       ok = false
     }
     try {

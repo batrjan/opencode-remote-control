@@ -2272,7 +2272,7 @@ var require_websocket = __commonJS({
     var tls = require("tls");
     var { randomBytes: randomBytes2, createHash } = require("crypto");
     var { Duplex, Readable } = require("stream");
-    var { URL } = require("url");
+    var { URL: URL2 } = require("url");
     var PerMessageDeflate2 = require_permessage_deflate();
     var Receiver2 = require_receiver();
     var Sender2 = require_sender();
@@ -2773,11 +2773,11 @@ var require_websocket = __commonJS({
         );
       }
       let parsedUrl;
-      if (address instanceof URL) {
+      if (address instanceof URL2) {
         parsedUrl = address;
       } else {
         try {
-          parsedUrl = new URL(address);
+          parsedUrl = new URL2(address);
         } catch {
           throw new SyntaxError(`Invalid URL: ${address}`);
         }
@@ -2914,7 +2914,7 @@ var require_websocket = __commonJS({
           req.abort();
           let addr;
           try {
-            addr = new URL(location, address);
+            addr = new URL2(location, address);
           } catch (e) {
             const err = new SyntaxError(`Invalid URL: ${location}`);
             emitErrorAndClose(websocket, err);
@@ -7263,7 +7263,62 @@ async function isHealthy(port) {
   }
 }
 
+// src/errors.ts
+var MAX_CAUSE_DEPTH = 4;
+function describeError(err) {
+  const parts = [];
+  const seen = /* @__PURE__ */ new Set();
+  let current = err;
+  for (let depth = 0; depth <= MAX_CAUSE_DEPTH && current != null && !seen.has(current); depth++) {
+    seen.add(current);
+    const text = withoutUserinfo(
+      depth === 0 && !(current instanceof Error) ? oneLine(String(current)) : errorText(current)
+    );
+    if (text && !parts.some((part) => part.includes(text))) parts.push(text);
+    current = current instanceof Error ? current.cause : void 0;
+  }
+  const [head = withoutUserinfo(oneLine(String(err))), ...causes] = parts;
+  return causes.length === 0 ? head : `${head} (${causes.join("; ")})`;
+}
+async function fetchFrom(server, url, init) {
+  try {
+    return await fetch(url, init);
+  } catch (err) {
+    if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) throw err;
+    const origin = originOf(url);
+    if (origin === void 0) throw err;
+    throw new Error(`${server} ${origin} unreachable: ${describeError(err)}`, { cause: err });
+  }
+}
+function originOf(url) {
+  try {
+    const { origin } = new URL(url);
+    return origin === "null" ? void 0 : origin;
+  } catch {
+    return void 0;
+  }
+}
+function errorText(err) {
+  if (typeof err === "string") return oneLine(err);
+  if (!(err instanceof Error)) return "";
+  let message = err.message;
+  if (!message && err instanceof AggregateError) {
+    message = err.errors.map((inner) => inner instanceof Error ? inner.message : String(inner)).filter(Boolean).join(", ");
+  }
+  message = oneLine(message);
+  const code = err.code;
+  if (typeof code !== "string" || message.includes(code)) return message;
+  return message ? `${code}: ${message}` : code;
+}
+function oneLine(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+function withoutUserinfo(text) {
+  return text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#@]+@/gi, "$1");
+}
+
 // src/opencode.ts
+var LOCAL_SERVER = "local opencode server";
 var OpencodeClient = class {
   constructor(url, username, password) {
     this.url = url;
@@ -7275,7 +7330,7 @@ var OpencodeClient = class {
   }
   async getSessions(directory) {
     const query = directory ? `?directory=${encodeURIComponent(directory)}` : "";
-    const res = await fetch(`${this.url}/session${query}`, { headers: this.auth() });
+    const res = await fetchFrom(LOCAL_SERVER, `${this.url}/session${query}`, { headers: this.auth() });
     return res.json();
   }
   async getSessionMessages(id, limit) {
@@ -7344,7 +7399,7 @@ var OpencodeClient = class {
    */
   async getEvent(signal, directory) {
     const query = directory ? `?directory=${encodeURIComponent(directory)}` : "";
-    const res = await fetch(`${this.url}/event${query}`, { headers: this.auth(), signal });
+    const res = await fetchFrom(LOCAL_SERVER, `${this.url}/event${query}`, { headers: this.auth(), signal });
     return res.body;
   }
   /**
@@ -7446,7 +7501,7 @@ var RelayClient = class {
    */
   async createSession(sessionId, directory, title, ownerKey2, timeoutMs = relayRegisterTimeoutMs()) {
     try {
-      const res = await fetch(`${this.url}/api/sessions`, {
+      const res = await fetchFrom("relay", `${this.url}/api/sessions`, {
         method: "POST",
         headers: this.headers(),
         body: JSON.stringify({
@@ -7474,7 +7529,7 @@ var RelayClient = class {
    * able to hold that shutdown open.
    */
   async deleteSession(sessionId, bridgeToken, timeoutMs = relayDeleteTimeoutMs()) {
-    const res = await fetch(`${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
+    const res = await fetchFrom("relay", `${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
       method: "DELETE",
       headers: { ...this.headers(), "x-bridge-token": bridgeToken },
       signal: AbortSignal.timeout(timeoutMs)
@@ -7483,7 +7538,7 @@ var RelayClient = class {
   }
   /** Session status probe for `bridge status`. Returns parsed body + HTTP status. */
   async getSession(sessionId, bridgeToken) {
-    const res = await fetch(`${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
+    const res = await fetchFrom("relay", `${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
       // The bridge_token unlocks the owner-only fields (directory, title) that
       // the public presence view withholds.
       headers: { ...this.headers(), ...bridgeToken ? { "x-bridge-token": bridgeToken } : {} }
@@ -8461,8 +8516,7 @@ function describeRelayError(err) {
   if (err instanceof Error && err.name === "TimeoutError") {
     return `relay did not answer within ${Math.round(relayDeleteTimeoutMs() / 1e3)} s`;
   }
-  const code = err?.cause?.code;
-  return `relay unreachable: ${typeof code === "string" ? code : errorMessage(err)}`;
+  return describeError(err);
 }
 var SERVE_COMMAND_RE = /(^|[/\\])opencode(\.exe)?\s+serve(\s|$)/;
 function terminateSpawnedServer(pid, startedAt, inspect = describeProcess) {
@@ -8620,11 +8674,8 @@ async function probeOpencode(opencodeUrl) {
   } catch (err) {
     if (err instanceof Error && err.name === "TimeoutError") return `no answer within ${timeoutMs} ms`;
     const code = err?.cause?.code;
-    return `unreachable: ${typeof code === "string" ? code : errorMessage(err)}`;
+    return `unreachable: ${typeof code === "string" ? code : describeError(err)}`;
   }
-}
-function errorMessage(err) {
-  return err instanceof Error ? err.message : String(err);
 }
 function resolveSessionId(flag) {
   return flag ?? latestSessionState()?.session_id;
@@ -8648,7 +8699,7 @@ program2.command("start").description("Register this session with the relay and 
   try {
     handle = await startBridge(opts.relay, opts.apiKey, { port, sessionId: opts.sessionId, ownerPid });
   } catch (err) {
-    console.error(`bridge start failed: ${errorMessage(err)}`);
+    console.error(`bridge start failed: ${describeError(err)}`);
     process.exitCode = 1;
     return;
   }
@@ -8677,7 +8728,7 @@ program2.command("stop").description("End a remote-control session on the relay"
     const warning = await stopBridge(opts.relay, sessionId, opts.apiKey);
     console.log(warning ?? "Remote control stopped.");
   } catch (err) {
-    console.error(`bridge stop failed: ${errorMessage(err)}`);
+    console.error(`bridge stop failed: ${describeError(err)}`);
     process.exitCode = 1;
   }
 });
@@ -8687,8 +8738,8 @@ program2.command("status").description("Probe relay health, local opencode detec
     const res = await fetch(`${opts.relay}/health`, { signal: AbortSignal.timeout(5e3) });
     console.log(`relay: ${res.ok ? "ok" : `HTTP ${res.status}`} (${opts.relay})`);
     if (!res.ok) ok = false;
-  } catch {
-    console.log(`relay: unreachable (${opts.relay})`);
+  } catch (err) {
+    console.log(`relay: unreachable (${opts.relay}): ${describeError(err)}`);
     ok = false;
   }
   try {
