@@ -49,6 +49,12 @@ const value = (...flags) => {
   return i < 0 ? undefined : argv[i + 1]
 }
 const outcome = JSON.parse(process.env.RC_OUTCOME)
+// \`opencode run --attach <url>\` (1.18.30) loads no plugin at all: it hands the
+// command to that server, where the hook runs, and prints only the model's
+// reply. So the hook decides as that server would, and nothing it shows reaches
+// this terminal: the server's stderr is its own log.
+const attached = value('--attach') !== undefined
+if (attached) process.argv.splice(2, Infinity, 'serve')
 const hooks = createHooks(async (action, sessionID) => {
   // Record every action the runner was asked for, so a test can tell an action
   // that ran from one the plugin declined without running.
@@ -56,7 +62,7 @@ const hooks = createHooks(async (action, sessionID) => {
   if (outcome.error) throw new Error(outcome.error)
   const text = outcome.text.repeat(outcome.times ?? 1) + (outcome.tail ?? '')
   return text.replaceAll('{action}', action).replaceAll('{session}', String(sessionID))
-})
+}, undefined, undefined, attached ? () => {} : undefined)
 const output = { parts: [] }
 await hooks['command.execute.before'](
   { command: value('--command') ?? 'remote-control/status', sessionID: value('--session', '-s') ?? 'ses_new', arguments: '' },
@@ -87,9 +93,9 @@ function runOpencode(args: string[], outcome: Outcome, extraEnv: Record<string, 
   }
 }
 
-/** The words after `opencode` of every inline `opencode run …` in README.md that names a remote-control command. */
-function readmeRunLines(): string[][] {
-  return [...fs.readFileSync(README, 'utf8').matchAll(/`(opencode run\b[^`]*)`/g)]
+/** The words after `opencode` of every inline `opencode run …` in a text that names a remote-control command. */
+function runLines(text: string): string[][] {
+  return [...text.matchAll(/`(opencode run\b[^`]*)`/g)]
     .map((m) => m[1].replace(/\s+/g, ' ').trim())
     .filter((line) => line.includes('remote-control'))
     .map((line) =>
@@ -98,6 +104,35 @@ function readmeRunLines(): string[][] {
         .slice(1)
         .map((w) => w.replace(/^["']|["']$/g, '')),
     )
+}
+
+const readmeRunLines = () => runLines(fs.readFileSync(README, 'utf8'))
+
+/**
+ * Where an owner who wants a share from a terminal is sent, in the decline text
+ * or in README.md.
+ *
+ * It used to be `opencode run --attach <server-url> --session <id> --command
+ * remote-control/start`. On opencode 1.18.30 that does start a share, in the
+ * server, which keeps it — but the `run --attach` client loads no plugin and
+ * prints only the model's "OK" (with `--format json` too), and the server writes
+ * the output only into the session. The owner followed the advice, saw "OK" and
+ * never learned the URL or code of a share that was live; a second start got a
+ * 409 and "OK" again. `opencode attach <server-url>` draws the session, so the
+ * start typed there shows both.
+ */
+function expectStartAdviceThatShowsTheCode(text: string, label: string) {
+  // An `opencode run --attach` recipe for a start has to put the code on the
+  // terminal. (A plain `opencode run` start is declined, as the first test shows.)
+  for (const words of runLines(text).filter((w) => w.includes('--attach') && w.includes('remote-control/start'))) {
+    const { stderr } = runOpencode(words, { text: 'https://relay.example/s/{session}\nCODE: TEST00' })
+    expect(stderr, `${label}: ${words.join(' ')}`).toContain('CODE: TEST00')
+  }
+  const flat = text.replace(/\s+/g, ' ')
+  expect(flat, label).toMatch(/`opencode attach <(server-)?url>/)
+  expect(flat, label).toContain('/remote-control/start')
+  // `opencode run --attach` may be named only together with what it hides.
+  if (flat.includes('opencode run --attach')) expect(flat, label).toMatch(/only the model's `?OK`?/)
 }
 
 test("README's `opencode run` lines show the command's result on the terminal, not only the model's OK", () => {
@@ -112,7 +147,7 @@ test("README's `opencode run` lines show the command's result on the terminal, n
     if (action === 'start') {
       // A plain `opencode run` never starts a share; the line shows why and how.
       expect(stderr, words.join(' ')).toContain('does nothing in `opencode run`')
-      expect(stderr, words.join(' ')).toContain('--attach')
+      expectStartAdviceThatShowsTheCode(stderr, words.join(' '))
     } else {
       expect(stderr, words.join(' ')).toContain(`is not shared from this machine — nothing to ${action}.`)
       expect(stderr, words.join(' ')).toContain('Shared from this machine: ses_other.')
@@ -126,6 +161,42 @@ test("README's `opencode run` lines show the command's result on the terminal, n
     lines.map((words) => words[words.indexOf('--command') + 1]),
     'README gives a terminal stop and a terminal status',
   ).toEqual(expect.arrayContaining(['remote-control/stop', 'remote-control/status']))
+})
+
+/**
+ * README.md sent a terminal owner to "point `opencode run --attach` at" a
+ * running `opencode serve`. That code span names no remote-control command, so
+ * the recipe check above never saw it, and the advice led to a live share whose
+ * URL and code the terminal never showed (see expectStartAdviceThatShowsTheCode).
+ */
+test("README's advice for starting a share from a terminal leads to the URL and code", () => {
+  const paragraphs = fs.readFileSync(README, 'utf8').split(/\n\s*\n/)
+  const declined = paragraphs.filter((p) => /`opencode run [^`]*--command remote-control\/start`/.test(p.replace(/\s+/g, ' ')))
+  expect(declined.length, 'README explains why `opencode run` starts no share').toBeGreaterThan(0)
+  for (const p of declined) expectStartAdviceThatShowsTheCode(p, 'README: the declined start')
+  for (const p of paragraphs.filter((p) => p.replace(/\s+/g, ' ').includes('opencode run --attach'))) {
+    expect(p.replace(/\s+/g, ' '), 'README names `opencode run --attach` with what it hides').toMatch(/only the model's `OK`/)
+  }
+})
+
+/** The fake's `--attach` behaves as measured on the real binary. */
+test('opencode run --attach starts the share in the server and shows nothing of it here', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rc-run-calls-'))
+  const calls = path.join(dir, 'calls')
+  try {
+    for (const format of [[], ['--format', 'json']]) {
+      fs.rmSync(calls, { force: true })
+      const { stdout, stderr } = runOpencode(
+        ['run', ...format, '--attach', 'http://127.0.0.1:4096', '--session', 'ses_x', '--command', 'remote-control/start'],
+        { text: 'https://relay.example/s/{session}\nCODE: TEST00' },
+        { RC_CALLS: calls },
+      )
+      expect(fs.readFileSync(calls, 'utf8')).toBe('start\n')
+      expect({ stdout, stderr }).toEqual({ stdout: '', stderr: '' })
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('a failed action reaches the terminal too, also with --format json', () => {
@@ -149,9 +220,9 @@ test('a failed action reaches the terminal too, also with --format json', () => 
  * was gone within seconds — while the terminal had just printed its URL and
  * access code, which the owner then sent to a viewer who found a dead link.
  * The start is declined up front instead, with the ways that do keep a share
- * running, and no bridge is spawned at all.
+ * running and show its URL and code, and no bridge is spawned at all.
  */
-test('a start from opencode run is declined with a way that works, and starts nothing', () => {
+test('a start from opencode run is declined with a way that shows the URL and code, and starts nothing', () => {
   const calls = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'rc-run-calls-')), 'calls')
   for (const format of [[], ['--format', 'json']]) {
     fs.rmSync(calls, { force: true })
@@ -163,7 +234,7 @@ test('a start from opencode run is declined with a way that works, and starts no
     expect(fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : '', 'the runner was never asked to start').toBe('')
     expect(stderr).not.toContain('CODE: TEST00')
     expect(stderr).toContain('opencode run')
-    expect(stderr).toMatch(/--attach/)
+    expectStartAdviceThatShowsTheCode(stderr, `decline text (${format.join(' ') || 'plain'})`)
     expect(stdout).toBe('')
   }
   // The same command still starts a share in a process that stays: a server

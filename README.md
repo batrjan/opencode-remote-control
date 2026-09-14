@@ -173,8 +173,12 @@ passes its pid as `--owner-pid`), not just the server the bridge talks to. A pla
 within seconds; `opencode run --command remote-control/start` therefore starts
 nothing and says so, instead of printing a code that stops working at once. Start a
 share from a long-running client (the TUI, the desktop app, `opencode web`); from a
-terminal, keep `opencode serve` running and point `opencode run --attach` at it, so
-the command runs in that server and the share lives as long as the server does. The
+terminal, keep `opencode serve` running, open it with `opencode attach <server-url>`
+(add `--session <id>` for an existing session) and type `/remote-control/start`
+there: the command runs in that server, so the share lives as long as the server
+does, and the URL and code appear in the session on screen. `opencode run --attach`
+against that server starts a share as well, but prints only the model's `OK`, never
+the URL and code; they are in the session, where `opencode attach` shows them. The
 bridge's `start` can also be run by hand, without `--owner-pid`.
 
 ### Surviving a bad network

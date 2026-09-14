@@ -57,15 +57,25 @@ const RELAY_INSTRUCTION = [
  * and ends the share when that process exits, and `opencode run` exits right
  * after its one command. A share started there died within seconds — after the
  * terminal had printed its URL and access code, which the owner then sent to a
- * viewer who found a dead link. With `--attach` the command runs in the server
- * it attaches to, which stays, so that is the terminal way that works.
+ * viewer who found a dead link.
+ *
+ * The terminal way that works is `opencode attach` to a running server: the
+ * command typed there runs in that server, which stays, and the terminal draws
+ * the session, where the URL and code are. This text used to recommend
+ * `opencode run --attach … --command remote-control/start` instead. That starts
+ * the share in the server too, but the `run --attach` client loads no plugin and
+ * prints only the model's reply (on opencode 1.18.30, also with --format json),
+ * so the owner saw "OK" and never the URL or code of a share that was live.
  */
 const RUN_START_DECLINED = [
   "remote-control start does nothing in `opencode run`: a share ends when the",
   "OpenCode process that started it exits, and `opencode run` exits right after",
   "this command. Start it from the terminal UI, the desktop app or `opencode web`,",
-  "or keep `opencode serve` running and start it through that server with",
-  "`opencode run --attach <server-url> --session <id> --command remote-control/start`.",
+  "or keep `opencode serve` running, open it with `opencode attach <server-url>`",
+  "(add `--session <id>` for an existing session) and type /remote-control/start",
+  "there: the share lives as long as that server, and the URL and code appear in",
+  "the session. `opencode run --attach` starts a share too, but prints only the",
+  "model's OK, never the URL and code.",
 ].join("\n")
 
 /**
