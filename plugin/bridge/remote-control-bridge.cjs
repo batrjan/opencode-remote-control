@@ -3705,6 +3705,7 @@ var require_websocket_server = __commonJS({
 var src_exports = {};
 __export(src_exports, {
   belongsToRunningShare: () => belongsToRunningShare,
+  spawnedByRecordedShare: () => spawnedByRecordedShare,
   startBridge: () => startBridge,
   stopBridge: () => stopBridge,
   terminateBridgeProcess: () => terminateBridgeProcess,
@@ -8282,23 +8283,30 @@ function readOwnerSecret(file) {
     return void 0;
   }
 }
-function latestSessionState() {
+function listSessionStates() {
   try {
     const dir = stateDir();
-    if (!(0, import_node_fs2.existsSync)(dir)) return void 0;
+    if (!(0, import_node_fs2.existsSync)(dir)) return [];
     const files = (0, import_node_fs2.readdirSync)(dir).filter((f) => f.endsWith(".json"));
-    let best;
+    const states = [];
     for (const f of files) {
       try {
         const s = JSON.parse((0, import_node_fs2.readFileSync)(import_node_path2.default.join(dir, f), "utf8"));
-        if (!best || s.started_at > best.started_at) best = s;
+        if (s && typeof s === "object") states.push(s);
       } catch {
       }
     }
-    return best;
+    return states;
   } catch {
-    return void 0;
+    return [];
   }
+}
+function latestSessionState() {
+  let best;
+  for (const s of listSessionStates()) {
+    if (!best || s.started_at > best.started_at) best = s;
+  }
+  return best;
 }
 
 // src/index.ts
@@ -8308,14 +8316,16 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
   if (opts.sessionId !== void 0) await settleEarlierShare(relay, opts.sessionId, true);
   let spawnedServer;
   let resolvedPort;
+  let endLeftoverServer = false;
   if (opts.opencodeUrl) {
     resolvedPort = 0;
   } else if (opts.port !== void 0) {
     resolvedPort = opts.port;
   } else {
-    const ensured = await (opts.serverSpawner ?? (() => ensureOpenCodeServer({ ownedByShare: (pid) => belongsToRunningShare(pid) })))();
+    const ensured = await (opts.serverSpawner ?? (() => ensureOpenCodeServer({ ownedByShare: (pid) => belongsToRunningShare(pid) || spawnedByRecordedShare(pid) })))();
     resolvedPort = ensured.port;
     spawnedServer = ensured.spawned;
+    endLeftoverServer = spawnedServer !== void 0 || opts.serverSpawner === void 0;
   }
   const killSpawnedServer = () => {
     if (spawnedServer && spawnedServer.exitCode === null && !spawnedServer.killed) spawnedServer.kill();
@@ -8340,7 +8350,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
       session_id,
       picked?.directory ?? process.cwd(),
       picked?.title ?? "",
-      spawnedServer !== void 0,
+      endLeftoverServer,
       // An explicit id was settled above, before anything was spawned.
       opts.sessionId === void 0
     ));
@@ -8542,14 +8552,9 @@ function terminateSpawnedServer(pid, startedAt, inspect = describeProcess) {
     snapshot = null;
   }
   if (!snapshot) return false;
-  if (!SERVE_COMMAND_RE.test(snapshot.command)) {
-    console.warn(
-      `bridge stop: not signalling opencode server pid ${pid} \u2014 pid now belongs to an unrelated process: ${snapshot.command.slice(0, 120)}`
-    );
-    return false;
-  }
-  if (startedAt !== void 0 && snapshot.startedAt !== void 0 && snapshot.startedAt > startedAt + PID_START_SLACK_MS) {
-    console.warn(`bridge stop: not signalling opencode server pid ${pid} \u2014 it started after this share was registered`);
+  const refusal = refuseAsSpawnedServer(snapshot, startedAt);
+  if (refusal) {
+    console.warn(`bridge stop: not signalling opencode server pid ${pid} \u2014 ${refusal}`);
     return false;
   }
   try {
@@ -8558,6 +8563,38 @@ function terminateSpawnedServer(pid, startedAt, inspect = describeProcess) {
   } catch {
     return false;
   }
+}
+function refuseAsSpawnedServer(snapshot, startedAt) {
+  if (!SERVE_COMMAND_RE.test(snapshot.command)) {
+    return `pid now belongs to an unrelated process: ${snapshot.command.slice(0, 120)}`;
+  }
+  if (startedAt !== void 0 && snapshot.startedAt !== void 0 && snapshot.startedAt > startedAt + PID_START_SLACK_MS) {
+    return "it started after this share was registered";
+  }
+  return null;
+}
+function spawnedByRecordedShare(pid, states = listSessionStates(), inspect = describeProcess, inspectParent = describeParent) {
+  const recorded = states.filter((s) => typeof s.server_pid === "number" && s.server_pid > 1 && s.server_pid !== process.pid);
+  if (recorded.length === 0) return false;
+  const safely = (fn) => {
+    try {
+      return fn();
+    } catch {
+      return null;
+    }
+  };
+  let current = pid;
+  for (let depth = 0; depth <= SHARE_ANCESTRY_DEPTH; depth++) {
+    const owners = recorded.filter((s) => s.server_pid === current);
+    if (owners.length > 0) {
+      const snapshot = safely(() => inspect(current));
+      if (snapshot && owners.some((s) => refuseAsSpawnedServer(snapshot, s.started_at) === null)) return true;
+    }
+    const parentPid = safely(() => inspectParent(current))?.ppid;
+    if (parentPid === void 0 || !(parentPid > 1)) return false;
+    current = parentPid;
+  }
+  return false;
 }
 var BRIDGE_ENTRY_RE = /(remote-control-bridge(\.cjs)?|remote-control[/\\]bin[/\\]index\.(js|cjs|mjs)|bridge[/\\](dist[/\\])?index\.(js|cjs|mjs|ts)|[/\\]\.bin[/\\]bridge(\s|$))/;
 var NODE_EXEC_RE = /(^|[/\\])(node|nodejs|node\d+(\.\d+)*|bun|deno|tsx|ts-node)(\.exe)?$/;
@@ -8820,6 +8857,7 @@ if (invokedDirectly) {
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   belongsToRunningShare,
+  spawnedByRecordedShare,
   startBridge,
   stopBridge,
   terminateBridgeProcess,

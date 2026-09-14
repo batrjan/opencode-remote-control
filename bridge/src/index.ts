@@ -21,6 +21,7 @@ import {
   clearSessionState,
   clearOwnSessionState,
   latestSessionState,
+  listSessionStates,
   ownerKey,
   type SessionState,
 } from './state.js'
@@ -93,18 +94,35 @@ export async function startBridge(
   // bridge's lifetime below.
   let spawnedServer: import('node:child_process').ChildProcess | undefined
   let resolvedPort: number
+  // Whether the server this start runs on cannot be the `opencode serve` an
+  // earlier, dead share of the session left behind, so settling that share may
+  // end it (see registerShare). A server named by --port or a URL may be exactly
+  // that leftover; one we spawned cannot, nor one detection picked, since it
+  // never attaches to a server a share recorded (spawnedByRecordedShare).
+  let endLeftoverServer = false
   if (opts.opencodeUrl) {
     resolvedPort = 0 // unused; url given directly
   } else if (opts.port !== undefined) {
     resolvedPort = opts.port
   } else {
     // Never attach to a server another share on this machine spawned: that
-    // share kills it when it ends, and this one would go down with it.
+    // share kills it when it ends, and this one would go down with it. That
+    // includes the server of a share whose bridge was killed with -9: it is
+    // re-parented away, so only the share's state file still names it. Without
+    // a session id this start learns which share it takes back only after
+    // detection, and used to attach to such a leftover as if it were the
+    // owner's own server: settling the dead share then dropped the only record
+    // of the server and left it running for good, and a share of another
+    // session ran on a server that a `stop` of the stale one would kill.
     const ensured = await (
-      opts.serverSpawner ?? (() => ensureOpenCodeServer({ ownedByShare: (pid) => belongsToRunningShare(pid) }))
+      opts.serverSpawner ??
+      (() =>
+        ensureOpenCodeServer({ ownedByShare: (pid) => belongsToRunningShare(pid) || spawnedByRecordedShare(pid) }))
     )()
     resolvedPort = ensured.port
     spawnedServer = ensured.spawned
+    // A test hook's server is vetted by nobody, unless it was spawned for us.
+    endLeftoverServer = spawnedServer !== undefined || opts.serverSpawner === undefined
   }
   const killSpawnedServer = () => {
     if (spawnedServer && spawnedServer.exitCode === null && !spawnedServer.killed) spawnedServer.kill()
@@ -132,14 +150,14 @@ export async function startBridge(
     const picked =
       opts.sessionId === undefined ? await pickSession(opencode) : await fetchSession(opencode, opts.sessionId)
     session_id = opts.sessionId ?? picked!.id
-    // A leftover server of an earlier share is only ended here when this start
-    // runs on a server of its own: an attached one may be that very server.
+    // A leftover server of an earlier share is only ended here when it cannot
+    // be the server this start runs on (see endLeftoverServer above).
     ;({ access_code, bridge_token, viewer_url } = await registerShare(
       relay,
       session_id,
       picked?.directory ?? process.cwd(),
       picked?.title ?? '',
-      spawnedServer !== undefined,
+      endLeftoverServer,
       // An explicit id was settled above, before anything was spawned.
       opts.sessionId === undefined,
     ))
@@ -522,14 +540,9 @@ export function terminateSpawnedServer(
     snapshot = null
   }
   if (!snapshot) return false // already gone: nothing to clean up, nothing to report
-  if (!SERVE_COMMAND_RE.test(snapshot.command)) {
-    console.warn(
-      `bridge stop: not signalling opencode server pid ${pid} — pid now belongs to an unrelated process: ${snapshot.command.slice(0, 120)}`,
-    )
-    return false
-  }
-  if (startedAt !== undefined && snapshot.startedAt !== undefined && snapshot.startedAt > startedAt + PID_START_SLACK_MS) {
-    console.warn(`bridge stop: not signalling opencode server pid ${pid} — it started after this share was registered`)
+  const refusal = refuseAsSpawnedServer(snapshot, startedAt)
+  if (refusal) {
+    console.warn(`bridge stop: not signalling opencode server pid ${pid} — ${refusal}`)
     return false
   }
   try {
@@ -539,6 +552,68 @@ export function terminateSpawnedServer(
     // Already gone (ESRCH) or not ours (EPERM).
     return false
   }
+}
+
+/**
+ * Why a live pid a share recorded as `server_pid` is no longer the
+ * `opencode serve` that share spawned, or null when it still is: pids are
+ * recycled, so the command line must still be a server's and the process must
+ * not have started after the share was registered.
+ */
+function refuseAsSpawnedServer(snapshot: ProcessSnapshot, startedAt?: number): string | null {
+  if (!SERVE_COMMAND_RE.test(snapshot.command)) {
+    return `pid now belongs to an unrelated process: ${snapshot.command.slice(0, 120)}`
+  }
+  if (startedAt !== undefined && snapshot.startedAt !== undefined && snapshot.startedAt > startedAt + PID_START_SLACK_MS) {
+    return 'it started after this share was registered'
+  }
+  return null
+}
+
+/**
+ * Whether the process listening on a port is — or runs under — the
+ * `opencode serve` a share on this machine recorded as its own (`server_pid`
+ * in its state file), whether or not that share's bridge still runs.
+ *
+ * belongsToRunningShare cannot see the server of a bridge killed with -9 (or
+ * crashed): it is re-parented away, and only the state file still says whose it
+ * is. Such a server is never the owner's own, and attaching to it gave a share
+ * a server that nothing would end, or that a `stop` of the stale share would
+ * end under it. The recorded pid is held to the check `stop` uses before
+ * signalling it, so a pid recycled into the owner's own server is not claimed;
+ * the listener's ancestors are looked at too, for an `opencode` on PATH that is
+ * a wrapper around the real binary.
+ *
+ * Never throws: without `ps` nothing is claimed. `states`, `inspect` and
+ * `inspectParent` are injectable so the decision can be tested deterministically.
+ */
+export function spawnedByRecordedShare(
+  pid: number,
+  states: SessionState[] = listSessionStates(),
+  inspect: (pid: number) => ProcessSnapshot | null = describeProcess,
+  inspectParent: (pid: number) => ProcessParent | null = describeParent,
+): boolean {
+  const recorded = states.filter((s) => typeof s.server_pid === 'number' && s.server_pid > 1 && s.server_pid !== process.pid)
+  if (recorded.length === 0) return false
+  const safely = <T>(fn: () => T): T | null => {
+    try {
+      return fn()
+    } catch {
+      return null
+    }
+  }
+  let current = pid
+  for (let depth = 0; depth <= SHARE_ANCESTRY_DEPTH; depth++) {
+    const owners = recorded.filter((s) => s.server_pid === current)
+    if (owners.length > 0) {
+      const snapshot = safely(() => inspect(current))
+      if (snapshot && owners.some((s) => refuseAsSpawnedServer(snapshot, s.started_at) === null)) return true
+    }
+    const parentPid = safely(() => inspectParent(current))?.ppid
+    if (parentPid === undefined || !(parentPid > 1)) return false
+    current = parentPid
+  }
+  return false
 }
 
 /** What the OS reports about a live pid: its command line and, when `ps`

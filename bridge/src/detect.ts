@@ -55,8 +55,9 @@ export interface EnsureServerOptions {
   /** Listening node/opencode processes — test hook; defaults to listListeners(). */
   listListeners?: () => Promise<Listener[]>
   /**
-   * Whether the process behind a listener belongs to a share that is already
-   * running on this machine. Such a server is never attached to.
+   * Whether the process behind a listener belongs to a share on this machine:
+   * spawned by a bridge that is still running, or recorded by a share as the
+   * server it spawned. Such a server is never attached to.
    */
   ownedByShare?: (pid: number) => boolean
 }
@@ -83,7 +84,9 @@ export async function ensureOpenCodeServer(
     // that share, which kills it on every way it ends (stop, the relay revoking
     // it, a signal, its bridge exiting). Attaching to it made this share run on
     // borrowed time — ending the first share cut the second one's viewers off
-    // and then ended it too. Start a server of our own instead.
+    // and then ended it too. Start a server of our own instead. The same goes
+    // for a server a share whose bridge died left behind: `stop` of that share
+    // ends it.
     if (opts.ownedByShare?.(pid)) {
       console.warn(
         `bridge: not attaching to the opencode server on port ${port} (pid ${pid}) — another share started it and ends it with that share; starting a separate one`,

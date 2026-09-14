@@ -177,23 +177,32 @@ function readOwnerSecret(file: string): Buffer | undefined {
   }
 }
 
-/** Most recent saved session (for stop/status when the id is not passed). */
-export function latestSessionState(): SessionState | undefined {
+/** Every saved session state, in no particular order. Unreadable entries are skipped; never throws. */
+export function listSessionStates(): SessionState[] {
   try {
     const dir = stateDir()
-    if (!existsSync(dir)) return undefined
+    if (!existsSync(dir)) return []
     const files = readdirSync(dir).filter((f: string) => f.endsWith('.json'))
-    let best: SessionState | undefined
+    const states: SessionState[] = []
     for (const f of files) {
       try {
-        const s = JSON.parse(readFileSync(path.join(dir, f), 'utf8')) as SessionState
-        if (!best || s.started_at > best.started_at) best = s
+        const s = JSON.parse(readFileSync(path.join(dir, f), 'utf8')) as SessionState | null
+        if (s && typeof s === 'object') states.push(s)
       } catch {
         // skip unreadable entry
       }
     }
-    return best
+    return states
   } catch {
-    return undefined
+    return []
   }
+}
+
+/** Most recent saved session (for stop/status when the id is not passed). */
+export function latestSessionState(): SessionState | undefined {
+  let best: SessionState | undefined
+  for (const s of listSessionStates()) {
+    if (!best || s.started_at > best.started_at) best = s
+  }
+  return best
 }
