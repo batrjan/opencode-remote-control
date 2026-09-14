@@ -37,6 +37,10 @@ const SHARE = 'ses_routeShare01'
 const CHILD = 'ses_routeChild01'
 const GRAND = 'ses_routeGrand01'
 const STRANGER = 'ses_routeStranger01'
+/** A share of the owner's that ended: a root session opencode still has. */
+const ENDED = 'ses_routeEnded01'
+/** A subagent opencode cannot describe right now (it answers an error). */
+const FLAKY = 'ses_routeFlaky01'
 
 const info = (id: string, parentID?: string) => ({
   id,
@@ -50,6 +54,7 @@ const SESSIONS = new Map([
   [CHILD, info(CHILD, SHARE)],
   [GRAND, info(GRAND, CHILD)],
   [STRANGER, info(STRANGER)],
+  [ENDED, info(ENDED)],
 ])
 
 let relay: Server
@@ -72,6 +77,7 @@ beforeAll(async () => {
     if (req.method === 'GET' && detail) {
       const id = decodeURIComponent(detail[1]!)
       detailReads.push(id)
+      if (id === FLAKY) return json(res, 500, { error: 'mock: storage busy' })
       const found = SESSIONS.get(id)
       return found ? json(res, 200, found) : json(res, 404, { error: 'not found' })
     }
@@ -131,8 +137,61 @@ test('reloading a subagent page, or opening it in a new tab, serves the viewer t
       expect(String(res.headers['set-cookie']), path).toContain('viewer_token=')
     }
   }
-  // Nothing went upstream to serve a page.
-  expect(detailReads).toEqual([])
+  // Proving a subagent took one parent walk, made once: the other spelling of
+  // each page found it known, as the page's own reads of it do next.
+  expect(detailReads).toEqual([CHILD, GRAND])
+})
+
+test("an old link to an ended share is the ended page, not the viewer's current share under its id", async () => {
+  // The viewer watched ENDED, that share has since been stopped, and they have
+  // joined SHARE, so their cookie is SHARE's. The ended share's page is still
+  // in their browser history, and the owner's opencode still has its session.
+  const ended = await request(relay).post('/api/sessions').send({ session_id: ENDED, directory: DIR, title: 't' })
+  expect(ended.status).toBe(201)
+  const deleted = await request(relay).delete(`/api/sessions/${ENDED}`).set('x-bridge-token', ended.body.bridge_token)
+  expect(deleted.status).toBe(204)
+
+  // The same for a share that lived on someone else's opencode, which this
+  // owner's has never heard of.
+  for (const id of [ENDED, 'ses_routeElsewhere01']) {
+    for (const path of pagePaths(id)) {
+      const res = await request(relay).get(path).set('Cookie', cookie())
+      // It was SHARE's UI at that URL: every read collapsed to SHARE, and the
+      // page showed "session not found" with no composer and no word that the
+      // share had ended or how to get a new link.
+      expect(res.status, path).toBe(404)
+      expect(res.text, path).toContain('This session has ended')
+      expect(res.text, path).not.toContain('oc-relay-server-url')
+    }
+  }
+})
+
+test("a subagent page is served when its parent walk cannot be made, as the share's own page is", async () => {
+  // opencode answers an error for this subagent's detail: nothing proves it
+  // is outside the share, and the share is live.
+  for (const path of pagePaths(FLAKY)) {
+    const res = await request(relay).get(path).set('Cookie', cookie())
+    expect(res.status, path).toBe(200)
+    expect(res.text, path).toContain('<script id="oc-relay-server-url">')
+  }
+
+  // A share whose bridge is not connected cannot be asked at all.
+  const away = await request(relay).post('/api/sessions').send({ session_id: 'ses_routeAway01', directory: DIR, title: 't' })
+  expect(away.status).toBe(201)
+  try {
+    const viewer = await request(relay)
+      .post('/api/activate')
+      .send({ code: away.body.access_code, session_id: 'ses_routeAway01' })
+    expect(viewer.status).toBe(200)
+    for (const path of pagePaths('ses_routeAwayChild01')) {
+      const res = await request(relay).get(path).set('Cookie', `viewer_token=${viewerTokenFrom(viewer)}`)
+      expect(res.status, path).toBe(200)
+      // The shell of that viewer's own share.
+      expect(res.text, path).toContain('const share = "ses_routeAway01"')
+    }
+  } finally {
+    await request(relay).delete('/api/sessions/ses_routeAway01').set('x-bridge-token', away.body.bridge_token)
+  }
 })
 
 test("what the subagent page then reads is the subagent's own, and its parent walk ends at the share", async () => {

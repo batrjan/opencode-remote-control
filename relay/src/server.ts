@@ -5,6 +5,7 @@ import path from 'node:path'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { Store } from './store.js'
+import type { Session } from './store.js'
 import { activateRouter } from './api/activate.js'
 import { setViewerCookie } from './api/viewerCookie.js'
 import { healthRouter } from './api/health.js'
@@ -317,6 +318,9 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
   const app = express()
   // Ends the viewers' SSE streams on shutdown; nothing to end without the proxy.
   let endEventStreams = () => {}
+  // Whether a session id is a subagent of a share (see sessionPage); without
+  // the proxy there is nobody to ask.
+  let shareAncestry: (share: Session, id: string) => Promise<boolean | undefined> = async () => undefined
   // Which proxy hop to believe for X-Forwarded-For — see trustProxy(). A
   // permissive `true` made XFF fully client-spoofable, defeating per-IP rate
   // limits; a bare 'loopback' inside Docker trusted nothing and collapsed
@@ -462,19 +466,31 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
    * A share's own page is served only to an authenticated viewer of THAT
    * share; anyone else is bounced to its code-entry page.
    *
-   * Any other id is served the UI too, when the cookie names a live share. The
-   * UI links a subagent's page — the task card in the transcript — by the
-   * subagent's own session id, which no share answers, and leaves a middle- or
-   * ctrl-click on that link to the browser. Answered from the share list alone,
-   * the viewer's reload of a subagent page, or the tab they opened for it, said
-   * "This session has ended" while the share was live. This grants nothing: the
-   * shell is the static UI, and every read it makes goes through the proxy's
-   * forced binding, where only a proven descendant of the viewer's share is
-   * read as itself (see SUBAGENT_ROUTES in proxy/adapter.ts). No upstream check
-   * here: it would put the owner's uplink in front of every such page load, and
-   * a page naming a session outside the share reads only the share, exactly as
-   * the same URL reached from inside the app does. Without a working cookie the
-   * answer is the ended page, as before.
+   * Any other id is served the UI too when it is a subagent of the share the
+   * cookie names. The UI links a subagent's page — the task card in the
+   * transcript — by the subagent's own session id, which no share answers, and
+   * leaves a middle- or ctrl-click on that link to the browser. Answered from
+   * the share list alone, the viewer's reload of a subagent page, or the tab
+   * they opened for it, said "This session has ended" while the share was live.
+   *
+   * Only a subagent, though. Served for any id, the UI also answered an old
+   * link to a share that has since ended (from the browser's history, say) to a
+   * viewer who had joined another share: that share's UI under the ended one's
+   * URL, where every read collapsed to the live share, showing "session not
+   * found" and no composer instead of saying the share ended and how to get a
+   * new link. The proof is the proxy's own parent walk (see shareAncestry in
+   * proxy/adapter.ts): already known when the viewer came from inside the app,
+   * whose reads proved it, and otherwise made once here, where the page's own
+   * first read of the subagent would have made it anyway. An id the walk rules
+   * out gets the ended page. One it could not finish (the bridge is away,
+   * opencode answered an error) gets the UI, as the share's own page does while
+   * its bridge is away: nothing shows the share has ended.
+   *
+   * This grants nothing: the shell is the static UI, and every read it makes
+   * goes through the proxy's forced binding, where only a proven descendant of
+   * the viewer's share is read as itself (see SUBAGENT_ROUTES). Without a
+   * working cookie the answer is the ended page, as before, with nothing asked
+   * upstream.
    */
   const sessionPage = (req: express.Request, res: express.Response, next: express.NextFunction) => {
     // '/:dir/session/:id' also matches /api/session/<id>, the proxy's /api twin
@@ -492,8 +508,17 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
     }
     const share = token ? store.getSessionByViewerToken(token) : undefined
     if (!token || !share) return res.status(404).type('html').send(endedHtml())
-    setViewerCookie(res, token)
-    return res.type('html').send(terminalHtml(share.id))
+    void shareAncestry(share, req.params.id)
+      .then((inShare) => {
+        // The walk may have waited out a bridge re-dial: the viewer's access
+        // or the share can have ended meanwhile.
+        if (inShare === false || store.getSessionByViewerToken(token) !== share) {
+          return res.status(404).type('html').send(endedHtml())
+        }
+        setViewerCookie(res, token)
+        return res.type('html').send(terminalHtml(share.id))
+      })
+      .catch(next)
   }
   // The official UI session route: /<base64(directory)>/session/<id>.
   app.get('/:dir/session/:id(ses_[A-Za-z0-9_]+)', sessionPage)
@@ -510,6 +535,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
     const adapter = proxyAdapter(store, bridge)
     app.use(adapter)
     endEventStreams = adapter.endEventStreams
+    shareAncestry = adapter.shareAncestry
   }
   // Nothing matched. express's own finalhandler answers an HTML page reading
   // "Cannot PUT /config", which is both the wrong content type for an API and

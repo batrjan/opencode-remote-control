@@ -719,6 +719,19 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
    * look like a descendant. Anything that cannot be verified is not one.
    */
   async function descendsFromShare(session: Session, requested: string): Promise<boolean> {
+    return (await shareAncestry(session, requested)) === true
+  }
+
+  /**
+   * descendsFromShare, telling a "no" from a walk that could not be finished:
+   * true when `requested` is proven a descendant, false when the answers rule
+   * it out (not a session id, no such session, a root that is not the share, a
+   * cycle, a chain too deep), undefined when the bridge could not be asked or
+   * opencode answered an error or no session detail. Every read takes both
+   * short of true alike; only the session page tells them apart (see
+   * sessionPage in server.ts).
+   */
+  async function shareAncestry(session: Session, requested: string): Promise<boolean | undefined> {
     // Only a well-formed session id may ever flow into an upstream path. This
     // is the value the caller controls, so anything that is not exactly a
     // session id (encoded slashes, query smuggling, traversal) is refused
@@ -739,13 +752,15 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           { method: 'GET', path: `/session/${encodeURIComponent(current)}${queryForSession('', session)}` },
           config.proxyTimeoutMs,
         )
-        if (out.status !== 200) return false
+        // opencode's answer for a session it does not have.
+        if (out.status === 404) return false
+        if (out.status !== 200) return undefined
         const detail = JSON.parse(out.body) as { id?: unknown; parentID?: unknown }
         // A session whose own id does not echo back is not a real session.
         if (detail?.id !== current) return false
         parentID = typeof detail?.parentID === 'string' ? detail.parentID : undefined
       } catch {
-        return false // cannot verify -> strict binding
+        return undefined // cannot verify -> strict binding
       }
       if (parentID === undefined) return false // reached a root that is not ours
       // Every session on a chain that reaches the share is a descendant.
@@ -1348,7 +1363,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     for (const stream of [...(viewerStreams.get(session_id) ?? [])]) stream.end()
   })
 
-  return Object.assign(router, { endEventStreams })
+  return Object.assign(router, { endEventStreams, shareAncestry })
 }
 
 /**
