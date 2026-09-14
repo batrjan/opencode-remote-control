@@ -378,9 +378,15 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
    * session. A dropped link is waited out first (the bridge re-dials within
    * about a second), and the GET itself survives one more re-dial. Anything
    * short of a 200 naming this very message is "no".
+   *
+   * Only the prompt's own registration is asked: the share may have ended
+   * during the wait and its id been registered again by someone else, whose
+   * bridge never saw the prompt and could answer anything (see
+   * BridgeClient.sameRegistration).
    */
   async function promptLanded(session: Session, messageID: string, query: string): Promise<boolean> {
     if (!(await bridge.waitForConnection(session.id, bridgeReconnectWaitMs()))) return false
+    if (!bridge.sameRegistration(session.id, session)) return false
     try {
       const out = await bridge.request(
         session.id,

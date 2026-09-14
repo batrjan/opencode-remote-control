@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import type { Server } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { gunzip } from 'node:zlib'
-import type { Store } from '../store.js'
+import type { Session, Store } from '../store.js'
 import { bridgeReconnectWaitMs, wsPingIntervalMs, wsPongGraceRounds } from '../config.js'
 
 /**
@@ -322,8 +322,13 @@ export class BridgeClient {
    * Nothing else is repeated — not a POST (a prompt sent twice is not
    * harmless), not a timeout (the first attempt may still be running), not a
    * session that was stopped on purpose.
+   *
+   * The repeat goes only to the registration the request was made for (the
+   * store's Session record at the call, which the caller checked the viewer
+   * against): see sameRegistration.
    */
   async request(session_id: string, req: ProxyRequest, timeoutMs: number): Promise<ProxyResponse> {
+    const registration = this.store.getSession(session_id)
     try {
       return await this.requestOnce(session_id, req, timeoutMs)
     } catch (err) {
@@ -331,8 +336,28 @@ export class BridgeClient {
       const linkDropped = reason === 'bridge not connected' || reason === 'bridge closed' || reason === 'bridge unreachable'
       if (req.method !== 'GET' || !linkDropped || !this.recentlyDropped(session_id)) throw err
       if (!(await this.waitForConnection(session_id, bridgeReconnectWaitMs()))) throw err
+      if (!this.sameRegistration(session_id, registration)) throw new Error('session closed')
       return this.requestOnce(session_id, req, timeoutMs)
     }
+  }
+
+  /**
+   * Whether `registration` still holds `session_id`, after a wait for its bridge.
+   *
+   * A wait is keyed by the id, and the id is not a secret: it is in the share
+   * link. An owner whose uplink dropped could stop the share meanwhile (the
+   * store frees an id registered without an owner_key at once), anyone holding
+   * the link could register it again and connect a bridge, and the waiting
+   * request woke to THAT socket — sent with the ended share's project directory
+   * in its query, and answered to the ended share's viewer with whatever the
+   * new bridge chose. The store builds a new Session record for every
+   * registration (an owner's replacement of its own included) and never
+   * reinstates one, and a bridge socket is authenticated against the record
+   * the store holds when it connects; so the same record before and after the
+   * wait means the socket now connected is that registration's bridge.
+   */
+  sameRegistration(session_id: string, registration: Session | undefined): boolean {
+    return registration !== undefined && this.store.getSession(session_id) === registration
   }
 
   /**
@@ -468,15 +493,27 @@ export class BridgeClient {
 
   /**
    * Drop one session's bridge connection (session stopped): close the socket
-   * and fail its pending proxy requests. No-op when no bridge is connected.
+   * and fail its pending proxy requests.
+   *
+   * Also when no bridge is connected: a share stopped while its bridge was
+   * re-dialling has no socket here, but it has requests waiting for that
+   * re-dial, and the mark that one is under way. Both used to stay behind for
+   * the id's next registration — the requests woke to its bridge (see
+   * sameRegistration) or waited out their time for nothing, and that
+   * registration's first connection counted as a re-dial. Woken now, the
+   * waiters find no bridge and fail at once.
    */
   disconnect(session_id: string): void {
-    const ws = this.clients.get(session_id)
-    if (!ws) return
-    this.clients.delete(session_id)
     this.droppedAt.delete(session_id)
-    this.failPending(session_id, 'session closed')
-    ws.close(4001, 'session closed')
+    const ws = this.clients.get(session_id)
+    if (ws) {
+      this.clients.delete(session_id)
+      this.failPending(session_id, 'session closed')
+      ws.close(4001, 'session closed')
+    }
+    // After the socket is gone, so each waiter sees no connection.
+    const waiters = this.connectWaiters.get(session_id)
+    if (waiters) for (const wake of [...waiters]) wake()
   }
 
   /** Close all bridge connections and fail every pending proxy request. */
