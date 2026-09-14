@@ -37,23 +37,24 @@ const BOUND = 8 * 1024 * 1024
 let relay: http.Server
 let relayUrl: string
 /** Relay-side responses of every viewer event stream, in arrival order. */
-let streams: { res: http.ServerResponse; peak: number }[]
+let streams: { res: http.ServerResponse; peak: number; writes: number }[]
 
 beforeEach(async () => {
   streams = []
   const store = new Store()
   relay = http.createServer()
   const bridge = new BridgeClient(relay, store)
-  // Registered before the app so it sees each response first: record the
-  // largest backlog the relay ever held for that viewer, right after each
-  // write and before anything the relay does about it.
+  // Registered before the app so it sees each response first: count the
+  // writes and record the largest backlog the relay ever held for that viewer,
+  // right after each write and before anything the relay does about it.
   relay.on('request', (req: http.IncomingMessage, res: http.ServerResponse) => {
     if (req.url !== '/event') return
-    const entry = { res, peak: 0 }
+    const entry = { res, peak: 0, writes: 0 }
     streams.push(entry)
     const write = res.write.bind(res) as (...args: unknown[]) => boolean
     res.write = ((...args: unknown[]) => {
       const ok = write(...args)
+      entry.writes++
       entry.peak = Math.max(entry.peak, res.writableLength)
       return ok
     }) as typeof res.write
@@ -142,6 +143,120 @@ test('a viewer that stops reading is dropped at a bounded backlog; a healthy one
     bridge.terminate()
     stuck.destroy()
     healthy.destroy()
+  }
+}, 30_000)
+
+/**
+ * One `message.part.updated` the size of a pasted image: the web UI sends a
+ * pasted picture as a data URL, and a part carrying it (or a big diff) can be
+ * megabytes on its own — larger than the relay's per-viewer backlog cap.
+ */
+function bigPartEvent(id: string, bytes: number): string {
+  const url = 'data:image/png;base64,' + 'A'.repeat(bytes)
+  return JSON.stringify({
+    type: 'message.part.updated',
+    properties: { part: { id: 'prt_big', messageID: 'msg_big', sessionID: id, type: 'file', url } },
+  })
+}
+
+/** Small events that follow a big one, as a model's next deltas would. */
+function smallEvents(id: string, count: number): string[] {
+  return Array.from({ length: count }, (_, i) =>
+    JSON.stringify({ type: 'message.part.delta', properties: { sessionID: id, delta: `after-${i}-` + 'y'.repeat(1024) } }),
+  )
+}
+
+/** Everything a raw viewer socket has received so far, as text. */
+function collect(socket: net.Socket): () => string {
+  const chunks: Buffer[] = []
+  socket.on('data', (chunk: Buffer) => chunks.push(chunk))
+  return () => Buffer.concat(chunks).toString('latin1')
+}
+
+test('one event larger than the cap reaches a reading viewer whole, and its stream stays open', async () => {
+  // The cap is a stuck-viewer detector, not an event size limit. It used to be
+  // checked right AFTER each write, so a single event past RELAY_SSE_MAX_BUFFER_BYTES
+  // (2 MiB) tripped it on every viewer at once, reading or not: all their
+  // streams were destroyed, the event itself never arrived, and the UI counted
+  // the drop as a failed attempt and backed off its reconnects. Checking only
+  // BEFORE each write still dropped the viewer on the events right behind it.
+  const id = 'ses_backpressure_big'
+  const { viewerToken, bridge } = await share(id)
+  const viewer = await openViewer(viewerToken)
+  const received = collect(viewer)
+  try {
+    await until(() => streams.length === 1, 2000)
+    expect(streams.length).toBe(1)
+    const big = bigPartEvent(id, 3 * 1024 * 1024)
+    const after = smallEvents(id, 8)
+    // In one burst, the way opencode emits a part and then carries on: the
+    // events after the big one reach the relay while it is still unsent.
+    for (const data of [big, ...after]) bridge.send(JSON.stringify({ type: 'event', data }))
+    await until(() => received().includes(`data: ${after[after.length - 1]}\n\n`) || streams[0].res.destroyed, 10_000)
+
+    expect(streams[0].res.destroyed).toBe(false)
+    const text = received()
+    expect(text.includes(`data: ${big}\n\n`)).toBe(true)
+    for (const data of after) expect(text.includes(`data: ${data}\n\n`)).toBe(true)
+  } finally {
+    bridge.terminate()
+    viewer.destroy()
+  }
+}, 30_000)
+
+test('a viewer still taking an oversized event is kept, and gets everything once it reads on', async () => {
+  // A phone downloading a pasted image takes seconds to take it; the model's
+  // next events arrive meanwhile. Only the backlog beyond that one event says
+  // the viewer is not keeping up.
+  const id = 'ses_backpressure_behind'
+  const { viewerToken, bridge } = await share(id)
+  const viewer = await openViewer(viewerToken)
+  const received = collect(viewer)
+  try {
+    await until(() => streams.length === 1, 2000)
+    expect(streams.length).toBe(1)
+    viewer.pause() // not reading while the big event and its followers are written
+    const big = bigPartEvent(id, 8 * 1024 * 1024)
+    const after = smallEvents(id, 16)
+    for (const data of [big, ...after]) bridge.send(JSON.stringify({ type: 'event', data }))
+    // Every follower was handed to the stream (or the stream was dropped):
+    // the opening write, the big event, then each follower.
+    const lastFrame = `data: ${after[after.length - 1]}\n\n`
+    await until(() => streams[0].res.destroyed || streams[0].writes >= 2 + after.length, 10_000)
+    expect(streams[0].writes).toBeGreaterThanOrEqual(2 + after.length)
+    expect(streams[0].res.destroyed).toBe(false)
+
+    viewer.resume()
+    await until(() => received().includes(lastFrame) || streams[0].res.destroyed, 10_000)
+    expect(streams[0].res.destroyed).toBe(false)
+    const text = received()
+    expect(text.includes(`data: ${big}\n\n`)).toBe(true)
+    for (const data of after) expect(text.includes(`data: ${data}\n\n`)).toBe(true)
+  } finally {
+    bridge.terminate()
+    viewer.destroy()
+  }
+}, 30_000)
+
+test('a stuck viewer is still dropped at a bounded backlog when an oversized event came first', async () => {
+  // The allowance for one big event must not become room for a stuck viewer
+  // to pile up everything after it.
+  const id = 'ses_backpressure_big_stuck'
+  const { viewerToken, bridge } = await share(id)
+  const stuck = await openViewer(viewerToken)
+  stuck.pause()
+  try {
+    await until(() => streams.length === 1, 2000)
+    expect(streams.length).toBe(1)
+    bridge.send(JSON.stringify({ type: 'event', data: bigPartEvent(id, 3 * 1024 * 1024) }))
+    await flood(bridge, id, 800) // ~50 MB behind it
+    await until(() => streams[0].res.destroyed, 10_000)
+
+    expect(streams[0].res.destroyed).toBe(true)
+    expect(streams[0].peak).toBeLessThan(BOUND)
+  } finally {
+    bridge.terminate()
+    stuck.destroy()
   }
 }, 30_000)
 

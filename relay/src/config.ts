@@ -212,12 +212,14 @@ export function sseHeartbeatMs(): number {
  * owner's output, and 64 streams on a single viewer token multiplied that
  * into an out-of-memory crash of the relay and every share on it.
  *
- * The cap is also the largest single event a viewer can still be sent, so it
- * cannot be tiny; but a session's 64 streams can all sit just under it at once,
- * so it cannot be generous either. At 4 MiB those 64 streams alone filled a
- * 256 MB heap and the relay still died; 2 MiB held under the same sustained
- * attack. Counted the way Node counts a write backlog (string length), so it
- * is approximate in bytes.
+ * It is not a limit on the size of one event: one large event still waiting
+ * for a viewer is not counted against it (see the SSE fan-out in the proxy
+ * adapter), so a pasted image or a big diff reaches a viewer that keeps
+ * reading even when it is larger than the cap. But a session's 64 streams can
+ * all sit just under it at once, so it cannot be generous. At 4 MiB those 64
+ * streams alone filled a 256 MB heap and the relay still died; 2 MiB held
+ * under the same sustained attack. Counted the way Node counts a write backlog
+ * (string length), so it is approximate in bytes.
  */
 export function sseMaxBufferBytes(): number {
   return envInt('RELAY_SSE_MAX_BUFFER_BYTES', 2 * 1024 * 1024)

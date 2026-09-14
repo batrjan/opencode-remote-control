@@ -878,19 +878,55 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // used to look at whether the viewer kept up: every event it did not take
     // waited in this process, so one stuck phone grew by the full rate of the
     // owner's output and 64 stuck streams on one token ran the relay out of
-    // memory — every share on it went down. Check after each write, so no
-    // stream ever holds more than the cap. Destroy rather than endStream():
+    // memory — every share on it went down. Destroy rather than endStream():
     // end() only queues the closing chunk BEHIND the backlog, so a peer that is
     // not reading keeps every queued byte, and its stream slot, for as long as
     // its TCP connection lives. Destroying frees both at once, and the viewer
     // sees its stream fail and reconnects.
+    //
+    // The cap detects a viewer that is not keeping up; it must not act as a
+    // limit on the size of one event. It used to be checked right after each
+    // write, so a single event larger than the cap (a part carrying a pasted
+    // image as a data URL, a big diff) tripped it on EVERY viewer at once,
+    // reading or not: all their streams were destroyed, the event never
+    // arrived, and the UI's reconnect backoff grew with each retry. Checking
+    // the backlog before the write is not enough either: a big frame takes a
+    // phone seconds to download, stays in the backlog all that time, and the
+    // next delta or heartbeat would drop the viewer just the same. So the check
+    // runs before each write and does not count ONE large frame still waiting
+    // in the backlog: the latest frame at least as large as what is left of
+    // the one exempted before it. A stuck stream is therefore dropped holding
+    // at most the cap, plus that one frame, plus the frame whose write passed.
+    // Only one frame is exempt, so the allowance never grows with the output:
+    // a viewer still behind on two frames that each exceed the cap is dropped
+    // at the next write.
     const maxBuffer = sseMaxBufferBytes()
+    // Counted in the response's own writableLength units (string length plus
+    // chunked framing), measured around each write, so `queued` minus the
+    // current backlog is what has left the process since this point, and the
+    // exempt frame is known by where it ends in that count. Whatever a write
+    // flushes synchronously never enters either number.
+    let queued = res.writableLength
+    let exemptEnd = 0
+    let exemptLength = 0
+    const unsentOfExempt = () =>
+      Math.min(exemptLength, Math.max(0, exemptEnd - (queued - res.writableLength)))
     const send = (frame: string) => {
+      const exempt = unsentOfExempt()
+      if (res.writableLength - exempt > maxBuffer) {
+        clearInterval(heartbeat)
+        unsubscribe()
+        res.destroy()
+        return
+      }
+      const before = res.writableLength
       res.write(frame)
-      if (res.writableLength <= maxBuffer) return
-      clearInterval(heartbeat)
-      unsubscribe()
-      res.destroy()
+      const added = Math.max(0, res.writableLength - before)
+      queued += added
+      if (added >= exempt) {
+        exemptEnd = queued
+        exemptLength = added
+      }
     }
     const heartbeat = setInterval(() => {
       if (res.writableEnded || res.destroyed) return
