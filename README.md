@@ -165,7 +165,11 @@ printed on stderr; the `OK` after it is only the model acknowledging the turn
 and looks the same whatever happened. The exit status tells them apart: a stop
 exits 0 only when it ended a share, and 1 when there was nothing to stop in that
 session or the stop failed, so a script's `&&` goes on only after a share really
-ended. A status exits 0 whatever it found, and 1 only when it failed.
+ended. A status exits 0 whatever it found, and 1 only when it failed. That is
+`opencode run` on its own: `opencode run --attach <server-url>` hands the command
+to that server, prints only the model's `OK` and exits 0 whatever the stop did, so
+there its `&&` proves nothing — the result is in the session, which
+`opencode attach <server-url> --session <id>` shows.
 
 The bridge also stops on its own when OpenCode quits (watchdog) or on SIGINT/SIGTERM;
 every stop path deletes the relay session, revokes the code, terminates the bridge
@@ -264,7 +268,12 @@ So there, too, the model is asked to repeat the output verbatim, and what the
 editor shows is the model's copy of the URL and code. Reopening the thread
 replays the session, the plugin's own message included, so the output then
 appears twice, and an editor that ignores the "for the assistant" marking on the
-plugin's instruction to the model shows that instruction as well.
+plugin's instruction to the model shows that instruction as well. `opencode acp`
+also listens on HTTP (127.0.0.1:4096 when that port is free, or `--port`), and a
+command sent through that server by another client (`opencode attach`, the web
+UI) runs in the same process, which cannot tell that client from the editor: its
+reply is the model's copy too, so such a client shows the URL and code twice, in
+the plugin's message and in the reply below it.
 
 The TUI itself exposes no HTTP port, so the bridge starts its own
 `opencode serve` against the same project and stops it again on
