@@ -416,29 +416,153 @@ function runBridge(args, { timeout = 15_000, allowFailure = false } = {}) {
 }
 
 
-/** Run one action and return the text to show. */
-export async function runAction(action, sessionID) {
+/** How many parents a stop or status climbs looking for the shared session. */
+const MAX_PARENT_HOPS = 32
+
+/**
+ * How long one parent lookup may take. A stop never used to wait on the
+ * OpenCode server at all; a server too busy to answer must not hang it now.
+ */
+const PARENT_LOOKUP_TIMEOUT_MS = 5_000
+
+/**
+ * A `parentOf(sessionID)` lookup over an OpenCode SDK client, for
+ * sharedSessionOf; undefined without a client.
+ *
+ * The two plugin loaders hand out different SDK generations: the server
+ * plugin's `input.client` takes `{ path: { id } }`, the TUI's `api.client` (v2)
+ * takes `{ sessionID }`. Each ignores the other's key, so one call carries
+ * both. A reply only counts when it is the session asked for, and the parent
+ * only when it is a string.
+ */
+export function clientParentOf(client) {
+  if (typeof client?.session?.get !== "function") return undefined
+  return async (id) => {
+    const res = await client.session.get({ sessionID: id, path: { id } })
+    // `data` unless the client was built with responseStyle "data".
+    const session = res?.data ?? res
+    return session?.id === id && typeof session.parentID === "string" ? session.parentID : undefined
+  }
+}
+
+/**
+ * The session whose share a stop or status typed in `sessionID` is about: that
+ * session when it is shared from this machine, else the nearest ancestor that
+ * is. Undefined when neither it nor any parent is.
+ *
+ * Once stop and status named the session they were typed in, every session
+ * without a share of its own became a dead end — including the subagent
+ * sessions of a shared one, which the TUI routes into whenever the owner opens
+ * a subagent. A stop typed there answered "nothing to stop" while the share it
+ * belongs to (the one its viewers see it under) stayed live. A subagent session
+ * is not "another share on this machine": the relay serves it as part of the
+ * shared session it descends from. So the walk follows parentID up to the
+ * first session with a recorded share — never sideways to an unrelated one,
+ * which is what binding to the typed session was for.
+ *
+ * `parentOf(id)` resolves the parent id (undefined for a root). A lookup that
+ * throws, loops, stalls past PARENT_LOOKUP_TIMEOUT_MS or runs deeper than
+ * MAX_PARENT_HOPS ends the walk: the typed session then keeps its own answer,
+ * as before.
+ */
+export async function sharedSessionOf(sessionID, parentOf, dir = path.dirname(logPath())) {
+  const shared = new Set(recordedShares(dir).map((share) => share.session_id))
+  const visited = new Set()
+  let current = sessionID
+  while (typeof current === "string" && current !== "" && !visited.has(current) && visited.size <= MAX_PARENT_HOPS) {
+    if (shared.has(current)) return current
+    if (!parentOf) return undefined
+    visited.add(current)
+    let timer
+    try {
+      current = await Promise.race([
+        parentOf(current),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, PARENT_LOOKUP_TIMEOUT_MS, undefined)
+        }),
+      ])
+    } catch {
+      return undefined
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  return undefined
+}
+
+/**
+ * The line added when a stop or status was typed where nothing is shared: which
+ * sessions are shared from this machine, and where the command reaches them.
+ *
+ * "session … is not shared from this machine" alone left the owner with a live
+ * share and no idea why stop did not end it — typed in a new session, a new
+ * desktop tab, or `opencode run` (a new session every time). The share is
+ * named rather than acted on: one sitting in another project may be a
+ * colleague's working session, and a stop typed by mistake must not end it.
+ * Oldest share first, so the list reads in the order they were started.
+ */
+export function sharedElsewhereHint(action, dir = path.dirname(logPath())) {
+  const ids = recordedShares(dir)
+    .sort((a, b) => (Number(a.started_at) || 0) - (Number(b.started_at) || 0))
+    .map((share) => share.session_id)
+  if (ids.length === 0) return "No session is shared from this machine."
+  if (ids.length === 1) {
+    return `Shared from this machine: ${ids[0]}. Run /remote-control/${action} in that session (or one of its subagents) to ${action === "stop" ? "end" : "check"} it.`
+  }
+  return `Shared from this machine: ${ids.join(", ")}. Run /remote-control/${action} in the session whose share you mean.`
+}
+
+/**
+ * Stop the share of the session the command was typed in.
+ *
+ * `stopped` says whether there was a share to end. A stop typed where nothing
+ * is shared exits 0 ("nothing to stop"), and the TUI used to show that as a
+ * success toast while the share the owner meant stayed live; it now tells the
+ * two apart. Without a session id (TUI home screen) the CLI falls back to the
+ * share that started last and fails when there is none, so that is `stopped`.
+ */
+export async function stopShare(sessionID, { parentOf } = {}) {
+  const shared = sessionID ? await sharedSessionOf(sessionID, parentOf) : undefined
+  const target = shared ?? sessionID
+  const out = await runBridge(["stop", "--relay", relayUrl(), ...(target ? ["--session-id", target] : [])])
+  // A stopped share's URL + access code in the log are spent: scrub them
+  // here rather than leaving them in the home directory until some later
+  // start replaces the file. Only on success — a stop that failed may have
+  // left the share (and that code) live. And not when the log belongs to a
+  // share that is still recorded here: this stop may have ended another
+  // one, or nothing at all ("not shared from this machine").
+  clearSpentLog()
+  const text = out || "Remote control stopped."
+  if (!sessionID || shared) return { stopped: true, text }
+  return { stopped: false, text: `${text}\n${sharedElsewhereHint("stop")}` }
+}
+
+/**
+ * Run one action and return the text to show.
+ *
+ * `parentOf` (see sharedSessionOf) lets stop and status typed in a subagent
+ * session reach the share that subagent belongs to; without it they act on
+ * the typed session alone.
+ */
+export async function runAction(action, sessionID, { parentOf } = {}) {
   // stop/status must name the session the command was typed in, exactly like
   // start. Without an id the CLI falls back to the share that STARTED LAST, so
   // with two shares a stop typed in A ended B — and reported success while A's
   // code and viewers stayed live.
-  const idArgs = sessionID ? ["--session-id", sessionID] : []
   switch (action) {
     case "start":
       return await startBridge(sessionID)
-    case "stop": {
-      const out = await runBridge(["stop", "--relay", relayUrl(), ...idArgs])
-      // A stopped share's URL + access code in the log are spent: scrub them
-      // here rather than leaving them in the home directory until some later
-      // start replaces the file. Only on success — a stop that failed may have
-      // left the share (and that code) live. And not when the log belongs to a
-      // share that is still recorded here: this stop may have ended another
-      // one, or nothing at all ("not shared from this machine").
-      clearSpentLog()
-      return out || "Remote control stopped."
+    case "stop":
+      return (await stopShare(sessionID, { parentOf })).text
+    case "status": {
+      const shared = sessionID ? await sharedSessionOf(sessionID, parentOf) : undefined
+      const target = shared ?? sessionID
+      const out =
+        (await runBridge(["status", "--relay", relayUrl(), ...(target ? ["--session-id", target] : [])], {
+          allowFailure: true,
+        })) || "no active session"
+      return sessionID && !shared ? `${out}\n${sharedElsewhereHint("status")}` : out
     }
-    case "status":
-      return (await runBridge(["status", "--relay", relayUrl(), ...idArgs], { allowFailure: true })) || "no active session"
     default:
       throw new Error(`unknown action: ${action} (use start, stop or status)`)
   }

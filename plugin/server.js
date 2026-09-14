@@ -16,7 +16,7 @@ import { existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 
-import { resolveAction, runAction } from "./bridge-runner.js"
+import { clientParentOf, resolveAction, runAction } from "./bridge-runner.js"
 
 const COMMANDS = {
   "remote-control": "Share this session on the web (start | stop | status)",
@@ -107,9 +107,11 @@ export const id = "remote-control"
 
 /**
  * Hooks factory. `run` is the action runner — injected in tests so they never
- * spawn the real bridge or touch the relay.
+ * spawn the real bridge or touch the relay. `parentOf` resolves a session's
+ * parent (see sharedSessionOf), so stop and status typed in a subagent session
+ * reach the share it belongs to; without it they act on the typed session only.
  */
-export function createHooks(run = runAction, registerCommands = defaultRegisterCommands) {
+export function createHooks(run = runAction, registerCommands = defaultRegisterCommands, parentOf = undefined) {
   return {
     // Register the commands so they appear in the `/` menu of every client
     // that has no TUI plugin support (desktop GUI, web UI).
@@ -134,7 +136,7 @@ export function createHooks(run = runAction, registerCommands = defaultRegisterC
       const action = resolveAction(name, input?.arguments)
       let text
       try {
-        text = await run(action, input?.sessionID)
+        text = await run(action, input?.sessionID, { parentOf })
       } catch (err) {
         text = `remote-control ${action} failed: ${String(err?.message ?? err)}`
       }
@@ -158,8 +160,10 @@ export function defaultRegisterCommands() {
   return !(runsTui() && tuiEntryRegistered())
 }
 
-export async function server() {
-  return createHooks()
+// opencode passes the plugin input (with the SDK `client` of this server); an
+// older host or a test that passes nothing still gets working hooks.
+export async function server(input) {
+  return createHooks(runAction, defaultRegisterCommands, clientParentOf(input?.client))
 }
 
 export default { id, server }

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type { AddressInfo } from 'node:net'
 // @ts-expect-error — the plugin entries are plain ESM JavaScript, no types.
-import { createHooks } from '../../plugin/server.js'
+import { createHooks, server } from '../../plugin/server.js'
 // @ts-expect-error — same.
 import tuiPlugin from '../../plugin/remote-control.js'
 
@@ -123,10 +123,49 @@ async function serverCommand(command: string, sessionID: string): Promise<string
   return output.parts.filter((p) => !p.synthetic).map((p) => p.text).join('\n')
 }
 
+/**
+ * Subagent sessions for the fixtures: the task tool runs a subagent in a child
+ * session whose parentID is the session that spawned it, and a subagent can
+ * spawn its own. ses_A_sub2 is a grandchild of the shared ses_A; ses_C is an
+ * unshared root, and ses_C_sub its child.
+ */
+const PARENTS: Record<string, string | undefined> = {
+  ses_A_sub: 'ses_A',
+  ses_A_sub2: 'ses_A_sub',
+  ses_C_sub: 'ses_C',
+}
+
+/**
+ * An OpenCode SDK client that knows the fixture sessions, answering
+ * `session.get` in the shape of the SDK the caller uses: v1 (`{ path: { id } }`,
+ * the server plugin's input.client) or v2 (`{ sessionID }`, the TUI's api.client).
+ */
+function fakeClient(asked: string[] = []) {
+  return {
+    session: {
+      get: async (params: { sessionID?: string; path?: { id?: string } }) => {
+        const id = params?.sessionID ?? params?.path?.id
+        asked.push(String(id))
+        if (typeof id !== 'string' || !/^ses_/.test(id)) return { error: { name: 'NotFoundError' } }
+        return { data: { id, parentID: PARENTS[id], title: `title ${id}` } }
+      },
+    },
+  }
+}
+
+/** Run a slash command through the server entry loaded the way opencode loads it: with its client. */
+async function serverPluginCommand(command: string, sessionID: string): Promise<string> {
+  const hooks = await server({ client: fakeClient(), directory: home, worktree: home })
+  const output = { parts: [] as Array<{ text: string; synthetic?: boolean }> }
+  await hooks['command.execute.before']({ command, sessionID, arguments: '' }, output)
+  return output.parts.filter((p) => !p.synthetic).map((p) => p.text).join('\n')
+}
+
 /** Load the TUI entry with the user on `route` and return its commands plus what it showed. */
-async function loadTui(route: { name: string; params?: Record<string, string> }) {
+async function loadTui(route: { name: string; params?: Record<string, string> }, extra: Record<string, unknown> = {}) {
   const commands = new Map<string, () => unknown>()
   const shown: string[] = []
+  const toasts: Array<{ variant?: string; message: string }> = []
   const api = {
     route: { current: route },
     keymap: {
@@ -135,14 +174,18 @@ async function loadTui(route: { name: string; params?: Record<string, string> })
       },
     },
     ui: {
-      toast: (t: { message: string }) => shown.push(t.message),
+      toast: (t: { variant?: string; message: string }) => {
+        shown.push(t.message)
+        toasts.push(t)
+      },
       dialog: { replace: (render: () => unknown) => render(), clear: () => {} },
       DialogAlert: (props: { message: string }) => shown.push(props.message),
       DialogSelect: () => {},
     },
+    ...extra,
   }
   await tuiPlugin.tui(api)
-  return { run: async (name: string) => await commands.get(name)!(), shown }
+  return { run: async (name: string) => await commands.get(name)!(), shown, toasts }
 }
 
 test('/remote-control/stop typed in session A stops A, not the share that started last', async () => {
@@ -237,4 +280,106 @@ test('stop while the relay cannot be told still ends the share, scrubs the code 
   expect(existsSync(stateFile('ses_down'))).toBe(false)
   expect(existsSync(log)).toBe(false)
   expect(existsSync(stateFile('ses_A'))).toBe(true)
+}, 30_000)
+
+/*
+ * Since stop and status name the session they were typed in, a session that
+ * is not itself shared used to be a dead end. Owners open subagent sessions
+ * all the time (the TUI routes into the child session), and a stop typed there
+ * printed "not shared from this machine — nothing to stop." with exit 0: the
+ * TUI showed that as a SUCCESS toast while the share, its code and its viewers
+ * stayed live. Status there answered "session …: not found" for a share that
+ * was working. A new session (a new desktop tab, every `opencode run`) got the
+ * same answer and no word about the share that was actually running.
+ */
+
+test('stop typed in a subagent session ends the share that subagent belongs to', async () => {
+  const text = await serverPluginCommand('remote-control/stop', 'ses_A_sub')
+  expect(seen).toContain('DELETE /api/sessions/ses_A')
+  expect(seen).not.toContain('DELETE /api/sessions/ses_B')
+  expect(existsSync(stateFile('ses_A'))).toBe(false)
+  expect(existsSync(stateFile('ses_B'))).toBe(true)
+  expect(text).toBe('Remote control stopped.')
+}, 30_000)
+
+test('the TUI in a nested subagent session reports and stops the share of its root', async () => {
+  // TUI state knows the synced sessions; ses_A_sub is only reachable through
+  // the client, so both lookups get exercised on the way up.
+  const asked: string[] = []
+  const tui = await loadTui(
+    { name: 'session', params: { sessionID: 'ses_A_sub2' } },
+    {
+      state: { session: { get: (id: string) => (id === 'ses_A_sub2' ? { id, parentID: PARENTS[id] } : undefined) } },
+      client: fakeClient(asked),
+    },
+  )
+
+  await tui.run('remote-control.status')
+  expect(seen).toContain('GET /api/sessions/ses_A')
+  expect(tui.shown.at(-1)).toContain('session ses_A: active')
+  expect(asked).toContain('ses_A_sub')
+
+  await tui.run('remote-control.stop')
+  expect(seen).toContain('DELETE /api/sessions/ses_A')
+  expect(existsSync(stateFile('ses_A'))).toBe(false)
+  expect(existsSync(stateFile('ses_B'))).toBe(true)
+  expect(tui.toasts.at(-1)).toMatchObject({ variant: 'success', message: 'Remote control stopped.' })
+}, 30_000)
+
+test('stop in a session with no share is not reported as a success and names the shares running here', async () => {
+  const tui = await loadTui({ name: 'session', params: { sessionID: 'ses_C_sub' } }, { client: fakeClient() })
+
+  await tui.run('remote-control.stop')
+
+  expect(seen.filter((r) => r.startsWith('DELETE'))).toEqual([])
+  expect(existsSync(stateFile('ses_A'))).toBe(true)
+  expect(existsSync(stateFile('ses_B'))).toBe(true)
+  const toast = tui.toasts.at(-1)!
+  expect(toast.variant).not.toBe('success')
+  expect(toast.variant).not.toBe('error')
+  expect(toast.message).toContain('ses_C_sub is not shared from this machine')
+  expect(toast.message).toContain('ses_A')
+  expect(toast.message).toContain('ses_B')
+  expect(toast.message).toContain('/remote-control/stop')
+}, 30_000)
+
+test('stop and status in a new session name the one share that is running and how to reach it', async () => {
+  rmSync(stateFile('ses_B'))
+
+  const stopped = await serverPluginCommand('remote-control/stop', 'ses_new')
+  expect(seen.filter((r) => r.startsWith('DELETE'))).toEqual([])
+  expect(existsSync(stateFile('ses_A'))).toBe(true)
+  expect(stopped).toContain('ses_new is not shared from this machine')
+  expect(stopped).toContain('Shared from this machine: ses_A.')
+  expect(stopped).toContain('/remote-control/stop in that session')
+
+  const status = await serverPluginCommand('remote-control/status', 'ses_new')
+  expect(status).toContain('Shared from this machine: ses_A.')
+  expect(status).toContain('/remote-control/status in that session')
+
+  rmSync(stateFile('ses_A'))
+  expect(await serverPluginCommand('remote-control/stop', 'ses_new')).toContain('No session is shared from this machine.')
+}, 30_000)
+
+test('a parent lookup that fails, loops or stalls ends the walk instead of hanging or throwing', async () => {
+  const looping = {
+    session: {
+      get: async (params: { sessionID?: string; path?: { id?: string } }) => {
+        const id = params?.sessionID ?? params?.path?.id
+        if (id === 'ses_boom') throw new Error('server gone')
+        // A server too busy to answer at all.
+        if (id === 'ses_stall') return await new Promise(() => {})
+        return { data: { id, parentID: id === 'ses_loop1' ? 'ses_loop2' : 'ses_loop1' } }
+      },
+    },
+  }
+  for (const sessionID of ['ses_loop1', 'ses_boom', 'ses_stall']) {
+    const hooks = await server({ client: looping })
+    const output = { parts: [] as Array<{ text: string; synthetic?: boolean }> }
+    await hooks['command.execute.before']({ command: 'remote-control/stop', sessionID, arguments: '' }, output)
+    const text = output.parts.filter((p) => !p.synthetic).map((p) => p.text).join('\n')
+    expect(text).toContain(`${sessionID} is not shared from this machine`)
+    expect(text).toContain('Shared from this machine: ses_A, ses_B.')
+  }
+  expect(seen.filter((r) => r.startsWith('DELETE'))).toEqual([])
 }, 30_000)

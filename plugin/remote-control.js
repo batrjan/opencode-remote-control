@@ -9,7 +9,7 @@
 // no TUI at all — they get the same actions from the server entry (./server,
 // registered through opencode.json). See plugin/server.js.
 
-import { bridgeBin, runAction } from "./bridge-runner.js"
+import { bridgeBin, clientParentOf, runAction, stopShare } from "./bridge-runner.js"
 export { parseBridgeLog } from "./bridge-runner.js"
 
 export const id = "remote-control"
@@ -20,6 +20,17 @@ export async function tui(api) {
   // share running on this machine. Undefined off a session route (home screen).
   const currentSessionID = () =>
     api.route.current.name === "session" ? api.route.current.params.sessionID : undefined
+
+  // The parent of a session, so stop/status typed in a subagent session (the
+  // TUI routes into one whenever the owner opens a subagent) reach the share
+  // it belongs to. The synced TUI state answers without a request; a session
+  // it does not hold is asked of the server.
+  const fromClient = clientParentOf(api.client)
+  const parentOf = async (id) => {
+    const known = api.state?.session?.get?.(id)
+    if (known) return typeof known.parentID === "string" ? known.parentID : undefined
+    return fromClient ? await fromClient(id) : undefined
+  }
 
   const showStart = async () => {
     if (!bridgeBin()) {
@@ -48,8 +59,14 @@ export async function tui(api) {
 
   const showStop = async () => {
     try {
-      const out = await runAction("stop", currentSessionID())
-      api.ui.toast({ variant: "success", title: "remote-control", message: out || "Remote control stopped.", duration: 4000 })
+      const { stopped, text } = await stopShare(currentSessionID(), { parentOf })
+      // A stop that found no share to end is not a success: the share the
+      // owner meant is still live, and the message says where it runs.
+      api.ui.toast(
+        stopped
+          ? { variant: "success", title: "remote-control", message: text, duration: 4000 }
+          : { variant: "warning", title: "remote-control", message: text, duration: 10000 },
+      )
     } catch (err) {
       api.ui.toast({ variant: "error", title: "stop failed", message: String(err?.message ?? err), duration: 8000 })
     }
@@ -57,7 +74,7 @@ export async function tui(api) {
 
   const showStatus = async () => {
     try {
-      const out = await runAction("status", currentSessionID())
+      const out = await runAction("status", currentSessionID(), { parentOf })
       api.ui.dialog.replace(() =>
         api.ui.DialogAlert({
           title: "Remote control status",

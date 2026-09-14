@@ -143,6 +143,12 @@ It prints the session URL and `CODE: XXXXXX`. Share both with your viewer — th
 the link, enter the code, and land in the OpenCode web UI proxied to your session.
 
 Stop sharing with `/remote-control/stop`; check with `/remote-control/status`.
+Both act on the session they are typed in, or on the shared session a subagent
+session belongs to, so a share running on this machine for another session is
+never ended by mistake. Typed anywhere else (a new session, a new desktop tab,
+or `opencode run`, which starts a new session every time) they end nothing and
+name the sessions shared from this machine instead; type the command in that
+session, or from a terminal run `opencode run --session <id> /remote-control/stop`.
 
 The bridge also stops on its own when OpenCode quits (watchdog) or on SIGINT/SIGTERM;
 every stop path deletes the relay session, revokes the code, terminates the bridge
