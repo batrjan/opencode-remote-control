@@ -69,13 +69,22 @@ await hooks['command.execute.before'](
   output,
 )
 // The message itself is unchanged: the output is still its only visible part.
-if (output.parts.filter((p) => !p.synthetic).length !== 1) throw new Error('message parts changed')
+// A status of its own: a throw would exit 1, the status of a declined start.
+if (output.parts.filter((p) => !p.synthetic).length !== 1) {
+  process.stderr.write('message parts changed\\n')
+  process.exit(70)
+}
 `
 
 /** times/tail build a large output inside the child: an environment variable cannot carry it. */
 type Outcome = { text?: string; error?: string; times?: number; tail?: string }
 
-function runOpencode(args: string[], outcome: Outcome, extraEnv: Record<string, string> = {}) {
+/**
+ * Run the fake `opencode` and expect it to exit with `status`. `opencode run`
+ * (1.18.30) exits with the process.exitCode the hook leaves, as a script's `&&`
+ * sees it.
+ */
+function runOpencode(args: string[], outcome: Outcome, extraEnv: Record<string, string> = {}, status = 0) {
   // A throwaway HOME and no inherited OPENCODE_* variables: the test must not
   // depend on (or touch) the opencode this suite happens to run under.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rc-run-output-'))
@@ -86,7 +95,7 @@ function runOpencode(args: string[], outcome: Outcome, extraEnv: Record<string, 
       timeout: 20_000,
     })
     expect(child.error, 'fake opencode ran').toBeUndefined()
-    expect(child.status, `fake opencode exited cleanly: ${child.stderr}`).toBe(0)
+    expect(child.status, `fake opencode ${args.join(' ')} exit status: ${child.stderr}`).toBe(status)
     return { stdout: child.stdout, stderr: child.stderr }
   } finally {
     fs.rmSync(home, { recursive: true, force: true })
@@ -139,11 +148,16 @@ test("README's `opencode run` lines show the command's result on the terminal, n
   const lines = readmeRunLines()
   expect(lines.length, 'README shows how to run the commands from a terminal').toBeGreaterThan(0)
   for (const words of lines) {
-    // A stop that finds nothing must not look like one that ended the share.
-    const { stdout, stderr } = runOpencode(words, {
-      text: 'session {session} is not shared from this machine — nothing to {action}.\nShared from this machine: ses_other.',
-    })
     const action = words[words.indexOf('--command') + 1].split('/')[1]
+    // A stop that finds nothing must not look like one that ended the share. A
+    // plain `opencode run` start is declined, and exits 1 (see the decline test).
+    const declined = action === 'start' && !words.includes('--attach')
+    const { stdout, stderr } = runOpencode(
+      words,
+      { text: 'session {session} is not shared from this machine — nothing to {action}.\nShared from this machine: ses_other.' },
+      {},
+      declined ? 1 : 0,
+    )
     if (action === 'start') {
       // A plain `opencode run` never starts a share; the line shows why and how.
       expect(stderr, words.join(' ')).toContain('does nothing in `opencode run`')
@@ -221,8 +235,13 @@ test('a failed action reaches the terminal too, also with --format json', () => 
  * access code, which the owner then sent to a viewer who found a dead link.
  * The start is declined up front instead, with the ways that do keep a share
  * running and show its URL and code, and no bridge is spawned at all.
+ *
+ * The decline exits 1. It used to exit 0 with the model's "OK" on stdout, the
+ * same as a start that worked, so `opencode run --command remote-control/start
+ * 2>share.txt && send share.txt` sent a viewer the decline text instead of a
+ * link and code.
  */
-test('a start from opencode run is declined with a way that shows the URL and code, and starts nothing', () => {
+test('a start from opencode run is declined with a way that shows the URL and code, starts nothing, and exits 1', () => {
   const calls = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'rc-run-calls-')), 'calls')
   for (const format of [[], ['--format', 'json']]) {
     fs.rmSync(calls, { force: true })
@@ -230,6 +249,7 @@ test('a start from opencode run is declined with a way that shows the URL and co
       ['run', ...format, '--session', 'ses_x', '--command', 'remote-control/start'],
       { text: 'https://relay.example/s/{session}\nCODE: TEST00' },
       { RC_CALLS: calls },
+      1,
     )
     expect(fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : '', 'the runner was never asked to start').toBe('')
     expect(stderr).not.toContain('CODE: TEST00')

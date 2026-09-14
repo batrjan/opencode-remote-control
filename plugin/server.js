@@ -350,6 +350,14 @@ export function createHooks(
       if (action === "start" && runPrintsReplyOnly()) {
         // Not started at all: the share would outlive this command by seconds.
         text = RUN_START_DECLINED
+        // And not a success either. `opencode run` (1.18.30) exits with the
+        // process.exitCode left here: it used to exit 0 with the model's "OK",
+        // like a start that worked, so `… 2>share.txt && send share.txt` sent a
+        // viewer this text instead of a link and code. Only this process exits:
+        // with --attach the command runs in the server, where this branch never
+        // fires. (Throwing instead also exits 1, but prints only "Unexpected
+        // server error" and loses the text.)
+        process.exitCode = 1
       } else {
         try {
           text = await run(action, input?.sessionID, { parentOf })

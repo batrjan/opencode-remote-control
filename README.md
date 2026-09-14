@@ -171,7 +171,8 @@ The watchdog follows the OpenCode process the share was started from (the plugin
 passes its pid as `--owner-pid`), not just the server the bridge talks to. A plain
 `opencode run` exits right after its command, so a share it started would be gone
 within seconds; `opencode run --command remote-control/start` therefore starts
-nothing and says so, instead of printing a code that stops working at once. Start a
+nothing, says so on stderr and exits with status 1 (so a script's `&&` stops
+there), instead of printing a code that stops working at once. Start a
 share from a long-running client (the TUI, the desktop app, `opencode web`); from a
 terminal, keep `opencode serve` running, open it with `opencode attach <server-url>`
 (add `--session <id>` for an existing session) and type `/remote-control/start`
