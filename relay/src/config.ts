@@ -243,6 +243,25 @@ export function sseMaxBufferBytes(): number {
 }
 
 /**
+ * How much of ONE oversized SSE frame the stuck-viewer cap discounts while it
+ * is still waiting in the backlog (see the SSE fan-out in the proxy adapter).
+ *
+ * The cap exempts a single large frame so a pasted image or big diff reaches a
+ * viewer that keeps reading. Left unbounded, that exemption is only as small
+ * as one ws frame — and the relay's bridge socket sets no maxPayload, so ws
+ * lets through up to its 100 MiB default. A viewer that took one such frame
+ * and then read nothing kept the whole thing buffered: only heartbeats were
+ * counted against the cap and they never reach it. Bounding the exemption
+ * means a frame larger than this trips the ordinary per-write check on the
+ * next frame, so a non-reading viewer can hold at most about this much beyond
+ * the cap. Generous enough for a phone photo pasted as a data URL (a few MiB,
+ * ~1.33x base64) or a large diff, so a reading viewer still gets those whole.
+ */
+export function sseMaxExemptBytes(): number {
+  return envInt('RELAY_SSE_MAX_EXEMPT_BYTES', 32 * 1024 * 1024)
+}
+
+/**
  * Most sessions the relay holds at once, whoever registered them.
  *
  * Registration is public and the other caps are per client address, so on

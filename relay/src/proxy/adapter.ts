@@ -4,7 +4,7 @@ import type { Request, Response } from 'express'
 import type { Store, Session } from '../store.js'
 import type { BridgeClient } from '../ws/bridge.js'
 import { setViewerCookie } from '../api/viewerCookie.js'
-import { bridgeReconnectWaitMs, config, promptTimeoutMs, sseHeartbeatMs, sseMaxBufferBytes, sseRetryMs } from '../config.js'
+import { bridgeReconnectWaitMs, config, promptTimeoutMs, sseHeartbeatMs, sseMaxBufferBytes, sseMaxExemptBytes, sseRetryMs } from '../config.js'
 
 /**
  * HTTP → WS → opencode proxy adapter, mounted at the server ROOT.
@@ -939,6 +939,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // a viewer still behind on two frames that each exceed the cap is dropped
     // at the next write.
     const maxBuffer = sseMaxBufferBytes()
+    const maxExempt = sseMaxExemptBytes()
     // Counted in the response's own writableLength units (string length plus
     // chunked framing), measured around each write, so `queued` minus the
     // current backlog is what has left the process since this point, and the
@@ -947,8 +948,14 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     let queued = res.writableLength
     let exemptEnd = 0
     let exemptLength = 0
+    // The unsent part of the last large frame — but never more than maxExempt.
+    // A single ws frame is bounded only by the bridge socket's maxPayload (ws
+    // default 100 MiB), so exempting all of it let a non-reading viewer hold
+    // that whole frame indefinitely. Capping the exemption means a frame bigger
+    // than maxExempt still leaves the excess counted, so the check below trips
+    // on the next frame instead of pinning the whole thing against the cap.
     const unsentOfExempt = () =>
-      Math.min(exemptLength, Math.max(0, exemptEnd - (queued - res.writableLength)))
+      Math.min(maxExempt, exemptLength, Math.max(0, exemptEnd - (queued - res.writableLength)))
     const send = (frame: string) => {
       const exempt = unsentOfExempt()
       if (res.writableLength - exempt > maxBuffer) {
@@ -966,12 +973,35 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
         exemptLength = added
       }
     }
+    // How much has left the process as of the previous heartbeat. The watchdog
+    // in the heartbeat compares against it; the exemption above does NOT enter
+    // this, so a frame parked inside the exemption is still caught.
+    let lastFlushed = queued - res.writableLength
     const heartbeat = setInterval(() => {
       if (res.writableEnded || res.destroyed) return
       if (!viewerToken || !store.verifyViewer(session.id, viewerToken)) {
         endStream()
         return
       }
+      // No-progress watchdog, immune to the one-frame exemption. The per-write
+      // check discounts one large frame so a reader still gets a big event; but
+      // a viewer that took a single oversized frame and then read nothing has
+      // that frame exempt forever, and only the ~150-byte heartbeats are ever
+      // counted, so the cap is never reached and the frame sits in the backlog
+      // for the life of the TCP connection. Here res.writableLength is the
+      // WHOLE backlog, exempt frame included: a stream over the cap that has
+      // not drained a byte since the previous beat is stuck regardless of the
+      // exemption, so drop it (destroy frees the backlog and its slot at once;
+      // the viewer reconnects). A viewer still taking the frame flushes
+      // something between beats and is spared.
+      const flushed = queued - res.writableLength
+      if (res.writableLength > maxBuffer && flushed <= lastFlushed) {
+        clearInterval(heartbeat)
+        unsubscribe()
+        res.destroy()
+        return
+      }
+      lastFlushed = flushed
       send(`data: ${envelope(JSON.stringify(heartbeatEvent()))}\n\n`)
     }, sseHeartbeatMs())
     heartbeat.unref?.()
