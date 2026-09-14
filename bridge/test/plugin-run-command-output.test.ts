@@ -40,6 +40,9 @@ const OPENCODE_ENTRY = '/$bunfs/root/opencode'
  */
 const FAKE_OPENCODE = `
 import { createHooks } from ${JSON.stringify(SERVER_ENTRY)}
+// opencode run uses process.stderr for its own lines before any command runs,
+// and touching it leaves a piped fd 2 non-blocking (Bun and Node alike).
+void process.stderr.fd
 const argv = process.argv.slice(2)
 const value = (...flags) => {
   const i = argv.findIndex((a) => flags.includes(a))
@@ -48,7 +51,8 @@ const value = (...flags) => {
 const outcome = JSON.parse(process.env.RC_OUTCOME)
 const hooks = createHooks(async (action, sessionID) => {
   if (outcome.error) throw new Error(outcome.error)
-  return outcome.text.replaceAll('{action}', action).replaceAll('{session}', String(sessionID))
+  const text = outcome.text.repeat(outcome.times ?? 1) + (outcome.tail ?? '')
+  return text.replaceAll('{action}', action).replaceAll('{session}', String(sessionID))
 })
 const output = { parts: [] }
 await hooks['command.execute.before'](
@@ -59,7 +63,8 @@ await hooks['command.execute.before'](
 if (output.parts.filter((p) => !p.synthetic).length !== 1) throw new Error('message parts changed')
 `
 
-type Outcome = { text?: string; error?: string }
+/** times/tail build a large output inside the child: an environment variable cannot carry it. */
+type Outcome = { text?: string; error?: string; times?: number; tail?: string }
 
 function runOpencode(args: string[], outcome: Outcome, extraEnv: Record<string, string> = {}) {
   // A throwaway HOME and no inherited OPENCODE_* variables: the test must not
@@ -182,6 +187,45 @@ test('a closed stderr pipe does not turn a finished command into a failure', asy
     child.stdout!.resume()
     const code = await new Promise<number | null>((resolve) => child.on('close', (c) => resolve(c)))
     expect(code).toBe(0)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+}, 30_000)
+
+/**
+ * Output larger than the pipe buffer arrives whole.
+ *
+ * A piped stderr is non-blocking inside opencode run, so a single writeSync
+ * stores at most what fits in the pipe (64 KiB on Linux) and returns — the rest
+ * was silently lost — or throws EAGAIN when the pipe is full, which dropped the
+ * whole message. The write has to continue until everything is out.
+ */
+test('output larger than the pipe buffer reaches the terminal whole', () => {
+  const line = 'status line\n'
+  const { stderr } = runOpencode(['run', '--command', 'remote-control/status'], { text: line, times: 20_000, tail: 'END-OF-OUTPUT' })
+  expect(stderr.length).toBeGreaterThanOrEqual(line.length * 20_000)
+  expect(stderr).toContain('END-OF-OUTPUT')
+})
+
+test('a stderr nobody reads delays a large output by at most the write deadline', async () => {
+  // The write keeps going while the pipe is full, but a reader that never comes
+  // must not hang the command.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rc-run-unread-'))
+  try {
+    const started = Date.now()
+    const child = spawn(
+      process.execPath,
+      ['--input-type=module', '-e', FAKE_OPENCODE, OPENCODE_ENTRY, 'run', '--command', 'remote-control/status'],
+      {
+        env: { PATH: process.env.PATH ?? '', HOME: home, RC_OUTCOME: JSON.stringify({ text: 'status line\n', times: 20_000 }) },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      },
+    )
+    child.stderr!.pause() // attached, never read
+    const code = await new Promise<number | null>((resolve) => child.on('exit', (c) => resolve(c)))
+    expect(code).toBe(0)
+    expect(Date.now() - started).toBeLessThan(10_000)
+    child.stderr!.destroy()
   } finally {
     fs.rmSync(home, { recursive: true, force: true })
   }

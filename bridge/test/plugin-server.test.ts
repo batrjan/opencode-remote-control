@@ -153,6 +153,20 @@ test('runsTui recognises the terminal UI worker whatever OPENCODE_CLIENT it inhe
   expect(runsTui([], { OPENCODE_CLIENT: 'desktop' }, undefined)).toBe(false)
 })
 
+/**
+ * `opencode --mini` draws its interface from the main thread and loads no
+ * tui.json plugin (opencode 1.18.30), so the server entry's config commands
+ * are the only /remote-control commands it can have. It used to look like a
+ * TUI launch — no subcommand, no client — and the server entry stepped aside
+ * for a TUI entry that mini never loads: "/remote-control" found nothing.
+ */
+test('runsTui leaves --mini to the server entry, but not a TUI worker', () => {
+  expect(runsTui(['--mini'], {}, '/$bunfs/root/src/index.js')).toBe(false)
+  expect(runsTui(['--mini', '/path/to/project'], {})).toBe(false)
+  expect(runsTui(['--mini=true'], {})).toBe(false)
+  expect(runsTui(['--mini'], {}, '/$bunfs/root/src/cli/tui/worker.js')).toBe(true)
+})
+
 test('runsTui rejects clients that never render a TUI', () => {
   for (const argv of [['serve'], ['run', 'hello'], ['web'], ['acp'], ['attach', 'url']]) {
     expect(runsTui(argv, {})).toBe(false)

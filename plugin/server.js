@@ -81,6 +81,9 @@ export function runsTui(argv = process.argv.slice(2), env = process.env, entry =
   if (typeof entry === "string" && TUI_WORKER_RE.test(entry)) return true
   const client = env.OPENCODE_CLIENT
   if (client && client !== "cli") return false
+  // `--mini` draws its interface from the main thread and loads no tui.json
+  // plugin, so the config commands are the only ones it gets.
+  if (argv.some((arg) => arg === "--mini" || arg.startsWith("--mini="))) return false
   return !argv.some((arg) => NON_TUI_SUBCOMMANDS.has(arg))
 }
 
@@ -113,16 +116,37 @@ export function runPrintsReplyOnly(argv = process.argv.slice(2)) {
  */
 export function showInRunTerminal(text) {
   if (!runPrintsReplyOnly()) return
-  try {
-    // Synchronously, on the descriptor: process.stderr.write reports a closed
-    // pipe (EPIPE) as an asynchronous 'error' event that no try/catch sees, and
-    // it turned `opencode run` into exit 1 after the command had already done
-    // its work — a script whose `&& echo stopped` then read a stopped share as
-    // a failed stop.
-    writeSync(2, `${text}\n`)
-  } catch {
-    // Best effort: a closed stderr must not cost the session its message.
+  // Synchronously, on the descriptor: process.stderr.write reports a closed
+  // pipe (EPIPE) as an asynchronous 'error' event that no try/catch sees, and
+  // it turned `opencode run` into exit 1 after the command had already done its
+  // work — a script whose `&& echo stopped` then read a stopped share as a
+  // failed stop.
+  writeAllSync(2, Buffer.from(`${text}\n`))
+}
+
+/**
+ * Write all of `buf` to `fd`, best effort, never for longer than `deadlineMs`.
+ *
+ * A piped stderr is non-blocking inside `opencode run`: one writeSync stores at
+ * most what fits in the pipe and returns, or throws EAGAIN when the pipe is
+ * full. So keep writing, and wait briefly for the reader while the pipe is
+ * full — but only up to the deadline, so a stderr nobody reads cannot hang the
+ * command. Any other error (a closed pipe, a closed descriptor) ends the write
+ * quietly: the session keeps its message either way. Returns the bytes written.
+ */
+export function writeAllSync(fd, buf, deadlineMs = 2000) {
+  const deadline = Date.now() + deadlineMs
+  let off = 0
+  while (off < buf.length) {
+    try {
+      off += writeSync(fd, buf, off)
+      continue
+    } catch (err) {
+      if (err?.code !== "EAGAIN" || Date.now() >= deadline) return off
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
   }
+  return off
 }
 
 /** Config files the TUI plugin loader reads, most specific last. */
