@@ -147,6 +147,41 @@ The deploy workflow also copies `relay/docker-compose.yml` to
 `/opt/opencode-remote-control/` on every run, so the host compose file can
 no longer drift from the repository.
 
+## Session cap (`RELAY_MAX_SESSIONS`)
+
+The relay holds at most `RELAY_MAX_SESSIONS` shares at once, 2,000 by default,
+whoever registered them. Registration is public and the other caps are per
+address, so without a total a pool of addresses could grow the session set —
+all of it in memory, up to ~5 KB per share plus its viewers, and rewritten to
+the state file on every change — without end.
+
+A registration that finds the relay full first drops the registrations no
+bridge connected to within 5 minutes, then takes the slot of the share whose
+bridge has been gone longest, once that bridge has been gone for more than
+5 minutes (a laptop closed, a network that dropped). A share whose bridge is
+connected is never ended. The bridge of an ended share is refused with 401 when
+it comes back and stops; its owner runs `/remote-control/start` again and gets
+the same link with a new code. Only when neither frees a slot is the
+registration answered `503 {"error":"relay full"}`. The relay logs both:
+
+```bash
+docker compose logs relay | grep RELAY_MAX_SESSIONS
+```
+
+```
+[store] relay full: ended share session="ses_…" (no live bridge for 47 min) to make room (RELAY_MAX_SESSIONS)
+[sessions] registration refused: relay holds 2000 sessions (RELAY_MAX_SESSIONS)
+```
+
+Such lines on a relay that is merely busy mean the cap is too low for it: set
+`RELAY_MAX_SESSIONS` in `.env` (compose passes the whole file to the
+container) and recreate the container. With `RELAY_STATE_KEY` unchanged the
+live shares survive the restart (see [Session state](#session-state-volume)).
+
+```bash
+docker compose up -d --force-recreate relay
+```
+
 ## Session state (volume)
 
 The relay keeps its sessions in memory, so a plain restart would end every live
