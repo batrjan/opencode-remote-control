@@ -122,6 +122,7 @@ test('an id the owner stopped sharing cannot be taken by anyone else, and the ow
   const K = ownerKey()
   const first = await register('ses_squat1', OWNER_IP, K)
   expect(first.status).toBe(201)
+  await connect('ses_squat1', first.body.bridge_token!)
   expect(await remove('ses_squat1', first.body.bridge_token!)).toBe(204)
 
   // The share link is public: whoever holds it knows the id.
@@ -141,6 +142,7 @@ test('a share the reaper removed (its bridge died, nobody stopped it) stays rese
   const K = ownerKey()
   const first = await register('ses_squat2', OWNER_IP, K)
   expect(first.status).toBe(201)
+  await connect('ses_squat2', first.body.bridge_token!)
   const now = Date.now()
   vi.spyOn(Date, 'now').mockReturnValue(now + config.orphanReapMs + 60_000)
   expect(store.reapOrphans(config.orphanReapMs)).toEqual(['ses_squat2'])
@@ -185,10 +187,13 @@ test('the claim survives a relay restart, both from a snapshot and from a plaint
   const K = ownerKey()
   const first = await register('ses_persist1', OWNER_IP, K)
   expect(first.status).toBe(201)
+  await connect('ses_persist1', first.body.bridge_token!)
   expect(await remove('ses_persist1', first.body.bridge_token!)).toBe(204)
   // A live keyed share whose relay was down for longer than the idle limit is
   // dropped on restore — but it stays its owner's.
-  expect((await register('ses_persist2', OWNER_IP, K)).status).toBe(201)
+  const second = await register('ses_persist2', OWNER_IP, K)
+  expect(second.status).toBe(201)
+  await connect('ses_persist2', second.body.bridge_token!)
   store.getSession('ses_persist2')!.last_seen = Date.now() - config.orphanReapMs - 60_000
   const snapshot = store.snapshot()
 
@@ -232,8 +237,109 @@ test('an id registered without a key behaves as before, and a claim expires', as
 
   const K = ownerKey()
   const keyed = await register('ses_expire1', OWNER_IP, K)
+  await connect('ses_expire1', keyed.body.bridge_token!)
   expect(await remove('ses_expire1', keyed.body.bridge_token!)).toBe(204)
+  expect((await register('ses_expire1', ATTACKER_IP)).status).toBe(409)
   const now = Date.now()
   vi.spyOn(Date, 'now').mockReturnValue(now + config.ownerClaimTtlMs + 60_000)
   expect((await register('ses_expire1', ATTACKER_IP)).status).toBe(201)
+})
+
+/** Date.now, moved forward by whatever the test adds to the returned offset. */
+function clock(): { advance(ms: number): void } {
+  const real = Date.now.bind(Date)
+  let offset = 0
+  vi.spyOn(Date, 'now').mockImplementation(() => real() + offset)
+  return { advance: (ms) => void (offset += ms) }
+}
+
+/**
+ * The reservation was recorded for every keyed registration that left the
+ * store, including one no bridge ever connected to. So one POST, with a key of
+ * the caller's own and nothing else, turned an id nobody reserved (every id an
+ * older, keyless bridge shares) into a 30-day reservation for that caller once
+ * the unbound reaper removed it, renewable by POSTing again: the owner's next
+ * start got 409 for a month. A squatter used to have to hold a bridge socket.
+ */
+test('a registration no bridge ever took up reserves its id for nobody', async () => {
+  const t = clock()
+  // The owner shares with an older bridge (no key) and stops.
+  const legacy = await register('ses_bare1', OWNER_IP)
+  await connect('ses_bare1', legacy.body.bridge_token!)
+  expect(await remove('ses_bare1', legacy.body.bridge_token!)).toBe(204)
+
+  // Someone holding the old link registers the freed id with a key of their
+  // own and never connects. The reaper removes it minutes later.
+  expect((await register('ses_bare1', ATTACKER_IP, ownerKey())).status).toBe(201)
+  t.advance(config.unboundReapMs + 60_000)
+  expect(store.reapOrphans(config.orphanReapMs)).toEqual(['ses_bare1'])
+  expect((await register('ses_bare1', OWNER_IP)).status).toBe(201)
+
+  // Nor by deleting it with the token it got back.
+  const squat = await register('ses_bare2', ATTACKER_IP, ownerKey())
+  expect(squat.status).toBe(201)
+  expect(await remove('ses_bare2', squat.body.bridge_token!)).toBe(204)
+  expect((await register('ses_bare2', OWNER_IP, ownerKey())).status).toBe(201)
+
+  // Nor by a restart that drops it as idle (the relay was down for a day).
+  expect((await register('ses_bare3', ATTACKER_IP, ownerKey())).status).toBe(201)
+  store.getSession('ses_bare3')!.last_seen = Date.now() - config.orphanReapMs - 60_000
+  const snapshot = store.snapshot()
+  await close()
+  const restored = new Store()
+  restored.restore(snapshot)
+  await listen(restored)
+  expect((await register('ses_bare3', OWNER_IP)).status).toBe(201)
+})
+
+test("an owner's registration no bridge took up keeps the reservation its last share earned", async () => {
+  const t = clock()
+  const K = ownerKey()
+  const share = async (id: string) => {
+    const r = await register(id, OWNER_IP, K)
+    expect(r.status).toBe(201)
+    await connect(id, r.body.bridge_token!)
+    return r.body.bridge_token!
+  }
+  const refusedToOthers = async (id: string) => {
+    expect((await register(id, ATTACKER_IP)).status).toBe(409)
+    expect((await register(id, ATTACKER_IP, ownerKey())).status).toBe(409)
+  }
+
+  // A real share, stopped; the owner starts again, but that bridge never dials
+  // in (a crash between the POST and the connection) and the reaper removes it.
+  expect(await remove('ses_keep1', await share('ses_keep1'))).toBe(204)
+  expect((await register('ses_keep1', OWNER_IP, K)).status).toBe(201)
+  t.advance(config.unboundReapMs + 60_000)
+  expect(store.reapOrphans(config.orphanReapMs)).toEqual(['ses_keep1'])
+  await refusedToOthers('ses_keep1')
+
+  // Or its dial failed and it deleted the registration itself.
+  expect(await remove('ses_keep2', await share('ses_keep2'))).toBe(204)
+  const retry = await register('ses_keep2', OWNER_IP, K)
+  expect(await remove('ses_keep2', retry.body.bridge_token!)).toBe(204)
+  await refusedToOthers('ses_keep2')
+
+  // A live share whose bridge died, replaced by a registration that never binds.
+  await share('ses_keep3')
+  expect((await register('ses_keep3', OWNER_IP, K)).status).toBe(201)
+  t.advance(config.unboundReapMs + 60_000)
+  expect(store.reapOrphans(config.orphanReapMs)).toEqual(['ses_keep3'])
+  await refusedToOthers('ses_keep3')
+
+  // And across a restart while such a registration was waiting.
+  expect(await remove('ses_keep4', await share('ses_keep4'))).toBe(204)
+  expect((await register('ses_keep4', OWNER_IP, K)).status).toBe(201)
+  const snapshot = store.snapshot()
+  await close()
+  const restored = new Store()
+  restored.restore(snapshot)
+  await listen(restored)
+  t.advance(config.unboundReapMs + 60_000)
+  expect(store.reapOrphans(config.orphanReapMs)).toEqual(['ses_keep4'])
+  await refusedToOthers('ses_keep4')
+
+  for (const id of ['ses_keep1', 'ses_keep2', 'ses_keep3', 'ses_keep4']) {
+    expect((await register(id, OWNER_IP, K)).status).toBe(201)
+  }
 })

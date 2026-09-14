@@ -169,6 +169,8 @@ function fullRelayWithDepartedShare() {
     store.deleteSession(`ses_hour${i}`)
   }
   register(store, 'ses_claimed', '198.51.100.30', 'k'.repeat(43))
+  // A share its bridge took up: a registration none did reserves nothing.
+  store.touchSession('ses_claimed')
   store.deleteSession('ses_claimed')
   register(store, 'ses_gone', '203.0.113.1')
   // What the bridge hub calls when the bridge connects.

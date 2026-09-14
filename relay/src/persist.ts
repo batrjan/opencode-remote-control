@@ -89,7 +89,9 @@ export interface PersistedSession {
  * The owner_key hash of a share that ended: its session id stays reserved for
  * that key until `at` + config.ownerClaimTtlMs. Persisted because a restart
  * that forgot them would hand every ended share's id to whoever registers it
- * first, which is what the reservation exists to prevent.
+ * first, which is what the reservation exists to prevent. Its id may also be
+ * held by a live registration with the same key (see Store.recordClaim); an
+ * older relay skips such a claim on restore, as it always did.
  */
 export interface PersistedClaim {
   id: string

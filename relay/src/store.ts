@@ -99,9 +99,11 @@ export class Store {
    */
   private unindexedViewers = 0
   /**
-   * session id -> owner_key hash of the share that last held it, for ids no
-   * live session holds. Insertion order is `at` order (recordClaim re-inserts),
-   * so expired claims are always at the front. Bounded like the tracking maps.
+   * session id -> owner_key hash of the share that last held it. Read only for
+   * ids no live session holds, but kept while a registration with the same key
+   * holds one, for when that ends without a bridge (see recordClaim). Insertion
+   * order is `at` order (recordClaim re-inserts), so expired claims are always
+   * at the front. Bounded like the tracking maps.
    */
   private claims: Map<string, OwnerClaim> = new Map()
   /** Called after anything that changes the session set, or activity on it (see setChangeListener). */
@@ -264,10 +266,15 @@ export class Store {
       // over into the new one.
       this.dropViewers(existing)
       this.sessionActivations.delete(session_id)
+      // The old share ends here, so it earns its reservation now: the new
+      // registration may never be taken up, and that one earns none.
+      this.recordClaim(existing, now)
     } else {
       const claim = this.liveClaim(session_id, now)
       if (claim && !ownerKeyMatches(claim.hash, claim.salt, owner_key)) throw new Error('session exists')
-      this.claims.delete(session_id)
+      // Kept, not consumed: it holds the same key as this registration, and it
+      // is what still reserves the id if no bridge takes this one up (see
+      // recordClaim). Nothing reads a claim while a live session holds its id.
     }
     // A fresh code starts with a clean failure lock. Misses counted under this
     // id were guesses at a code that ends here (the replaced share's) or at no
@@ -327,12 +334,24 @@ export class Store {
   /**
    * Keep an ending session's id reserved for the key it was registered with.
    * Called wherever a session leaves the store — a delete by its bridge, the
-   * reaper; restore() does the same for one it drops as idle — because each
-   * of those frees the id, and a freed id is exactly what a squatter holding
-   * the old link waits for. A session registered without a key reserves
-   * nothing.
+   * reaper, its owner's replacement; restore() does the same for one it drops
+   * as idle — because each of those frees the id, and a freed id is exactly
+   * what a squatter holding the old link waits for. A session registered
+   * without a key reserves nothing.
+   *
+   * Nor does a registration no bridge ever took up (Session.unbound_since): it
+   * leaves whatever claim the id already had, from its last share with a
+   * bridge, as it was. It used to reserve the id like a share, so one POST with
+   * a key of the caller's own, for an id nobody had reserved (every id a
+   * keyless bridge shares), became a 30-day claim once the unbound reaper
+   * removed it, renewable by POSTing again, and the owner's next start got 409
+   * for all of it. Holding such an id takes a bridge connection again.
    */
-  private recordClaim(session: { id: string; owner_hash?: string; owner_salt?: string }, at: number): void {
+  private recordClaim(
+    session: { id: string; owner_hash?: string; owner_salt?: string; unbound_since?: number },
+    at: number,
+  ): void {
+    if (session.unbound_since !== undefined) return
     if (session.owner_hash === undefined || session.owner_salt === undefined) return
     this.pruneClaims(Date.now())
     // Re-insert, so Map order stays `at` order for pruneClaims.
@@ -862,6 +881,7 @@ export class Store {
     if (!state || state.version !== STATE_VERSION || !Array.isArray(state.sessions)) return 0
     const now = Date.now()
     let restored = 0
+    const heldBefore = new Set(this.sessions.keys())
     // Collected first and inserted in `at` order, the order pruneClaims relies on.
     const claims: { id: string; hash: string; salt: string; at: number }[] = []
     for (const c of Array.isArray(state.claims) ? state.claims : []) {
@@ -874,8 +894,10 @@ export class Store {
       if (this.sessions.has(s.id)) continue
       if (typeof s.last_seen !== 'number' || now - s.last_seen > maxIdleMs) {
         // Dropped as idle, which ends the share like the reaper would have:
-        // its id stays reserved for its owner all the same.
+        // its id stays reserved for its owner all the same — if a bridge ever
+        // took it up (see recordClaim).
         if (
+          s.unbound !== true &&
           typeof s.last_seen === 'number' &&
           now - s.last_seen <= config.ownerClaimTtlMs &&
           typeof s.owner_hash === 'string' &&
@@ -949,10 +971,13 @@ export class Store {
       restored += 1
     }
     if (restored > 0) this.restoredAt = now
-    // A live session carries its own owner hash; a claim this process already
-    // holds is at least as recent as the file.
+    // A session this process already held was registered against its own
+    // claims, not the file's; a claim it already holds is at least as recent
+    // as the file. A claim on an id restored from the file stays: it is that
+    // registration's key, and all that reserves the id if no bridge takes the
+    // registration up (see recordClaim). Files from before that have none.
     for (const c of claims.sort((a, b) => a.at - b.at)) {
-      if (this.sessions.has(c.id) || this.claims.has(c.id)) continue
+      if (heldBefore.has(c.id) || this.claims.has(c.id)) continue
       this.setBounded(this.claims, c.id, { hash: c.hash, salt: c.salt, at: c.at })
     }
     return restored
