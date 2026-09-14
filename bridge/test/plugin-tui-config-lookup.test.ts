@@ -239,6 +239,42 @@ test('a tui.json that fails the terminal UI schema does not count', () => {
   expect(registered({ plugin: [SPEC], tui: 'compact' })).toBe(true)
 })
 
+test('a key binding under a name the terminal UI does not know is not checked', () => {
+  // TuiConfig of opencode 1.18.30 removes from "keybinds" every name that is not
+  // one of its key bindings, whatever the value, and only then checks the
+  // schema. The plugin checked every value: on the real binary `{ "plugin":
+  // [<TUI entry>], "keybinds": { "no_such_binding": null } }` (an old or renamed
+  // binding switched off) loaded the TUI entry, while the plugin took the file
+  // for skipped. The server entry registered its commands beside the TUI entry,
+  // and `/remote-control` ran a model turn answering "OK" instead of opening
+  // the picker.
+  const { home, project, write } = tree()
+  const file = path.join(home, '.config', 'opencode', 'tui.json')
+  const registered = (keybinds: object) => {
+    write(file, JSON.stringify({ plugin: [SPEC], keybinds }))
+    return tuiEntryRegistered(project, { HOME: home })
+  }
+
+  for (const value of [null, true, 5, { ctrl: true }, 'ctrl+x', false, []]) {
+    expect(registered({ no_such_binding: value }), JSON.stringify(value)).toBe(true)
+  }
+  // A command id is not a binding name either ("input.redo" is bound as input_redo).
+  expect(registered({ 'input.redo': null, session_old_name: true, another_gone: 5 })).toBe(true)
+  expect(registered({ no_such_binding: null, leader: 'ctrl+x' })).toBe(true)
+
+  // A name it knows is still checked, a dotted one included, and fails the file.
+  for (const keybinds of [
+    { leader: null },
+    { 'dialog.select.prev': 5 },
+    { which_key_end: true },
+    { no_such_binding: 'ctrl+x', session_quick_switch_9: { ctrl: true } },
+  ]) {
+    expect(registered(keybinds), JSON.stringify(keybinds)).toBe(false)
+  }
+  // Names of Object.prototype are no binding names.
+  expect(registered(JSON.parse('{ "constructor": null, "__proto__": 5, "toString": true }'))).toBe(true)
+})
+
 test('a plugin list under "tui" counts, as opencode lifts it to the top level', () => {
   // On the real binary `{ "tui": { "plugin": [<TUI entry>] } }` loads the TUI
   // entry, while the plugin saw no top-level list: the server entry registered

@@ -347,13 +347,68 @@ const keyBinding = struct({
   ...each(["preventDefault", "fallthrough"], isBoolean),
 })
 const binding = (v) => isString(v) || keyStroke(v) || keyBinding(v)
+/**
+ * The key binding names of opencode 1.18.30 (TuiKeybind Definitions), dotted ones
+ * included. TuiConfig removes every other name from "keybinds", whatever its
+ * value, before the schema check, so only these values can make it skip a file.
+ * Read from the binary, where the list is the keys of one object.
+ */
+const TUI_BINDING_NAMES = new Set([
+  "leader", "app_exit", "app_debug", "app_console", "app_heap_snapshot", "app_toggle_animations",
+  "app_toggle_file_context", "app_toggle_diffwrap", "app_toggle_paste_summary",
+  "app_toggle_session_directory_filter", "command_list", "help_show", "docs_open", "diff_open", "diff_close",
+  "diff_toggle", "diff_expand", "diff_expand_all", "diff_collapse", "diff_switch_focus", "diff_next_hunk",
+  "diff_previous_hunk", "diff_next_file", "diff_previous_file", "diff_toggle_file_tree", "diff_single_patch",
+  "diff_switch_source", "diff_toggle_view", "diff_help", "editor_open", "theme_list", "theme_switch_mode",
+  "theme_mode_lock", "sidebar_toggle", "scrollbar_toggle", "status_view", "debug_view", "session_export",
+  "session_copy", "session_move", "session_new", "session_list", "session_timeline", "session_fork",
+  "session_rename", "session_delete", "session_share", "session_unshare", "session_interrupt",
+  "session_background", "session_compact", "session_toggle_timestamps", "session_toggle_generic_tool_output",
+  "session_queued_prompts", "session_child_first", "session_child_cycle", "session_child_cycle_reverse",
+  "session_parent", "session_pin_toggle", "session_quick_switch_1", "session_quick_switch_2",
+  "session_quick_switch_3", "session_quick_switch_4", "session_quick_switch_5", "session_quick_switch_6",
+  "session_quick_switch_7", "session_quick_switch_8", "session_quick_switch_9", "stash_delete",
+  "model_provider_list", "model_favorite_toggle", "model_list", "model_cycle_recent",
+  "model_cycle_recent_reverse", "model_cycle_favorite", "model_cycle_favorite_reverse", "mcp_list",
+  "provider_connect", "console_org_switch", "agent_list", "agent_cycle", "agent_cycle_reverse", "variant_cycle",
+  "variant_list", "messages_page_up", "messages_page_down", "messages_line_up", "messages_line_down",
+  "messages_half_page_up", "messages_half_page_down", "messages_first", "messages_last", "messages_next",
+  "messages_previous", "messages_last_user", "messages_copy", "messages_undo", "messages_redo",
+  "messages_toggle_conceal", "tool_details", "display_thinking", "prompt_submit", "prompt_editor_context_clear",
+  "prompt_skills", "prompt_stash", "prompt_stash_pop", "prompt_stash_list", "workspace_set", "input_clear",
+  "input_paste", "input_submit", "input_newline", "input_move_left", "input_move_right", "input_move_up",
+  "input_move_down", "input_select_left", "input_select_right", "input_select_up", "input_select_down",
+  "input_line_home", "input_line_end", "input_select_line_home", "input_select_line_end",
+  "input_visual_line_home", "input_visual_line_end", "input_select_visual_line_home",
+  "input_select_visual_line_end", "input_buffer_home", "input_buffer_end", "input_select_buffer_home",
+  "input_select_buffer_end", "input_delete_line", "input_delete_to_line_end", "input_delete_to_line_start",
+  "input_backspace", "input_delete", "input_undo", "input_redo", "input_word_forward", "input_word_backward",
+  "input_select_word_forward", "input_select_word_backward", "input_delete_word_forward",
+  "input_delete_word_backward", "input_select_all", "history_previous", "history_next", "dialog.select.prev",
+  "dialog.select.next", "dialog.select.page_up", "dialog.select.page_down", "dialog.select.home",
+  "dialog.select.end", "dialog.select.submit", "dialog.prompt.submit", "dialog.mcp.toggle",
+  "dialog.move_session.new", "dialog.move_session.delete", "dialog.move_session.refresh",
+  "prompt.autocomplete.prev", "prompt.autocomplete.next", "prompt.autocomplete.hide",
+  "prompt.autocomplete.select", "prompt.autocomplete.complete", "permission.prompt.fullscreen",
+  "plugins.toggle", "dialog.plugins.install", "terminal_suspend", "terminal_title_toggle", "tips_toggle",
+  "plugin_manager", "plugin_install", "which_key_toggle", "which_key_layout_toggle", "which_key_pending_toggle",
+  "which_key_group_previous", "which_key_group_next", "which_key_scroll_up", "which_key_scroll_down",
+  "which_key_page_up", "which_key_page_down", "which_key_home", "which_key_end",
+])
 const validTuiInfo = struct({
   ...each(["$schema", "theme"], isString),
-  // opencode first drops the names it has no action for, and only its own list
-  // of names tells those apart, so every value is checked here. A wrong value
-  // under an unknown name then leaves the commands to the server entry (a model
-  // turn), rather than a wrong one under a known name leaving none at all.
-  keybinds: optional(recordOf((v) => v === false || binding(v) || arrayOf(binding)(v))),
+  // Only a name opencode knows has its value checked: it drops the others first.
+  // Checking every value took `"no_such_binding": null` (an old or renamed binding
+  // switched off) for a skipped file. The server entry then registered its
+  // commands beside the TUI entry opencode did load, and `/remote-control` ran a
+  // model turn instead of opening the picker.
+  keybinds: optional(
+    (v) =>
+      isObject(v) &&
+      Object.entries(v).every(
+        ([name, value]) => !TUI_BINDING_NAMES.has(name) || value === false || binding(value) || arrayOf(binding)(value),
+      ),
+  ),
   // An entry with options is exactly [spec, options object].
   plugin: optional(
     arrayOf((v) => isString(v) || (Array.isArray(v) && v.length === 2 && isString(v[0]) && isObject(v[1]))),
