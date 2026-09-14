@@ -74,6 +74,18 @@ beforeAll(async () => {
     if (req.method === 'GET' && url.pathname === '/project/current') {
       return json(res, 200, { id: 'global', worktree: url.searchParams.get('directory'), vcs: 'git' })
     }
+    // The review panel's diff: echo what the relay forwarded, so a test can
+    // see which directory it ran in and that `workspace` never reached us.
+    if (req.method === 'GET' && url.pathname === '/vcs/diff') {
+      return json(res, 200, [
+        {
+          file: 'hello.txt',
+          mode: url.searchParams.get('mode'),
+          directory: url.searchParams.get('directory'),
+          workspace: url.searchParams.get('workspace'),
+        },
+      ])
+    }
     if (req.method === 'GET' && url.pathname === '/session/sess1/todo') {
       return json(res, 200, [{ id: 'todo1' }])
     }
@@ -504,4 +516,41 @@ test('a session inside a registered project still gets that project, not the fal
   const res = await request(relay).get('/project').set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
   expect(res.body).toEqual([{ id: 'p1', worktree: '/path' }])
+})
+
+/**
+ * The review panel ("Changes") loads its git and branch modes from
+ * GET /vcs/diff, and git is the mode it opens in. Neither the relay nor the
+ * bridge routed it, so the request met the catch-all 404; the UI swallows that
+ * failure into an empty list and showed "No file changes yet" while the agent
+ * was editing files in the shared repo. The diff is read in the session's
+ * directory like every other proxied read, and nothing else under /vcs opens.
+ */
+test('the review panel reads the git diff of the shared directory', async () => {
+  for (const [path, mode] of [
+    ['/vcs/diff?mode=git&directory=%2Fetc&workspace=evil', 'git'],
+    ['/vcs/diff?mode=branch&directory=%2Fetc&workspace=evil', 'branch'],
+    ['/api/vcs/diff?mode=git', 'git'],
+  ] as const) {
+    lastPath = ''
+    const res = await request(relay).get(path).set('x-viewer-token', viewerToken)
+    expect(res.status).toBe(200)
+    expect(lastPath).toBe('/vcs/diff')
+    // The session's directory, never the one the caller named, and no workspace.
+    expect(res.body).toEqual([{ file: 'hello.txt', mode, directory: '/path', workspace: null }])
+  }
+
+  expect((await request(relay).get('/vcs/diff?mode=git')).status).toBe(401)
+
+  // Only the read: the raw patch download and the patch apply stay unrouted.
+  for (const [method, path] of [
+    ['post', '/vcs/diff?mode=git'],
+    ['get', '/vcs/diff/raw?mode=git'],
+    ['post', '/vcs/apply'],
+  ] as const) {
+    lastPath = ''
+    const res = await request(relay)[method](path).set('x-viewer-token', viewerToken)
+    expect(res.status).toBe(404)
+    expect(lastPath).toBe('')
+  }
 })

@@ -61,6 +61,11 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   ['GET', '/project/current'],
   ['GET', '/path'],
   ['GET', '/vcs'],
+  // The review panel's git and branch modes (it opens in git mode). Unrouted,
+  // the 404 was swallowed by the UI into an empty "No file changes yet" panel.
+  // Read-only, and pinned to the session's directory like /file/status. The
+  // raw patch (/vcs/diff/raw) and /vcs/apply, which writes, stay unrouted.
+  ['GET', '/vcs/diff'],
   ['GET', '/mcp'],
   ['GET', '/lsp'],
   ['GET', '/formatter'],

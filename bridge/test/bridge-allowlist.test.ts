@@ -47,6 +47,9 @@ const ACCEPTED: Array<[string, string]> = [
   ['GET', '/project/current?directory=%2Fp'],
   ['GET', '/path?directory=%2Fp'],
   ['GET', '/vcs?directory=%2Fp'],
+  // The review panel's git / branch diff (the panel opens in git mode).
+  ['GET', '/vcs/diff?directory=%2Fp&mode=git'],
+  ['GET', '/api/vcs/diff?directory=%2Fp&mode=branch'],
   ['GET', '/mcp?directory=%2Fp'],
   ['GET', '/lsp?directory=%2Fp'],
   ['GET', '/formatter?directory=%2Fp'],
@@ -134,6 +137,9 @@ const REJECTED: Array<[string, string]> = [
   ['POST', '/question/que_1/answer'], // only reply and reject exist
   ['POST', '/question/que%2F..%2Fx/reply'], // encoded slash in the requestID segment
   ['POST', '/question//reply'], // empty requestID segment
+  ['POST', '/vcs/apply?directory=%2Fp'], // writes a patch into the owner's working tree
+  ['GET', '/vcs/diff/raw?directory=%2Fp'], // only the panel's diff read is routed
+  ['POST', '/vcs/diff?directory=%2Fp'], // right path, wrong verb
 ]
 
 test.each(REJECTED)('rejects %s %s', (method, path) => {

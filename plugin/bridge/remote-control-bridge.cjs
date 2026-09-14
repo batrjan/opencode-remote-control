@@ -7523,6 +7523,9 @@ var RELAY_PROXY_ROUTES = [
   ["GET", "/project/current"],
   ["GET", "/path"],
   ["GET", "/vcs"],
+  // The review panel's git / branch diff, a read. Not '/vcs/diff/raw', and
+  // never '/vcs/apply': that one writes a patch into the working tree.
+  ["GET", "/vcs/diff"],
   ["GET", "/mcp"],
   ["GET", "/lsp"],
   ["GET", "/formatter"],
