@@ -219,9 +219,10 @@ const PROXY_BODY_LIMIT = '25mb'
 const MAX_STREAMS_PER_SESSION = 64
 
 /**
- * Cap on the ancestry cache (see ancestryOk). Sessions are never removed from
- * it when their share is deleted, so without a bound it grows for the life of
- * the process. The event filter reads its subagents from the same cache.
+ * Cap on the ancestry cache (see ancestryOk). Entries are never removed when
+ * their share ends: they only become unreachable (the cache is keyed per
+ * registration), so without a bound it grows for the life of the process. The
+ * event filter reads its subagents from the same cache.
  */
 const ANCESTRY_CACHE_MAX = 10_000
 
@@ -608,13 +609,46 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   })
 
   // A session's parent never changes once created, so a positive ancestry
-  // result is cached forever safely (keyed bound->descendant). Negatives are
-  // NOT cached: a subagent may spawn after the first miss, and re-checking is
-  // cheap. This is what makes a freshly-spawned child and a nested grandchild
-  // read correctly instead of showing the parent transcript under their title.
-  // Keyed per share, so what one bridge reports about its sessions can never
-  // widen what another share's viewers are shown.
+  // result is cached for as long as the share lasts (keyed registration ->
+  // descendant). Negatives are NOT cached: a subagent may spawn after the
+  // first miss, and re-checking is cheap. This is what makes a freshly-spawned
+  // child and a nested grandchild read correctly instead of showing the parent
+  // transcript under their title.
+  //
+  // Keyed per REGISTRATION (see registrationOf), never per session id. The
+  // cache holds what one bridge claimed, and a claim is only as good as that
+  // bridge: an id is not a secret, and one registered without an owner_key (or
+  // whose reservation lapsed) goes to whoever registers it first. Keyed on the
+  // id, a stranger could register a free id X, have its own bridge call the
+  // owner's session Y a child of X (by the parent walk, or a session.created
+  // on its event stream), and end the share; once the owner shared X, the
+  // relay still took Y for X's subagent and sent the owner's viewers Y's
+  // transcript, detail, live events, pending prompts and status straight from
+  // the owner's own bridge. A new registration starts with nothing proven, so
+  // what one bridge reports can never widen what another share's viewers see
+  // — not another id's, and not a later share of the same id.
   const ancestryOk = new Set<string>()
+
+  /**
+   * A number unique to one registration of a session id, for the ancestry
+   * cache keys. The store builds a new Session record for every registration
+   * (createSession, including an owner's replacement of its own) and drops it
+   * when the share ends (deleteSession, reapOrphans), so the record's identity
+   * is the registration. Keyed weakly: a number is never reused, and an ended
+   * registration's record is not kept alive by it. A record rebuilt for the
+   * same registration (a restore) would only get a fresh number, which costs
+   * a re-walk and never grants anything.
+   */
+  const registrations = new WeakMap<Session, number>()
+  let nextRegistration = 0
+  function registrationOf(session: Session): number {
+    let n = registrations.get(session)
+    if (n === undefined) {
+      n = nextRegistration++
+      registrations.set(session, n)
+    }
+    return n
+  }
 
   /**
    * Remember a verified ancestry, evicting the oldest entry when full (a Set
@@ -641,12 +675,14 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
    * The subagents of one share known so far, for the live event filter. It
    * cannot ask upstream (it must decide each event in order, at once), so it
    * learns a subagent from the child's own session.created / session.updated on
-   * the share's event stream, and from every chain a request has walked.
+   * the share's event stream, and from every chain a request has walked. Only
+   * this registration's: see ancestryOk.
    */
-  function subagentsOf(bound: string): SubagentIndex {
+  function subagentsOf(session: Session): SubagentIndex {
+    const registration = registrationOf(session)
     return {
-      has: (id) => ancestryOk.has(`${bound}\u0000${id}`),
-      add: (id) => rememberAncestry(`${bound}\u0000${id}`),
+      has: (id) => ancestryOk.has(`${registration}\u0000${id}`),
+      add: (id) => rememberAncestry(`${registration}\u0000${id}`),
     }
   }
 
@@ -663,7 +699,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // session id (encoded slashes, query smuggling, traversal) is refused
     // instead of being interpolated raw.
     if (requested === session.id || !SESSION_ID_RE.test(requested)) return false
-    const subagents = subagentsOf(session.id)
+    const subagents = subagentsOf(session)
     if (subagents.has(requested)) return true
     const chain: string[] = []
     let current = requested
@@ -861,7 +897,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // stream within one heartbeat. It also slides last_used, which is correct:
     // a viewer holding an open stream is present, not idle.
     const viewerToken = extractViewerToken(req)
-    const subagents = subagentsOf(session.id)
+    const subagents = subagentsOf(session)
     let unsubscribe: () => void = () => {}
     // Stop feeding the stream BEFORE ending it. The subscription used to be
     // dropped only on the request's 'close', which follows the response's
@@ -1301,7 +1337,10 @@ export interface SubagentIndex {
  * session.created has put it in the session tree. So a session.created or
  * session.updated whose info names the shared session, or a known subagent, as
  * its parent adds that session to `subagents` — and passes. The events come
- * from the share's own bridge, the same source every ancestry walk asks.
+ * from the share's own bridge, the same source every ancestry walk asks, and
+ * what they teach is kept for that registration only (the adapter's index is
+ * keyed per registration, so a bridge that ended cannot vouch for a session
+ * to whoever shares its id next).
  */
 export function eventBelongsToSession(data: string, sessionId: string, subagents?: SubagentIndex): boolean {
   let ev: unknown
