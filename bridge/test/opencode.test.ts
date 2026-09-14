@@ -1,7 +1,7 @@
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { OpencodeClient } from '../src/opencode'
-import { afterAll, beforeAll, expect, test } from 'vitest'
+import { afterAll, beforeAll, expect, test, vi } from 'vitest'
 
 /**
  * Mock OpenCode HTTP API. The brief's snippet targeted the live server on
@@ -67,4 +67,39 @@ test('request passes on the pagination cursor of a message page', async () => {
   const last = await client.request('GET', '/session/sess1/message?limit=200')
   expect(last.status).toBe(200)
   expect(last.nextCursor).toBeUndefined()
+})
+
+/**
+ * The question routes are not long-polls, so they get the normal 30 s guard.
+ *
+ * Every path under /question used to be armed for 130 s, as if opencode held
+ * it open until an event arrived. It does not: the pending list (which the
+ * relay reads at every viewer bootstrap, and the question guard before every
+ * reply) is answered at once, and a reply or reject only settles a question
+ * that is already waiting. A local opencode that stopped answering therefore
+ * kept each such request open for over two minutes, long after the relay had
+ * given the viewer its timeout.
+ */
+test('request gives the question list, reply and reject the normal timeout', async () => {
+  const client = new OpencodeClient(url, 'opencode', 'password')
+  const spy = vi.spyOn(globalThis, 'setTimeout')
+  try {
+    const armed: Record<string, unknown[]> = {}
+    for (const [method, path] of [
+      ['GET', '/question?directory=%2Fpath'],
+      ['POST', '/question/que_1/reply?directory=%2Fpath'],
+      ['POST', '/question/que_1/reject?directory=%2Fpath'],
+    ] as const) {
+      spy.mockClear()
+      await client.request(method, path, method === 'POST' ? {} : undefined)
+      armed[`${method} ${path}`] = spy.mock.calls.map((call) => call[1]).filter((ms) => typeof ms === 'number' && ms >= 30_000)
+    }
+    expect(armed).toEqual({
+      'GET /question?directory=%2Fpath': [30_000],
+      'POST /question/que_1/reply?directory=%2Fpath': [30_000],
+      'POST /question/que_1/reject?directory=%2Fpath': [30_000],
+    })
+  } finally {
+    spy.mockRestore()
+  }
 })

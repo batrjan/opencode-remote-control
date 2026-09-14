@@ -7360,7 +7360,7 @@ var OpencodeClient = class {
    * the absolute project directory, so it stays here.
    */
   async request(method, path3, body) {
-    const isLongPoll = path3.startsWith("/permission/request") || path3.startsWith("/question");
+    const isLongPoll = path3.startsWith("/permission/request");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), isLongPoll ? 13e4 : 3e4);
     try {

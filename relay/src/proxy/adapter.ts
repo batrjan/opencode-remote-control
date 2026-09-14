@@ -158,8 +158,14 @@ const MAX_ANCESTRY_DEPTH = 8
 const SESSION_ID_RE = /^ses_[A-Za-z0-9_]+$/
 
 /** Paths that are long-polls upstream (opencode holds them open until an
- * event arrives). They get a longer proxy timeout than normal requests. */
-const LONG_POLL_PREFIXES = ['/permission/request', '/question']
+ * event arrives). They get a longer proxy timeout than normal requests.
+ * '/question' is not one and must not be listed: opencode answers the pending
+ * list at once, and a reply or reject settles a question that is already
+ * waiting. As a prefix it gave the question dock's answer and dismiss two
+ * minutes, so on a slow uplink a viewer's click spun for 120 s before its
+ * error, where the same click on a permission prompt gave up after the proxy
+ * timeout. */
+const LONG_POLL_PREFIXES = ['/permission/request']
 const LONG_POLL_TIMEOUT_MS = 120_000
 
 /** The prompt route whose lost answers are checked with opencode — see proxyPrompt. */
