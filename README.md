@@ -197,6 +197,18 @@ In the terminal UI the TUI entry (`plugin/remote-control.js`) provides
 `/remote-control` (a picker) plus `/remote-control/start`, `/remote-control/stop`
 and `/remote-control/status`, running the bridge directly — no LLM prompt, instant.
 
+`opencode attach <url>` is a terminal UI too, but its server is a separate
+process, and one that has the server entry (an `opencode serve` with it in
+`opencode.json`, say) lists the same four commands. The `/` menu would show each
+of them twice, so the TUI entry leaves the slash names that server has to it.
+Typed there, a command runs in the server, as it does in the web UI: its output is
+the command's message, the model answers `OK` under it, `/remote-control` without
+an action reports status instead of opening the picker, and a share it starts
+follows that server's process rather than the terminal. The picker and the
+direct, LLM-free actions stay in the command palette (ctrl+p, "Remote control");
+those run in the terminal's own process, so a share started from there ends when
+that terminal exits.
+
 In the desktop GUI, the web UI and `opencode run` the same four commands come from
 the server entry (`plugin/server.js`): it registers them through the `config` hook
 and runs the action itself in `command.execute.before`, so the share is started by
