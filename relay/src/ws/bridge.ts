@@ -71,15 +71,34 @@ function nextCursorOf(value: unknown): string | undefined {
   return typeof value === 'string' && NEXT_CURSOR_RE.test(value) ? value : undefined
 }
 
+/** How a caller of BridgeClient.request deals with a request whose socket goes. */
+export interface RequestOptions {
+  /**
+   * The caller finds out for itself whether a request that failed with its
+   * socket still had its effect (the proxy adapter looks a prompt up by the
+   * message id it names), so the request is failed as soon as that socket
+   * closes, also one the bridge has already replaced. A GET needs no flag:
+   * request() repeats it.
+   */
+  checksLostAnswer?: boolean
+}
+
 interface PendingRequest {
   session_id: string
   /**
-   * The socket the request was sent on: when that socket goes, so does any
-   * chance of an answer to what it had not yet delivered. Only failure is
+   * The socket the request waits on: the one it was sent on, or the socket
+   * that replaced that one (see movePending). When that socket goes, so does
+   * any chance of an answer to what it had not yet delivered. Only failure is
    * bound to it — a bridge answers on whichever socket is current, so a
    * response is still matched by request_id and session alone.
    */
   ws: WebSocket
+  /**
+   * Fail it when `ws` closes even though the bridge replaced that socket,
+   * because its caller recovers it (a GET is repeated, a prompt looked up).
+   * Anything else moves to the new socket instead — see the 'close' handler.
+   */
+  failWithSocket: boolean
   resolve: (value: ProxyResponse) => void
   reject: (err: Error) => void
   timer: NodeJS.Timeout
@@ -140,9 +159,10 @@ export class BridgeClient {
       // still here, dead, because the bridge noticed before the relay did.
       // Either way the bridge read opencode's events into the void meanwhile.
       const redial = replaced !== undefined || this.droppedAt.has(session_id)
-      // Its 'close' fails what was still waiting on it (see below) once this
-      // socket is current, so a GET caught in it is repeated on this one at
-      // once and a lost prompt is looked for here.
+      // Its 'close' (see below) runs once this socket is current: it fails what
+      // was still waiting on it and is recovered, so a GET caught in it is
+      // repeated on this one at once and a lost prompt is looked for here, and
+      // moves everything else to this socket, which the bridge answers on.
       replaced?.terminate()
       this.clients.set(session_id, ws)
       this.droppedAt.delete(session_id)
@@ -206,11 +226,23 @@ export class BridgeClient {
         // sat out its whole two-minute timeout before the relay even looked
         // for it (see the proxy adapter's promptLanded). Requests sent on the
         // new socket are that socket's own and stay.
+        //
+        // Only what is recovered, though, when the bridge replaced this socket
+        // (see failWithSocket). The bridge answers on its current socket, so a
+        // shell command or slash command opencode was still running when the
+        // bridge re-dialled is answered on the new one. Failed here, that
+        // answer found nothing waiting: the viewer got a 502 for a command that
+        // ran, and the web UI puts a failed command back in the input to be
+        // sent, and run, again. Moved to the new socket, such a request gets
+        // its answer, its own timeout, or that socket's close.
+        const successor = current ? undefined : this.clients.get(session_id)
+        const moved = successor ? this.movePending(session_id, ws, successor) : 0
         const failed = this.failPending(session_id, 'bridge closed', ws)
         this.logLifecycle(
           `disconnected session=${JSON.stringify(session_id)} code=${code} ` +
             `after ${Math.round((Date.now() - connectedAt) / 1000)}s` +
             (failed ? `, failed ${failed} in-flight request(s)` : '') +
+            (moved ? `, moved ${moved} in-flight request(s) to the new socket` : '') +
             (current ? '' : ' (already detached)'),
         )
       })
@@ -302,6 +334,21 @@ export class BridgeClient {
   }
 
   /**
+   * Bind the requests on `from` that its closing should not fail (see
+   * failWithSocket) to `to`, the socket that replaced it; returns how many.
+   * Their timers keep running.
+   */
+  private movePending(session_id: string, from: WebSocket, to: WebSocket): number {
+    let moved = 0
+    for (const pending of this.pending.values()) {
+      if (pending.session_id !== session_id || pending.ws !== from || pending.failWithSocket) continue
+      pending.ws = to
+      moved += 1
+    }
+    return moved
+  }
+
+  /**
    * Bridge connects, disconnects and keep-alive kills.
    *
    * These lines are how a share that keeps dropping gets diagnosed: when a
@@ -349,11 +396,20 @@ export class BridgeClient {
    * The repeat goes only to the registration the request was made for (the
    * store's Session record at the call, which the caller checked the viewer
    * against): see sameRegistration.
+   *
+   * A request of any other kind caught by a socket the bridge replaced waits
+   * for its answer on the new socket, unless `options` says the caller checks
+   * what became of it.
    */
-  async request(session_id: string, req: ProxyRequest, timeoutMs: number): Promise<ProxyResponse> {
+  async request(
+    session_id: string,
+    req: ProxyRequest,
+    timeoutMs: number,
+    options: RequestOptions = {},
+  ): Promise<ProxyResponse> {
     const registration = this.store.getSession(session_id)
     try {
-      return await this.requestOnce(session_id, req, timeoutMs)
+      return await this.requestOnce(session_id, req, timeoutMs, options)
     } catch (err) {
       const reason = err instanceof Error ? err.message : ''
       const linkDropped = reason === 'bridge not connected' || reason === 'bridge closed' || reason === 'bridge unreachable'
@@ -364,7 +420,7 @@ export class BridgeClient {
       if (req.method !== 'GET' || !linkDropped || !reconnecting) throw err
       if (!(await this.waitForConnection(session_id, bridgeReconnectWaitMs()))) throw err
       if (!this.sameRegistration(session_id, registration)) throw new Error('session closed')
-      return this.requestOnce(session_id, req, timeoutMs)
+      return this.requestOnce(session_id, req, timeoutMs, options)
     }
   }
 
@@ -443,7 +499,12 @@ export class BridgeClient {
     })
   }
 
-  private requestOnce(session_id: string, req: ProxyRequest, timeoutMs: number): Promise<ProxyResponse> {
+  private requestOnce(
+    session_id: string,
+    req: ProxyRequest,
+    timeoutMs: number,
+    options: RequestOptions,
+  ): Promise<ProxyResponse> {
     const ws = this.clients.get(session_id)
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('bridge not connected'))
@@ -462,7 +523,8 @@ export class BridgeClient {
         )
         reject(new Error('proxy timeout'))
       }, timeoutMs)
-      this.pending.set(request_id, { session_id, ws, resolve, reject, timer })
+      const failWithSocket = req.method === 'GET' || options.checksLostAnswer === true
+      this.pending.set(request_id, { session_id, ws, failWithSocket, resolve, reject, timer })
       ws.send(JSON.stringify({ type: 'proxy', request_id, ...req }))
     })
   }

@@ -382,16 +382,21 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
    * original error, as before.
    */
   async function proxyPrompt(res: Response, session: Session, path: string, query: string, body: unknown): Promise<void> {
+    const named = (body as { messageID?: unknown } | null | undefined)?.messageID
+    const messageID = typeof named === 'string' && MESSAGE_ID_RE.test(named) ? named : undefined
     try {
-      const out = await bridge.request(session.id, { method: 'POST', path: path + query, body }, promptTimeoutMs())
+      // Only a prompt that can be looked up is failed with a socket the bridge
+      // replaced; any other waits for the answer the bridge sends on its new one.
+      const out = await bridge.request(session.id, { method: 'POST', path: path + query, body }, promptTimeoutMs(), {
+        checksLostAnswer: messageID !== undefined,
+      })
       res
         .status(out.status)
         .type(out.contentType ?? 'application/json')
         .send(out.body)
     } catch (err) {
-      const messageID = (body as { messageID?: unknown } | null | undefined)?.messageID
       const lostAnswer = err instanceof Error && LOST_ANSWER_ERRORS.has(err.message)
-      if (lostAnswer && typeof messageID === 'string' && MESSAGE_ID_RE.test(messageID)) {
+      if (lostAnswer && messageID !== undefined) {
         if (await promptLanded(session, messageID, query)) {
           res.status(204).end()
           return

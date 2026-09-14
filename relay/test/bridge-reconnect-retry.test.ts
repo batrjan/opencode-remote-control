@@ -5,6 +5,7 @@ import request from 'supertest'
 import { viewerTokenFrom } from './helpers/viewer-token'
 import { WebSocket } from 'ws'
 import { startServer } from '../src/server'
+import { config } from '../src/config'
 
 /**
  * A request caught by a bridge reconnect.
@@ -117,23 +118,88 @@ test('a GET caught by a socket the bridge replaced is answered on the new socket
   second.ws.terminate()
 }, 15_000)
 
-test('a POST caught by a socket the bridge replaced fails at once and is never sent again', async () => {
+/** Resolves once the relay has dropped a socket it replaced, and a moment more for its 'close' to run. */
+async function replacedClosed(ws: WebSocket) {
+  if (ws.readyState !== WebSocket.CLOSED) await new Promise((resolve) => ws.once('close', resolve))
+  await new Promise((resolve) => setTimeout(resolve, 200))
+}
+
+test('a POST caught by a socket the bridge replaced is answered on the new socket and never sent again', async () => {
+  // A bridge answers on whichever socket is current, so a shell command that
+  // opencode was still running when the bridge re-dialled is answered on the
+  // new socket. Failed when the replaced socket closed, that answer found
+  // nothing waiting: the viewer got a 502 for a command that ran, and the web
+  // UI puts a failed command back in the input to be sent — and run — again.
   const { bridgeToken, viewerToken } = await share('ses_retry_replaced_post')
   const first = await bridgeSocket('ses_retry_replaced_post', bridgeToken)
-  const started = Date.now()
   const view = request(relay)
-    .post('/session/ses_retry_replaced_post/abort')
+    .post('/session/ses_retry_replaced_post/shell')
     .set('x-viewer-token', viewerToken)
-    .send({})
+    .send({ agent: 'build', command: 'make test' })
+    .then((r) => r)
+
+  const caught = await first.next()
+  expect(caught?.method).toBe('POST')
+  const second = await bridgeSocket('ses_retry_replaced_post', bridgeToken)
+  // The relay has dropped the replaced socket; opencode finishes after that.
+  await replacedClosed(first.ws)
+  second.answer(caught!, { id: 'msg_shell' })
+
+  const res = await view
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual({ id: 'msg_shell' })
+  expect(await second.next(800)).toBeUndefined()
+  second.ws.terminate()
+}, 15_000)
+
+test('a POST moved to the new socket fails at once when that socket drops too', async () => {
+  const { bridgeToken, viewerToken } = await share('ses_retry_moved_drop')
+  const first = await bridgeSocket('ses_retry_moved_drop', bridgeToken)
+  const view = request(relay)
+    .post('/session/ses_retry_moved_drop/command')
+    .set('x-viewer-token', viewerToken)
+    .send({ command: 'review', arguments: '' })
     .then((r) => r)
 
   expect((await first.next())?.method).toBe('POST')
-  const second = await bridgeSocket('ses_retry_replaced_post', bridgeToken)
+  const second = await bridgeSocket('ses_retry_moved_drop', bridgeToken)
+  await replacedClosed(first.ws)
+  const droppedAt = Date.now()
+  second.ws.terminate()
+
   const res = await Promise.race([view, new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 5000))])
   expect(res?.status).toBe(502)
-  expect(Date.now() - started).toBeLessThan(5000)
-  expect(await second.next(800)).toBeUndefined()
-  second.ws.terminate()
+  expect(Date.now() - droppedAt).toBeLessThan(5000)
+  // The bridge comes back; the command must not follow it.
+  const third = await bridgeSocket('ses_retry_moved_drop', bridgeToken)
+  expect(await third.next(800)).toBeUndefined()
+  third.ws.terminate()
+}, 15_000)
+
+test('a POST caught by a socket the bridge replaced and never answered ends at its own timeout, never sent again', async () => {
+  const savedTimeout = config.proxyTimeoutMs
+  ;(config as { proxyTimeoutMs: number }).proxyTimeoutMs = 1500
+  try {
+    const { bridgeToken, viewerToken } = await share('ses_retry_moved_silent')
+    const first = await bridgeSocket('ses_retry_moved_silent', bridgeToken)
+    const started = Date.now()
+    const view = request(relay)
+      .post('/session/ses_retry_moved_silent/summarize')
+      .set('x-viewer-token', viewerToken)
+      .send({ providerID: 'p', modelID: 'm' })
+      .then((r) => r)
+
+    expect((await first.next())?.method).toBe('POST')
+    const second = await bridgeSocket('ses_retry_moved_silent', bridgeToken)
+    const res = await view
+    expect(res.status).toBe(504)
+    expect(res.body).toEqual({ error: 'proxy timeout' })
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1400)
+    expect(await second.next(0)).toBeUndefined()
+    second.ws.terminate()
+  } finally {
+    ;(config as { proxyTimeoutMs: number }).proxyTimeoutMs = savedTimeout
+  }
 }, 15_000)
 
 test('a POST caught by a reconnect fails and is never sent again', async () => {

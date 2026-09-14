@@ -170,6 +170,39 @@ test('a prompt caught by a socket the bridge replaced is checked on the new sock
   }
 }, 15_000)
 
+test('a prompt without a messageID caught by a socket the bridge replaced gets its answer from the new socket', async () => {
+  // Nothing can look such a prompt up, so failing it with the replaced socket
+  // only threw away the 204 the bridge sends on its new one — and the web UI
+  // offers a failed prompt to be sent, and run, again.
+  const savedPromptTimeout = process.env.RELAY_PROMPT_TIMEOUT_MS
+  process.env.RELAY_PROMPT_TIMEOUT_MS = '30000'
+  try {
+    const { bridgeToken, viewerToken } = await share('ses_lost_replaced_noid')
+    const first = await bridgeSocket('ses_lost_replaced_noid', bridgeToken)
+    const view = request(relay)
+      .post('/session/ses_lost_replaced_noid/prompt_async')
+      .set('x-viewer-token', viewerToken)
+      .send(prompt())
+      .then((r) => r)
+
+    const sent = await first.next()
+    expect(sent?.method).toBe('POST')
+    const second = await bridgeSocket('ses_lost_replaced_noid', bridgeToken)
+    // The relay drops the replaced socket before opencode's 204 gets back.
+    await new Promise((resolve) => (first.ws.readyState === WebSocket.CLOSED ? resolve(undefined) : first.ws.once('close', resolve)))
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    second.answer(sent!, 204, undefined)
+
+    const res = await Promise.race([view, new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 5000))])
+    expect(res?.status).toBe(204)
+    expect(await second.next(800)).toBeUndefined()
+    second.ws.terminate()
+  } finally {
+    if (savedPromptTimeout === undefined) delete process.env.RELAY_PROMPT_TIMEOUT_MS
+    else process.env.RELAY_PROMPT_TIMEOUT_MS = savedPromptTimeout
+  }
+}, 15_000)
+
 test('the same prompt still fails when opencode has no such message', async () => {
   const { bridgeToken, viewerToken } = await share('ses_lost_none')
   const first = await bridgeSocket('ses_lost_none', bridgeToken)
