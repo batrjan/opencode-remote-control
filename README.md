@@ -162,7 +162,10 @@ session, or from a terminal run
 `opencode run --session <id> --command remote-control/status`). The result —
 the share ended, nothing to stop in that session, or why the stop failed — is
 printed on stderr; the `OK` after it is only the model acknowledging the turn
-and looks the same whatever happened.
+and looks the same whatever happened. The exit status tells them apart: a stop
+exits 0 only when it ended a share, and 1 when there was nothing to stop in that
+session or the stop failed, so a script's `&&` goes on only after a share really
+ended. A status exits 0 whatever it found, and 1 only when it failed.
 
 The bridge also stops on its own when OpenCode quits (watchdog) or on SIGINT/SIGTERM;
 every stop path deletes the relay session, revokes the code, terminates the bridge

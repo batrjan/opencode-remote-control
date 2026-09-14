@@ -518,8 +518,9 @@ export function sharedElsewhereHint(action, dir = path.dirname(logPath())) {
  * `stopped` says whether there was a share to end. A stop typed where nothing
  * is shared exits 0 ("nothing to stop"), and the TUI used to show that as a
  * success toast while the share the owner meant stayed live; it now tells the
- * two apart. Without a session id (TUI home screen) the CLI falls back to the
- * share that started last and fails when there is none, so that is `stopped`.
+ * two apart, and so does the exit status of `opencode run` (server.js). Without
+ * a session id (TUI home screen) the CLI falls back to the share that started
+ * last and fails when there is none, so that is `stopped`.
  */
 export async function stopShare(sessionID, { parentOf } = {}) {
   const shared = sessionID ? await sharedSessionOf(sessionID, parentOf) : undefined

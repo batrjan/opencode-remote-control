@@ -16,7 +16,16 @@ import { readFileSync, writeSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 
-import { clientParentOf, resolveAction, runAction } from "./bridge-runner.js"
+import { clientParentOf, resolveAction, runAction, stopShare } from "./bridge-runner.js"
+
+/**
+ * The server entry's action runner: runAction, except that a stop answers with
+ * stopShare's { stopped, text } instead of the text alone, so the command hook
+ * can tell a stop that ended a share from one that ended nothing (see the exit
+ * status of `opencode run` in command.execute.before).
+ */
+const runActionWithOutcome = (action, sessionID, options) =>
+  action === "stop" ? stopShare(sessionID, options) : runAction(action, sessionID, options)
 
 const COMMANDS = {
   "remote-control": "Share this session on the web (start | stop | status)",
@@ -410,14 +419,16 @@ export const id = "remote-control"
 
 /**
  * Hooks factory. `run` is the action runner — injected in tests so they never
- * spawn the real bridge or touch the relay. `parentOf` resolves a session's
- * parent (see sharedSessionOf), so stop and status typed in a subagent session
- * reach the share it belongs to; without it they act on the typed session only.
+ * spawn the real bridge or touch the relay. It answers with the text to show,
+ * or with { stopped, text } for a stop (see stopShare). `parentOf` resolves a
+ * session's parent (see sharedSessionOf), so stop and status typed in a
+ * subagent session reach the share it belongs to; without it they act on the
+ * typed session only.
  * `show` gets the output as well, for a client that never displays the message
  * (see showInRunTerminal).
  */
 export function createHooks(
-  run = runAction,
+  run = runActionWithOutcome,
   registerCommands = defaultRegisterCommands,
   parentOf = undefined,
   show = showInRunTerminal,
@@ -461,11 +472,25 @@ export function createHooks(
         // server error" and loses the text.)
         process.exitCode = 1
       } else {
+        // No success either: a stop that ended no share (nothing shared in that
+        // session or its parents, e.g. a wrong `--session <id>`), and an action
+        // that failed.
+        let failed = false
         try {
-          text = await run(action, input?.sessionID, { parentOf })
+          const result = await run(action, input?.sessionID, { parentOf })
+          text = result !== null && typeof result === "object" ? result.text : result
+          failed = result?.stopped === false
         } catch (err) {
           text = `remote-control ${action} failed: ${String(err?.message ?? err)}`
+          failed = true
         }
+        // `opencode run` exited 0 for both, like a stop that ended the share, so
+        // `… --command remote-control/stop && notify "share ended"` went on while
+        // the share, its access code and the viewer stayed live. Set the same way
+        // as for the declined start above, and only in `opencode run`: a server,
+        // a terminal UI, mini or ACP keep running after the command, and with
+        // --attach the command runs in the server.
+        if (failed && runPrintsReplyOnly()) process.exitCode = 1
       }
       // Mutate in place: opencode keeps a reference to this array, so a
       // reassignment would be dropped. Clearing first drops the blank command
@@ -509,7 +534,7 @@ export function defaultRegisterCommands() {
 // opencode passes the plugin input (with the SDK `client` of this server); an
 // older host or a test that passes nothing still gets working hooks.
 export async function server(input) {
-  return createHooks(runAction, defaultRegisterCommands, clientParentOf(input?.client))
+  return createHooks(runActionWithOutcome, defaultRegisterCommands, clientParentOf(input?.client))
 }
 
 export default { id, server }

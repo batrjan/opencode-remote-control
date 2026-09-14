@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, test } from 'vitest'
+import { spawn } from 'node:child_process'
 import { createServer, type Server } from 'node:http'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -360,6 +361,45 @@ test('stop and status in a new session name the one share that is running and ho
   rmSync(stateFile('ses_A'))
   expect(await serverPluginCommand('remote-control/stop', 'ses_new')).toContain('No session is shared from this machine.')
 }, 30_000)
+
+/**
+ * `opencode run --session <id> --command remote-control/stop` from a script,
+ * through the server entry as opencode loads it and the real runner, with argv
+ * laid out like the binary's. Spawned asynchronously: the stub relay answers
+ * from this process.
+ */
+async function runStop(sessionID: string): Promise<{ code: number | null; stderr: string }> {
+  const script = `
+import { server } from ${JSON.stringify(new URL('../../plugin/server.js', import.meta.url).href)}
+const hooks = await server({})
+await hooks['command.execute.before']({ command: 'remote-control/stop', sessionID: process.argv[4], arguments: '' }, { parts: [] })
+`
+  const child = spawn(
+    process.execPath,
+    ['--input-type=module', '-e', script, '/$bunfs/root/opencode', 'run', '--session', sessionID, '--command', 'remote-control/stop'],
+    { env: { PATH: process.env.PATH ?? '', HOME: home, OPENCODE_REMOTE_CONTROL_RELAY: relayUrl }, stdio: ['ignore', 'ignore', 'pipe'] },
+  )
+  let stderr = ''
+  child.stderr!.on('data', (chunk) => (stderr += chunk))
+  const code = await new Promise<number | null>((resolve) => child.on('close', (c) => resolve(c)))
+  return { code, stderr }
+}
+
+test('a stop from opencode run exits 0 when it ended the share and 1 when it ended nothing', async () => {
+  // A script's `… --command remote-control/stop && notify "share ended"` went on
+  // after a stop in a session with no share: exit 0, while A and B stayed live.
+  const nothing = await runStop('ses_C')
+  expect(nothing.stderr).toContain('ses_C is not shared from this machine')
+  expect(nothing.code).toBe(1)
+  expect(seen.filter((r) => r.startsWith('DELETE'))).toEqual([])
+  expect(existsSync(stateFile('ses_A'))).toBe(true)
+
+  const ended = await runStop('ses_A')
+  expect(ended.stderr).toContain('Remote control stopped.')
+  expect(ended.code).toBe(0)
+  expect(seen).toContain('DELETE /api/sessions/ses_A')
+  expect(existsSync(stateFile('ses_A'))).toBe(false)
+}, 60_000)
 
 test('a parent lookup that fails, loops or stalls ends the walk instead of hanging or throwing', async () => {
   const looping = {

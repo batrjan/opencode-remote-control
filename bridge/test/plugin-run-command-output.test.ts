@@ -36,7 +36,8 @@ const OPENCODE_ENTRY = '/$bunfs/root/opencode'
 /**
  * A minimal `opencode` process: reads --command/--session the way Cli.run
  * does, fires the server entry's command hook once, and exits. The action
- * answers with RC_OUTCOME.text, or throws RC_OUTCOME.error.
+ * answers with RC_OUTCOME.text, or throws RC_OUTCOME.error. A stop whose
+ * RC_OUTCOME.stopped is set answers the way stopShare does, { stopped, text }.
  */
 const FAKE_OPENCODE = `
 import { createHooks } from ${JSON.stringify(SERVER_ENTRY)}
@@ -60,8 +61,10 @@ const hooks = createHooks(async (action, sessionID) => {
   // that ran from one the plugin declined without running.
   if (process.env.RC_CALLS) (await import('node:fs')).appendFileSync(process.env.RC_CALLS, action + '\\n')
   if (outcome.error) throw new Error(outcome.error)
-  const text = outcome.text.repeat(outcome.times ?? 1) + (outcome.tail ?? '')
-  return text.replaceAll('{action}', action).replaceAll('{session}', String(sessionID))
+  const text = (outcome.text.repeat(outcome.times ?? 1) + (outcome.tail ?? ''))
+    .replaceAll('{action}', action)
+    .replaceAll('{session}', String(sessionID))
+  return action === 'stop' && outcome.stopped !== undefined ? { stopped: outcome.stopped, text } : text
 }, undefined, undefined, attached ? () => {} : undefined)
 const output = { parts: [] }
 await hooks['command.execute.before'](
@@ -77,7 +80,7 @@ if (output.parts.filter((p) => !p.synthetic).length !== 1) {
 `
 
 /** times/tail build a large output inside the child: an environment variable cannot carry it. */
-type Outcome = { text?: string; error?: string; times?: number; tail?: string }
+type Outcome = { text?: string; error?: string; times?: number; tail?: string; stopped?: boolean }
 
 /**
  * Run the fake `opencode` and expect it to exit with `status`. `opencode run`
@@ -149,14 +152,19 @@ test("README's `opencode run` lines show the command's result on the terminal, n
   expect(lines.length, 'README shows how to run the commands from a terminal').toBeGreaterThan(0)
   for (const words of lines) {
     const action = words[words.indexOf('--command') + 1].split('/')[1]
-    // A stop that finds nothing must not look like one that ended the share. A
+    // A stop that finds nothing must not look like one that ended the share, on
+    // the terminal or in the exit status (see the stop exit status test). A
     // plain `opencode run` start is declined, and exits 1 (see the decline test).
     const declined = action === 'start' && !words.includes('--attach')
+    const endedNothing = action === 'stop' && !words.includes('--attach')
     const { stdout, stderr } = runOpencode(
       words,
-      { text: 'session {session} is not shared from this machine — nothing to {action}.\nShared from this machine: ses_other.' },
+      {
+        text: 'session {session} is not shared from this machine — nothing to {action}.\nShared from this machine: ses_other.',
+        stopped: false,
+      },
       {},
-      declined ? 1 : 0,
+      declined || endedNothing ? 1 : 0,
     )
     if (action === 'start') {
       // A plain `opencode run` never starts a share; the line shows why and how.
@@ -218,10 +226,53 @@ test('a failed action reaches the terminal too, also with --format json', () => 
     const { stdout, stderr } = runOpencode(
       ['run', ...format, '--session', 'ses_x', '--command', 'remote-control/stop'],
       { error: 'relay unreachable' },
+      {},
+      1,
     )
     expect(stderr).toContain('remote-control stop failed: relay unreachable')
     // Never on stdout: `--format json` consumers parse every line of it.
     expect(stdout).toBe('')
+  }
+})
+
+/**
+ * The exit status of a stop from `opencode run`.
+ *
+ * README sends a terminal owner to `opencode run --session <id> --command
+ * remote-control/stop`, and a script goes on with `&& notify "share ended"`. It
+ * exited 0 whatever the stop did: after ending the share, after finding nothing
+ * to stop in that session (a wrong id, or no --session at all) and after
+ * "remote-control stop failed: …". The script reported the share closed while
+ * its access code and the viewer stayed live. Only a stop that ended a share is
+ * a success now; so is a status that reported, whatever it found.
+ */
+test('a stop from opencode run exits 0 only when it ended a share', () => {
+  const stop = (outcome: Outcome, status: number, extra: string[] = []) =>
+    runOpencode(['run', ...extra, '--session', 'ses_x', '--command', 'remote-control/stop'], outcome, {}, status)
+  for (const format of [[], ['--format', 'json']]) {
+    stop({ text: 'Remote control stopped.', stopped: true }, 0, format)
+    const { stderr } = stop({ text: 'session ses_x is not shared from this machine — nothing to stop.', stopped: false }, 1, format)
+    // The text still says why.
+    expect(stderr).toContain('nothing to stop')
+    stop({ error: 'bridge not found' }, 1, format)
+  }
+  // With --attach the stop runs in the server: this process has no say in it,
+  // and the server's own exit status is not touched.
+  stop({ text: 'session ses_x is not shared from this machine — nothing to stop.', stopped: false }, 0, ['--attach', 'http://127.0.0.1:4096'])
+  stop({ error: 'bridge not found' }, 0, ['--attach', 'http://127.0.0.1:4096'])
+  // A status that reported exits 0, "not sharing" included; one that failed does not.
+  runOpencode(['run', '--command', 'remote-control/status'], { text: 'no active session' }, {}, 0)
+  runOpencode(['run', '--command', 'remote-control/status'], { error: 'bridge not found' }, {}, 1)
+})
+
+/**
+ * Servers and terminal UIs keep running after the command: the exit status of
+ * the process belongs to it, not to one stop typed into it.
+ */
+test('a stop that ended nothing leaves the exit status of a process that stays alone', () => {
+  for (const args of [['serve', '--port', '4096'], ['web'], [], ['--mini'], ['acp']]) {
+    runOpencode([...args, '--command', 'remote-control/stop'], { text: 'nothing to stop', stopped: false }, {}, 0)
+    runOpencode([...args, '--command', 'remote-control/stop'], { error: 'bridge not found' }, {}, 0)
   }
 })
 
