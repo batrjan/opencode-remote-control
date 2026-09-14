@@ -280,6 +280,35 @@ function terminalHtml(shareId?: string): string {
 }
 
 /**
+ * Powerful browser features denied to every relay page and anything it could
+ * embed. None of them is called by the UI build (no getUserMedia, geolocation,
+ * PaymentRequest, WebAuthn, WebUSB/HID/serial, MIDI or clipboard reads).
+ *
+ * clipboard-write stays (self), never (): the UI's copy buttons and its
+ * terminal call navigator.clipboard.writeText, which Chromium rejects with
+ * NotAllowedError under clipboard-write=() — measured in a real browser.
+ */
+const PERMISSIONS_POLICY = [
+  'accelerometer=()',
+  'camera=()',
+  'clipboard-read=()',
+  'clipboard-write=(self)',
+  'display-capture=()',
+  'geolocation=()',
+  'gyroscope=()',
+  'hid=()',
+  'magnetometer=()',
+  'microphone=()',
+  'midi=()',
+  'payment=()',
+  'publickey-credentials-get=()',
+  'screen-wake-lock=()',
+  'serial=()',
+  'usb=()',
+  'xr-spatial-tracking=()',
+].join(', ')
+
+/**
  * App factory: injects the Store so tests and the entrypoint can share one
  * instance per app. The optional BridgeClient lets the session API disconnect
  * a bridge when its session is deleted (startServer always passes it).
@@ -299,11 +328,20 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
   // No server fingerprint, no MIME sniffing, never framed (the join page takes
   // a secret code — clickjacking protection), and no referrer: the viewer URL
   // carries the session id, which must not leak to third-party origins.
+  // Defence in depth on top: no powerful features the UI never uses (see
+  // PERMISSIONS_POLICY), no window handle shared with a cross-origin opener or
+  // popup, and no bundle or API answer embedded by another site. nginx adds
+  // only HSTS, so these must come from here, on every response the relay sends.
+  // No Cross-Origin-Embedder-Policy: the UI needs no crossOriginIsolated, and
+  // require-corp would only risk blocking any cross-origin image or font.
   app.disable('x-powered-by')
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff')
     res.setHeader('X-Frame-Options', 'DENY')
     res.setHeader('Referrer-Policy', 'no-referrer')
+    res.setHeader('Permissions-Policy', PERMISSIONS_POLICY)
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin')
     next()
   })
   // NO global express.json(): a single parser cannot serve both sides of this
