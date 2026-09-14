@@ -227,7 +227,9 @@ unauthenticated JSON API (`POST /api/sessions`, `POST /api/activate`) accepts at
 **32 KB**, while authenticated proxy traffic gets **25 MB** so a viewer can paste a whole
 file into a prompt. The proxy's parser is mounted behind the viewer check, so an anonymous
 request can never make the relay buffer the larger limit. Anything over the cap gets
-`413 {"error":"payload too large"}`.
+`413 {"error":"payload too large"}`; a body that is not JSON gets
+`400 {"error":"invalid json"}`, and one in a charset or content encoding the relay cannot
+decode gets `415 {"error":"unsupported media type"}`. None of these is logged.
 
 ## Development
 

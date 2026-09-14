@@ -500,20 +500,43 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
   }
   // Nothing matched. express's own finalhandler answers an HTML page reading
   // "Cannot PUT /config", which is both the wrong content type for an API and
-  // a free framework fingerprint — every other error this relay produces is
-  // JSON. Reached by an unallowlisted method or path (the allowlist mounts
-  // GET /config, so a PUT falls through here), and by a missing asset.
+  // a free framework fingerprint — the relay's own errors are JSON, and so are
+  // the client errors mapped below. Reached by an unallowlisted method or path
+  // (the allowlist mounts GET /config, so a PUT falls through here), and by a
+  // missing asset.
   app.use((_req, res) => {
     res.status(404).json({ error: 'not found' })
   })
-  // Body-size failures as JSON. express's default handler answers an HTML
-  // error page, which every caller here (the bridge's fetch, the viewer's UI)
-  // parses as JSON and reports as an opaque failure instead of "too large".
-  // 'entity.too.large' is raw-body's code for exceeding a parser's limit.
+  // A request the relay could not read, answered as JSON and not logged: a
+  // body over a parser's limit, one that is not JSON, in a charset or content
+  // encoding the parser cannot decode, or gzip that does not inflate, and a
+  // path parameter that does not decode. Each arrives here as an error
+  // carrying its 4xx status. express's default handler answered an HTML page,
+  // which every caller here (the bridge's fetch, the viewer's UI) parses as
+  // JSON and reports as an opaque failure, and printed the error's stack
+  // unless env is 'test' — NODE_ENV=production does not stop it. That was
+  // about 950 bytes a request for any anonymous caller, since the public
+  // routes parse before any check, and a SyntaxError's message quotes the raw
+  // body around the fault, newlines included: lines of the caller's choosing
+  // in the log. So the answer is a fixed string, never err.message.
+  // Anything else (a 5xx, or no status: a bug) still goes to express, stack
+  // and all.
   app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
-    if ((err as { type?: unknown } | null)?.type !== 'entity.too.large') return next(err)
+    const e = err as { type?: unknown; status?: unknown; statusCode?: unknown } | null | undefined
+    const status = typeof e?.status === 'number' ? e.status : e?.statusCode
+    if (typeof status !== 'number' || !Number.isInteger(status) || status < 400 || status >= 500) return next(err)
     if (res.headersSent) return next(err)
-    return res.status(413).json({ error: 'payload too large' })
+    // body-parser's own codes ('entity.too.large' is raw-body's for a limit);
+    // anything else by its status alone, as in "bad request".
+    const error =
+      e?.type === 'entity.too.large'
+        ? 'payload too large'
+        : e?.type === 'entity.parse.failed'
+          ? 'invalid json'
+          : e?.type === 'charset.unsupported' || e?.type === 'encoding.unsupported'
+            ? 'unsupported media type'
+            : (http.STATUS_CODES[status] ?? 'bad request').toLowerCase()
+    return res.status(status).json({ error })
   })
   return Object.assign(app, { endEventStreams })
 }
