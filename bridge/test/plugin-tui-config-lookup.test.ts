@@ -142,3 +142,24 @@ test('a tui.jsonc with comments and trailing commas is read as opencode reads it
   write(file, `{ "plugin": ["${SPEC}"] `)
   expect(tuiEntryRegistered(project, { HOME: home })).toBe(false)
 })
+
+test('a tui.json that starts with a UTF-8 byte order mark is read as opencode reads it', () => {
+  // opencode 1.18.30 loads such a file (it drops only a leading mark: one after
+  // the "{" makes the file invalid there too). The plugin read the mark as
+  // U+FEFF, JSON.parse rejected it and the file was
+  // skipped: the server entry registered its commands next to the TUI entry
+  // opencode did load, and `/remote-control` ran a model turn answering "OK"
+  // instead of opening the picker.
+  const BOM = '\uFEFF'
+  const { home, project, write } = tree()
+  write(path.join(home, '.config', 'opencode', 'tui.json'), BOM + REGISTERED)
+  expect(tuiEntryRegistered(project, { HOME: home })).toBe(true)
+
+  rmSync(path.join(home, '.config'), { recursive: true })
+  write(path.join(project, '.opencode', 'tui.jsonc'), `${BOM}{\n  // the terminal UI\n  "plugin": ["${SPEC}",],\n}\n`)
+  expect(tuiEntryRegistered(project, { HOME: home })).toBe(true)
+
+  // The mark does not make a commented-out entry count.
+  write(path.join(project, '.opencode', 'tui.jsonc'), `${BOM}{\n  // "plugin": ["${SPEC}"],\n  "plugin": []\n}\n`)
+  expect(tuiEntryRegistered(project, { HOME: home })).toBe(false)
+})

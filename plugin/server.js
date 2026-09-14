@@ -276,6 +276,12 @@ function tuiConfigPaths(directory, env) {
  */
 function parseJsonc(text) {
   const json = text
+    // A leading UTF-8 byte order mark goes first. opencode loads a tui.json
+    // that starts with one, but readFileSync keeps it as U+FEFF and JSON.parse
+    // rejects that: the file was skipped, the server entry registered its
+    // commands beside the TUI entry opencode did load, and `/remote-control`
+    // ran a model turn instead of opening the picker.
+    .replace(/^\uFEFF/, "")
     // Each comment becomes a space. A string is matched first and put back as
     // it is, so the "//" of a git+https:// plugin spec is not taken for one.
     .replace(/("(?:[^"\\]|\\.)*")|\/\/[^\n]*|\/\*[\s\S]*?\*\//g, (_, string) => string ?? " ")
