@@ -216,3 +216,42 @@ test('a reading viewer still gets an oversized event whole and is never dropped 
     viewer.destroy()
   }
 }, 30_000)
+
+test('a viewer reading one oversized event slower than a heartbeat still gets it whole', async () => {
+  // The test above passes only because loopback takes 6 MiB in milliseconds.
+  // A phone on a 1-2 Mbit/s link needs longer than a heartbeat for one big
+  // frame, and the watchdog measured progress with res.writableLength alone:
+  // Node lowers that only when a WHOLE socket write completes, and one frame
+  // is one write, so while the frame was leaving piece by piece it read as
+  // "nothing drained" and the stream was destroyed mid-frame on the second
+  // beat. That event was lost, and so was every later big one.
+  //
+  // Here the frame takes ~3 s to read, i.e. several beats. The beat must stay
+  // well above the ~300 KiB steps in which macOS loopback frees its send
+  // buffer, or even a reader that is moving could look still between beats.
+  process.env.RELAY_SSE_HEARTBEAT_MS = '500'
+  const RATE = 4 * MiB // bytes per second the viewer reads
+  const id = 'ses_exempt_slow_reader'
+  const { viewerToken, bridge } = await share(id)
+  const viewer = await openViewer(viewerToken)
+  const received = collect(viewer)
+  // Throttle: after each chunk, stop reading for as long as that chunk would
+  // take at RATE, so the kernel buffers fill and the relay's write backs up.
+  viewer.on('data', (chunk: Buffer) => {
+    viewer.pause()
+    setTimeout(() => viewer.resume(), (chunk.length / RATE) * 1000)
+  })
+  try {
+    await until(() => streams.length === 1, 2000)
+    expect(streams.length).toBe(1)
+
+    const big = bigPartEvent(id, 12 * MiB)
+    bridge.send(JSON.stringify({ type: 'event', data: big }))
+    await until(() => streams[0].res.destroyed || received().includes(`data: ${big}\n\n`), 20_000)
+    expect(streams[0].res.destroyed).toBe(false)
+    expect(received().includes(`data: ${big}\n\n`)).toBe(true)
+  } finally {
+    bridge.terminate()
+    viewer.destroy()
+  }
+}, 30_000)

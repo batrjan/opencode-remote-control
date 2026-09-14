@@ -983,6 +983,16 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // in the heartbeat compares against it; the exemption above does NOT enter
     // this, so a frame parked inside the exemption is still caught.
     let lastFlushed = queued - res.writableLength
+    // Bytes libuv still has to hand the kernel for the socket write in flight
+    // (`_handle.writeQueueSize`, the same count the bridge's keep-alive reads in
+    // bridge/src/relay.ts outboundCounters). Unlike writableLength it shrinks
+    // while a single large write is only partly sent. Read defensively: without
+    // it only whole-write progress is seen, as before.
+    const inFlight = (): number | undefined => {
+      const handle = (res.socket as unknown as { _handle?: { writeQueueSize?: unknown } | null } | null)?._handle
+      return typeof handle?.writeQueueSize === 'number' ? handle.writeQueueSize : undefined
+    }
+    let lastInFlight = inFlight()
     const heartbeat = setInterval(() => {
       if (res.writableEnded || res.destroyed) return
       if (!viewerToken || !store.verifyViewer(session.id, viewerToken)) {
@@ -998,16 +1008,30 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       // WHOLE backlog, exempt frame included: a stream over the cap that has
       // not drained a byte since the previous beat is stuck regardless of the
       // exemption, so drop it (destroy frees the backlog and its slot at once;
-      // the viewer reconnects). A viewer still taking the frame flushes
-      // something between beats and is spared.
+      // the viewer reconnects).
+      //
+      // "Drained a byte" cannot be read off writableLength alone: Node lowers
+      // it only when a WHOLE socket write completes, and one frame is one write
+      // (header, payload and CRLF go out corked together). A viewer on a slow
+      // link that takes longer than a beat to read one big frame would sit
+      // still in that number and be cut mid-frame. So a beat counts as progress
+      // if either moved:
+      //   - flushed (queued - writableLength) grew: a write completed;
+      //   - libuv's queue for the write in flight shrank: it is partway out.
+      // The next write enters libuv only after the previous one completed, so
+      // that queue can only grow together with `flushed` — a viewer that reads
+      // nothing moves neither and is still dropped.
       const flushed = queued - res.writableLength
-      if (res.writableLength > maxBuffer && flushed <= lastFlushed) {
+      const pending = inFlight()
+      const partlySent = pending !== undefined && lastInFlight !== undefined && pending < lastInFlight
+      if (res.writableLength > maxBuffer && flushed <= lastFlushed && !partlySent) {
         clearInterval(heartbeat)
         unsubscribe()
         res.destroy()
         return
       }
       lastFlushed = flushed
+      lastInFlight = pending
       send(`data: ${envelope(JSON.stringify(heartbeatEvent()))}\n\n`)
     }, sseHeartbeatMs())
     heartbeat.unref?.()
