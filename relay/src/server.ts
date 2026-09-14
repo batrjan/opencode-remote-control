@@ -21,6 +21,31 @@ import { FileStateStore } from './persist.js'
  */
 const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url))
 
+/**
+ * Which static files a browser may keep for a year without asking again.
+ *
+ * express.static's default is "public, max-age=0": stale on arrival, so a
+ * viewer's every load revalidated each file (one round trip apiece, ahead of
+ * the UI's boot), and the ETag it revalidates against is size+mtime — a
+ * rebuilt image layer re-copies the UI build, and every returning viewer then
+ * downloaded all of it again although not a byte had changed.
+ *
+ * The UI build names what it emits into /assets after the content (Vite's
+ * -[hash8] suffix, base64url), so such a name always holds the same bytes.
+ * Not everything there has one: Inter.ttf and the JetBrains Mono woff2 are
+ * copied verbatim and referenced by fixed URL from the CSS, so they, the root
+ * files and the HTML shells keep the default and keep revalidating — the
+ * shells are what points a viewer at a deploy's new hashed names. A future
+ * unhashed file whose name happens to end in -<8 name characters> (say
+ * "-Variable.ttf") would be taken for hashed; the hash alphabet includes
+ * plain words, so the name alone cannot tell them apart.
+ */
+const ASSETS_DIR = path.join(PUBLIC_DIR, 'assets') + path.sep
+const HASHED_ASSET_NAME = /-[A-Za-z0-9_-]{8}\.[a-z0-9]+(?:\.map)?$/
+function isHashedAsset(filePath: string): boolean {
+  return filePath.startsWith(ASSETS_DIR) && HASHED_ASSET_NAME.test(path.basename(filePath))
+}
+
 /** index.html split at </head>, where the shell's scripts go. */
 let cachedShell: { head: string; tail: string } | undefined
 
@@ -307,7 +332,16 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
   // The root URL is the viewer entry point; the SPA itself lives at /terminal.
   // Registered before static so express.static does not serve index.html here.
   app.get('/', (req, res) => res.redirect(viewerHome(req) ?? '/join'))
-  app.use(express.static(PUBLIC_DIR))
+  // Content-hashed assets are immutable (see isHashedAsset). setHeaders runs
+  // before send writes its own Cache-Control, which it skips when one is set;
+  // everything else keeps the default and revalidates.
+  app.use(
+    express.static(PUBLIC_DIR, {
+      setHeaders(res, filePath) {
+        if (isHashedAsset(filePath)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+      },
+    }),
+  )
   app.get('/join', (req, res) => {
     const home = viewerHome(req)
     if (home) return res.redirect(home)
