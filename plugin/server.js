@@ -50,6 +50,31 @@ const RELAY_INSTRUCTION = [
   "output, do not explain it, do not run any tools.",
 ].join(" ")
 
+/**
+ * The instruction for `opencode --mini` (see runsMini). Mini never draws the
+ * command's message live, only the model's reply, so an "OK" there left the
+ * owner with no URL, no code and no status. The reply has to be the output.
+ * Only mini gets this: every other client shows the message itself, and a
+ * model copying a share link and code is one more place for them to go wrong.
+ */
+const MINI_RELAY_INSTRUCTION = [
+  "The remote-control plugin already ran this command locally; its output is",
+  "the message above. This terminal does not show that message, so reply with",
+  "that output verbatim: every line exactly as written, with nothing added.",
+  "Do not explain it, do not run any tools.",
+].join(" ")
+
+/**
+ * How long mini's reply is held back at the end of its text (see the
+ * experimental.text.complete hook). Mini ends a command's turn the moment
+ * session.command answers, and draws the last line of streamed text only when
+ * a turn ends; the answer came back a few milliseconds before the reply's text
+ * reached mini's event stream, so the reply stayed undrawn until the next
+ * prompt. A single timer tick was enough on opencode 1.18.30; this leaves a
+ * wide margin and still goes unnoticed next to a model turn.
+ */
+const MINI_REPLY_SETTLE_MS = 250
+
 
 /**
  * Subcommands that never open a terminal UI. `opencode` with none of them (or
@@ -69,6 +94,9 @@ const NON_TUI_SUBCOMMANDS = new Set([
  */
 const TUI_WORKER_RE = /[\\/]cli[\\/]tui[\\/]worker\.js$/
 
+/** Whether argv asks for the minimal interface (`--mini`, `--mini=…`). */
+const hasMiniFlag = (argv) => argv.some((arg) => arg === "--mini" || arg.startsWith("--mini="))
+
 /**
  * Whether this process is going to render the terminal UI.
  *
@@ -83,8 +111,21 @@ export function runsTui(argv = process.argv.slice(2), env = process.env, entry =
   if (client && client !== "cli") return false
   // `--mini` draws its interface from the main thread and loads no tui.json
   // plugin, so the config commands are the only ones it gets.
-  if (argv.some((arg) => arg === "--mini" || arg.startsWith("--mini="))) return false
+  if (hasMiniFlag(argv)) return false
   return !argv.some((arg) => NON_TUI_SUBCOMMANDS.has(arg))
+}
+
+/**
+ * Whether this process is `opencode --mini`, which runs the commands typed into
+ * it itself and shows only the model's reply to them (see
+ * MINI_RELAY_INSTRUCTION). argv alone decides, as in runPrintsReplyOnly:
+ * OPENCODE_CLIENT is inherited. `opencode attach <url> --mini` is not one: its
+ * commands run in the server it is attached to, which cannot tell a mini
+ * client from the web UI or a full terminal UI, so they keep the plain "OK".
+ */
+export function runsMini(argv = process.argv.slice(2), entry = process.argv[1]) {
+  if (typeof entry === "string" && TUI_WORKER_RE.test(entry)) return false
+  return hasMiniFlag(argv) && !argv.some((arg) => NON_TUI_SUBCOMMANDS.has(arg))
 }
 
 /**
@@ -199,6 +240,10 @@ export function createHooks(
   parentOf = undefined,
   show = showInRunTerminal,
 ) {
+  // Sessions in which a command just ran in `opencode --mini`: the next reply
+  // text there is the output, and has to reach mini's screen (see
+  // MINI_REPLY_SETTLE_MS).
+  const settling = new Set()
   return {
     // Register the commands so they appear in the `/` menu of every client
     // that has no TUI plugin support (desktop GUI, web UI).
@@ -234,11 +279,22 @@ export function createHooks(
       // synthetic part, which the model reads and the transcript hides.
       output.parts.length = 0
       output.parts.push({ type: "text", text })
-      output.parts.push({ type: "text", text: RELAY_INSTRUCTION, synthetic: true })
+      const mini = runsMini()
+      output.parts.push({ type: "text", text: mini ? MINI_RELAY_INSTRUCTION : RELAY_INSTRUCTION, synthetic: true })
+      if (mini) settling.add(input?.sessionID)
       // `opencode run` prints only the model's reply — the "OK" asked for above —
       // so the owner would otherwise never learn whether a stop ended anything
       // or what URL and code a start produced.
       show(text)
+    },
+    // Called at the end of every text part the model writes, before the part is
+    // stored as finished and the turn can end. Only the first reply text after a
+    // command in `opencode --mini` waits here, briefly, so mini draws the output
+    // it repeats instead of keeping it off screen until the next prompt. The
+    // text itself is left alone.
+    "experimental.text.complete": async (input) => {
+      if (!settling.delete(input?.sessionID)) return
+      await new Promise((resolve) => setTimeout(resolve, MINI_REPLY_SETTLE_MS))
     },
   }
 }

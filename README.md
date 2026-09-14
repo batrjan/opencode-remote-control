@@ -124,7 +124,7 @@ Restart OpenCode. The plugin ships a prebuilt bridge, so no build is needed.
 | Client | Loader | Config file | Entry point |
 | ------ | ------ | ----------- | ----------- |
 | Terminal UI (`opencode`) | TUI | `tui.json` (also `<project>/.opencode/tui.json`, `$OPENCODE_TUI_CONFIG`) | `./tui` → `plugin/remote-control.js` |
-| Desktop GUI, web UI, `opencode run`, `opencode serve` | server | `opencode.json` (also `<project>/.opencode/opencode.json`, auto-discovered `.opencode/{plugin,plugins}/*.js`) | `./server` → `plugin/server.js` |
+| Desktop GUI, web UI, `opencode run`, `opencode serve`, `opencode --mini` | server | `opencode.json` (also `<project>/.opencode/opencode.json`, auto-discovered `.opencode/{plugin,plugins}/*.js`) | `./server` → `plugin/server.js` |
 
 > Registering in only one file leaves the commands missing on the other side —
 > the GUI has no TUI at all, so a TUI plugin can never reach it. A single module
@@ -208,6 +208,17 @@ output to stderr (stdout stays the reply, or the events of `--format json`).
 (`opencode run --command remote-control/start`): a message such as
 `/remote-control/stop` is sent to the model as an ordinary prompt, runs
 nothing, and lands in the session where a viewer can read it.
+
+`opencode --mini` loads no `tui.json` plugin, so it gets the server entry's
+commands as well. Mini draws the model's reply but not the command's message, so
+there the model is asked to repeat the output verbatim instead of answering `OK`
+(its first reply text is held back for a moment, or mini would draw it only after
+your next prompt). What mini shows is therefore the model's copy of the output;
+the message with the plugin's own text stays in the session. That holds only for
+a mini that runs its own server. With `opencode attach <url> --mini` the command
+runs in the attached server, which cannot tell a mini client from the others, so
+the reply stays `OK` and the output is not drawn: resize the terminal (mini then
+redraws the session, output included), or attach without `--mini`.
 
 The TUI itself exposes no HTTP port, so the bridge starts its own
 `opencode serve` against the same project and stops it again on
