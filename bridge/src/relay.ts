@@ -185,7 +185,8 @@ const RELAY_PROXY_ROUTES: ReadonlyArray<readonly [ProxyMethod, string]> = [
   ['POST', '/session/:id/summarize'],
   ['POST', '/session/:id/revert'],
   ['POST', '/session/:id/unrevert'],
-  ['POST', '/session/:id/fork'],
+  // Not '/session/:id/fork': it creates a new root session outside the share,
+  // and the relay does not route it.
   ['POST', '/session/:id/permissions/:permissionID'],
   ['GET', '/session/:id/todo'],
   ['GET', '/session/:id/children'],

@@ -25,7 +25,9 @@ import { bridgeReconnectWaitMs, config, promptTimeoutMs, sseHeartbeatMs, sseMaxB
  * session-scoped ones are bound to the viewer's session; session-listing
  * endpoints are collapsed to the single bound session. Mutations outside a
  * session scope (config PATCH, auth, instance dispose, TUI control, MCP
- * management, share) are NOT routed — they 404 by construction.
+ * management, share) are NOT routed — they 404 by construction. So is the
+ * one session-scoped mutation that leaves the session: fork (see the NOTE in
+ * the list).
  */
 type Method = 'GET' | 'POST'
 
@@ -43,7 +45,13 @@ const ALLOWED_ROUTES: Array<[Method, string]> = [
   ['POST', '/session/:id/summarize'],
   ['POST', '/session/:id/revert'],
   ['POST', '/session/:id/unrevert'],
-  ['POST', '/session/:id/fork'],
+  // NOTE: '/session/:id/fork' is NOT here. Upstream answers it with a NEW root
+  // session (no parentID) holding a copy of the transcript, and the UI moves
+  // to it. The viewer is bound to one session and the fork is not its
+  // descendant, so every read of it collapsed to the bound session: the page
+  // said "session not found" with no composer, a reload served "This session
+  // has ended", and each attempt left the owner one more session. Unrouted,
+  // the UI reports the failed request and stays on the share.
   ['POST', '/session/:id/permissions/:permissionID'],
   ['GET', '/session/:id/todo'],
   ['GET', '/session/:id/children'],

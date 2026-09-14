@@ -87,6 +87,11 @@ beforeAll(async () => {
         },
       ])
     }
+    // Upstream's fork: a NEW root session (no parentID) holding a copy of the
+    // transcript. Answered like opencode does, so a forwarded fork succeeds.
+    if (req.method === 'POST' && /^\/session\/[^/]+\/fork$/.test(url.pathname)) {
+      return json(res, 200, { id: 'ses_fork1', title: 'title (fork #1)', directory: '/path' })
+    }
     if (req.method === 'GET' && url.pathname === '/session/sess1/todo') {
       return json(res, 200, [{ id: 'todo1' }])
     }
@@ -552,6 +557,28 @@ test('the review panel reads the git diff of the shared directory', async () => 
     lastPath = ''
     const res = await request(relay)[method](path).set('x-viewer-token', viewerToken)
     expect(res.status).toBe(404)
+    expect(lastPath).toBe('')
+  }
+})
+
+/**
+ * The UI's /fork command. opencode answers POST /session/:id/fork by creating
+ * a NEW root session (no parentID) with a copy of the transcript, and the UI
+ * then navigates to it. A viewer is bound to one session, and the fork is not
+ * a descendant of it, so every read of the fork collapsed back to the bound
+ * session: the page said "session not found" with no composer, and a reload
+ * of its URL served "This session has ended" while the share was live. Each
+ * attempt still left the owner another session holding a copy of the
+ * conversation. The route is not proxied, so the UI shows "Request failed"
+ * and the viewer stays on the share.
+ */
+test('a viewer cannot fork the shared session', async () => {
+  for (const path of ['/session/sess1/fork', '/api/session/sess1/fork', '/session/ses_stranger/fork']) {
+    lastPath = ''
+    const res = await request(relay).post(path).set('x-viewer-token', viewerToken).send({ messageID: 'm1' })
+    expect(res.status).toBe(404)
+    expect(res.body).toEqual({ error: 'not found' })
+    // Never forwarded: the owner's opencode was not asked to create a session.
     expect(lastPath).toBe('')
   }
 })

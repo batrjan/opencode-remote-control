@@ -31,7 +31,6 @@ const ACCEPTED: Array<[string, string]> = [
   ['POST', `/session/${SES}/summarize?directory=%2FUsers%2Fme%2Fproj`],
   ['POST', `/session/${SES}/revert?directory=%2FUsers%2Fme%2Fproj`],
   ['POST', `/session/${SES}/unrevert?directory=%2FUsers%2Fme%2Fproj`],
-  ['POST', `/session/${SES}/fork?directory=%2FUsers%2Fme%2Fproj`],
   // The permission reply — the one POST that carries a second id segment.
   ['POST', `/session/${SES}/permissions/per_9ab?directory=%2FUsers%2Fme%2Fproj`],
   ['GET', `/session/${SES}/todo?directory=%2FUsers%2Fme%2Fproj`],
@@ -129,6 +128,9 @@ const REJECTED: Array<[string, string]> = [
   ['POST', `/session/${SES}/todo`], // right path, wrong verb (todo is GET-only)
   ['GET', '/auth/anthropic'], // not routed by the relay at all
   ['POST', '/session'], // session creation is not in the contract
+  // …nor through a fork, which makes a new root session the viewer is not bound to.
+  ['POST', `/session/${SES}/fork?directory=%2FUsers%2Fme%2Fproj`],
+  ['POST', `/api/session/${SES}/fork`],
   ['GET', '/session/not_a_session_id/message'], // ':id' must look like a session
   ['GET', 'http://evil.example/config'], // absolute URL, would re-target the host
   ['GET', '/session//message'], // empty id segment
