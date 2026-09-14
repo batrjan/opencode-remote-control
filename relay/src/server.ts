@@ -21,7 +21,8 @@ import { FileStateStore } from './persist.js'
  */
 const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url))
 
-let cachedTerminalHtml: string | undefined
+/** index.html split at </head>, where the shell's scripts go. */
+let cachedShell: { head: string; tail: string } | undefined
 
 /**
  * The official UI's index.html. The proxy adapter is mounted at the server
@@ -76,13 +77,13 @@ const SERVER_URL_RESET = `<script id="oc-relay-server-url">
  * So wrap fetch, which the UI resolves at call time for its API calls and its
  * event stream alike, and on a 401 carrying the relay's own marker (see
  * VIEWER_AUTH_HEADER — a 401 from the owner's opencode has none, and navigating
- * on that would loop) replace the page with /<session_id>. That id comes from
- * the path this shell was served at: the relay serves it only at URLs naming
- * the share (/<dir>/session/<id>, /server/<key>/session/<id>), while the path
- * the UI has moved to since may name another session, a subagent's, which no
- * share answers. Not / or /join: a cookie that names no share gets the generic
- * page there, whose code field is disabled. /terminal names nothing; / is all
- * that is left.
+ * on that would loop) replace the page with /<session_id>. The relay names that
+ * id as it serves the shell: the share the page belongs to, known only then.
+ * Not read from the path: a subagent's page is served at the subagent's id,
+ * and the path the UI has moved to since may name one too, while no share
+ * answers a subagent's id — its page would say the share has ended. Not / or
+ * /join: a cookie that names no share gets the generic page there, whose code
+ * field is disabled. /terminal names nothing; / is all that is left.
  *
  * The response is handed back untouched and its body never read, so the event
  * stream is not disturbed. At most one navigation per tab per AUTH_GUARD_WINDOW_MS
@@ -92,13 +93,18 @@ const SERVER_URL_RESET = `<script id="oc-relay-server-url">
  * the UI's deferred module bundle makes its first request.
  */
 const AUTH_GUARD_WINDOW_MS = 30_000
-const AUTH_GUARD = `<script id="oc-relay-auth-guard">
+/**
+ * The share ids /<id> answers (see that route). A share registered under any
+ * other id has no such page, so its guard goes to /; the check also keeps what
+ * is written into the script inert.
+ */
+const SHARE_PAGE_ID_RE = /^ses_[A-Za-z0-9_]+$/
+const authGuard = (shareId: string | undefined) => `<script id="oc-relay-auth-guard">
 ;(() => {
   try {
     const original = window.fetch
     if (typeof original !== 'function') return
-    const share = /\\/session\\/(ses_[A-Za-z0-9_]+)/.exec(location.pathname)
-    const home = share ? '/' + share[1] : '/'
+    const home = ${JSON.stringify(shareId !== undefined && SHARE_PAGE_ID_RE.test(shareId) ? `/${shareId}` : '/')}
     const key = 'oc-relay-auth-redirect-at'
     let left = false
     const leave = () => {
@@ -127,14 +133,14 @@ const AUTH_GUARD = `<script id="oc-relay-auth-guard">
 })()
 </script>`
 
-function terminalHtml(): string {
-  if (cachedTerminalHtml === undefined) {
+/** The UI shell for a page of the share `shareId` (none for /terminal). */
+function terminalHtml(shareId?: string): string {
+  if (cachedShell === undefined) {
     const html = readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8')
     const anchor = html.indexOf('</head>')
-    const inject = SERVER_URL_RESET + AUTH_GUARD
-    cachedTerminalHtml = anchor === -1 ? html + inject : html.slice(0, anchor) + inject + html.slice(anchor)
+    cachedShell = anchor === -1 ? { head: html, tail: '' } : { head: html.slice(0, anchor), tail: html.slice(anchor) }
   }
-  return cachedTerminalHtml
+  return cachedShell.head + SERVER_URL_RESET + authGuard(shareId) + cachedShell.tail
 }
 
 /**
@@ -253,34 +259,53 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
     }
     return res.type('html').send(joinHtml(session.id))
   })
-  // The official UI session route: /<base64(directory)>/session/<id>. Serve
-  // the UI only to an authenticated viewer of THAT session; otherwise bounce
-  // to the session's code-entry page. The :dir segment is base64url of the
-  // session directory — we validate by decoding and comparing to the session.
-  app.get('/:dir/session/:id(ses_[A-Za-z0-9_]+)', (req, res) => {
-    const session = store.getSession(req.params.id)
-    if (!session) return res.status(404).type('html').send(endedHtml())
+  /**
+   * A UI session page loaded as a page (a reload, a new tab, a pasted link):
+   * /<base64url(directory)>/session/<id> or /server/<base64url(serverUrl)>/session/<id>.
+   *
+   * A share's own page is served only to an authenticated viewer of THAT
+   * share; anyone else is bounced to its code-entry page.
+   *
+   * Any other id is served the UI too, when the cookie names a live share. The
+   * UI links a subagent's page — the task card in the transcript — by the
+   * subagent's own session id, which no share answers, and leaves a middle- or
+   * ctrl-click on that link to the browser. Answered from the share list alone,
+   * the viewer's reload of a subagent page, or the tab they opened for it, said
+   * "This session has ended" while the share was live. This grants nothing: the
+   * shell is the static UI, and every read it makes goes through the proxy's
+   * forced binding, where only a proven descendant of the viewer's share is
+   * read as itself (see SUBAGENT_ROUTES in proxy/adapter.ts). No upstream check
+   * here: it would put the owner's uplink in front of every such page load, and
+   * a page naming a session outside the share reads only the share, exactly as
+   * the same URL reached from inside the app does. Without a working cookie the
+   * answer is the ended page, as before.
+   */
+  const sessionPage = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    // '/:dir/session/:id' also matches /api/session/<id>, the proxy's /api twin
+    // of the session detail, which then answered HTML instead of reaching it.
+    if (req.params.dir === 'api') return next()
     const token = cookieViewerToken(req)
-    if (token && store.verifyViewer(session.id, token)) {
-      setViewerCookie(res, token)
-      return res.type('html').send(terminalHtml())
+    const session = store.getSession(req.params.id)
+    if (session) {
+      if (token && store.verifyViewer(session.id, token)) {
+        // verifyViewer slid the token's idle window: slide the cookie too.
+        setViewerCookie(res, token)
+        return res.type('html').send(terminalHtml(session.id))
+      }
+      return res.redirect(`/${session.id}`)
     }
-    return res.redirect(`/${session.id}`)
-  })
+    const share = token ? store.getSessionByViewerToken(token) : undefined
+    if (!token || !share) return res.status(404).type('html').send(endedHtml())
+    setViewerCookie(res, token)
+    return res.type('html').send(terminalHtml(share.id))
+  }
+  // The official UI session route: /<base64(directory)>/session/<id>.
+  app.get('/:dir/session/:id(ses_[A-Za-z0-9_]+)', sessionPage)
   // The UI's SPA route when the viewer navigates/relods inside the app:
-  // /server/<base64(serverUrl)>/session/<id>. Same auth rule as above — the
-  // server-side must answer the SPA shell for this deep link, otherwise F5
-  // 404s ("Cannot GET /server/.../session/...").
-  app.get('/server/:key/session/:id(ses_[A-Za-z0-9_]+)', (req, res) => {
-    const session = store.getSession(req.params.id)
-    if (!session) return res.status(404).type('html').send(endedHtml())
-    const token = cookieViewerToken(req)
-    if (token && store.verifyViewer(session.id, token)) {
-      setViewerCookie(res, token)
-      return res.type('html').send(terminalHtml())
-    }
-    return res.redirect(`/${session.id}`)
-  })
+  // /server/<base64(serverUrl)>/session/<id>. The server-side must answer the
+  // SPA shell for this deep link too, otherwise F5 404s ("Cannot GET
+  // /server/.../session/...").
+  app.get('/server/:key/session/:id(ses_[A-Za-z0-9_]+)', sessionPage)
   // The proxy adapter mounts at the root LAST. It only routes its own
   // allowlisted opencode paths (/session/..., /agent, /provider, /file, ...);
   // everything else falls through to this 404. Because it is registered after
