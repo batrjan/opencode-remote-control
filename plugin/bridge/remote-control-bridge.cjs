@@ -3705,6 +3705,7 @@ var require_websocket_server = __commonJS({
 var src_exports = {};
 __export(src_exports, {
   belongsToRunningShare: () => belongsToRunningShare,
+  serverListensOnPort: () => serverListensOnPort,
   spawnedByRecordedShare: () => spawnedByRecordedShare,
   startBridge: () => startBridge,
   stopBridge: () => stopBridge,
@@ -8322,12 +8323,13 @@ function latestSessionState() {
 var import_meta = {};
 async function startBridge(relayUrl, apiKey, opts = {}) {
   const relay = new RelayClient(relayUrl, apiKey);
+  const namedServer = opts.opencodeUrl ? { namedPort: urlPort(opts.opencodeUrl) } : opts.port !== void 0 ? { namedPort: opts.port } : void 0;
   if (opts.sessionId !== void 0) {
-    await settleEarlierShare(relay, opts.sessionId, opts.port === void 0 && !opts.opencodeUrl);
+    await settleEarlierShare(relay, opts.sessionId, namedServer ?? true);
   }
   let spawnedServer;
   let resolvedPort;
-  let endLeftoverServer = false;
+  let endLeftoverServer = namedServer ?? false;
   if (opts.opencodeUrl) {
     resolvedPort = 0;
   } else if (opts.port !== void 0) {
@@ -8515,7 +8517,8 @@ async function settleEarlierShare(relay, sessionId, endLeftoverServer) {
   }
   clearOwnSessionState(sessionId, state.bridge_token);
   console.warn(`bridge: ended the earlier share of session ${sessionId}; its bridge (pid ${state.pid}) was no longer running`);
-  if (endLeftoverServer && terminateSpawnedServer(state.server_pid, state.started_at)) {
+  const endServer = typeof endLeftoverServer === "boolean" ? endLeftoverServer : state.server_pid !== void 0 && await serverListensOnPort(state.server_pid, endLeftoverServer.namedPort) === false;
+  if (endServer && terminateSpawnedServer(state.server_pid, state.started_at)) {
     const deadline = Date.now() + LEFTOVER_SERVER_EXIT_WAIT_MS;
     while (pidAlive(state.server_pid) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -8528,6 +8531,41 @@ function shareRelay(state, current) {
   return recorded !== void 0 && recorded === originOf(current.url) ? current : new RelayClient(state.relay);
 }
 var LEFTOVER_SERVER_EXIT_WAIT_MS = 5e3;
+function urlPort(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.port !== "") return Number(parsed.port);
+    return parsed.protocol === "http:" ? 80 : parsed.protocol === "https:" ? 443 : void 0;
+  } catch {
+    return void 0;
+  }
+}
+async function serverListensOnPort(serverPid, port, listeners = listListeners, inspectParent = describeParent) {
+  if (port === void 0 || !(serverPid > 1)) return void 0;
+  let listed;
+  try {
+    listed = await listeners();
+  } catch {
+    return void 0;
+  }
+  const underServer = (pid) => {
+    let current = pid;
+    for (let depth = 0; depth < SHARE_ANCESTRY_DEPTH && current !== serverPid; depth++) {
+      let parentPid;
+      try {
+        parentPid = inspectParent(current)?.ppid;
+      } catch {
+        return false;
+      }
+      if (parentPid === void 0 || !(parentPid > 1)) return false;
+      current = parentPid;
+    }
+    return current === serverPid;
+  };
+  const servers = listed.filter((l) => underServer(l.pid));
+  if (servers.length === 0) return void 0;
+  return servers.some((l) => l.port === port);
+}
 function shareBridgeRunning(state, inspect = describeProcess) {
   const pid = state.pid;
   if (!pid) return true;
@@ -8883,6 +8921,7 @@ if (invokedDirectly) {
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   belongsToRunningShare,
+  serverListensOnPort,
   spawnedByRecordedShare,
   startBridge,
   stopBridge,

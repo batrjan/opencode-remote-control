@@ -11,7 +11,7 @@ import {
   watchdogProbeTimeoutMs,
   watchdogStrikes,
 } from './config.js'
-import { detectOpenCodePort, ensureOpenCodeServer } from './detect.js'
+import { detectOpenCodePort, ensureOpenCodeServer, listListeners, type Listener } from './detect.js'
 import { describeError, originOf } from './errors.js'
 import { OpencodeClient } from './opencode.js'
 import { RelayClient, RelayHttpError, RelayWSClient, type RelaySession } from './relay.js'
@@ -83,16 +83,23 @@ export async function startBridge(
   opts: StartBridgeOptions = {},
 ): Promise<BridgeHandle> {
   const relay = new RelayClient(relayUrl, apiKey)
+  // A server this start names itself (--port, a URL) may be exactly the
+  // `opencode serve` an earlier, dead share of the session left behind, so that
+  // leftover is ended only once it is known to listen on another port (see
+  // LeftoverServerPolicy). Ending it regardless left the start nothing to run
+  // on; keeping it regardless, when the named server was the owner's own, lost
+  // the only record of the leftover and left it running unsecured for good.
+  const namedServer: LeftoverServerPolicy | undefined = opts.opencodeUrl
+    ? { namedPort: urlPort(opts.opencodeUrl) }
+    : opts.port !== undefined
+      ? { namedPort: opts.port }
+      : undefined
   // An earlier share of this session recorded on this machine is settled
   // before any server is detected or spawned: a live one is refused without
   // anything being started, and the `opencode serve` a dead one left behind
   // has to be gone before detection could mistake it for the user's own.
-  // Unless this start names its server (--port, a URL): that may be exactly
-  // the leftover (see endLeftoverServer below), and ending it here left the
-  // start nothing to run on — "local opencode server unreachable" on the port
-  // it had just emptied itself.
   if (opts.sessionId !== undefined) {
-    await settleEarlierShare(relay, opts.sessionId, opts.port === undefined && !opts.opencodeUrl)
+    await settleEarlierShare(relay, opts.sessionId, namedServer ?? true)
   }
   // When no opencode server is listening (plain console runs use an
   // in-process server with no HTTP port), spawn `opencode serve` ourselves so
@@ -103,9 +110,10 @@ export async function startBridge(
   // Whether the server this start runs on cannot be the `opencode serve` an
   // earlier, dead share of the session left behind, so settling that share may
   // end it (see registerShare). A server named by --port or a URL may be exactly
-  // that leftover; one we spawned cannot, nor one detection picked, since it
-  // never attaches to a server a share recorded (spawnedByRecordedShare).
-  let endLeftoverServer = false
+  // that leftover, which is then decided by the port it listens on; one we
+  // spawned cannot, nor one detection picked, since it never attaches to a
+  // server a share recorded (spawnedByRecordedShare).
+  let endLeftoverServer: LeftoverServerPolicy = namedServer ?? false
   if (opts.opencodeUrl) {
     resolvedPort = 0 // unused; url given directly
   } else if (opts.port !== undefined) {
@@ -348,7 +356,7 @@ async function registerShare(
   sessionId: string,
   directory: string,
   title: string,
-  endLeftoverServer: boolean,
+  endLeftoverServer: LeftoverServerPolicy,
   settleFirst: boolean,
 ): Promise<RelaySession> {
   const isConflict = (err: unknown): err is RelayHttpError => err instanceof RelayHttpError && err.status === 409
@@ -399,11 +407,15 @@ async function registerShare(
  *   Taking it over would delete its registration under its viewers.
  * - Its bridge is gone: ends its relay registration with the bridge_token from
  *   its state, on the relay it was registered on (see shareRelay), drops that
- *   state and, with `endLeftoverServer`, the `opencode serve` it spawned — what
- *   `stop` would have done. Throws when that relay cannot be told, keeping the
- *   state so a retry or `stop` still can.
+ *   state and, as `endLeftoverServer` allows, the `opencode serve` it spawned —
+ *   what `stop` would have done. Throws when that relay cannot be told, keeping
+ *   the state so a retry or `stop` still can.
  */
-async function settleEarlierShare(relay: RelayClient, sessionId: string, endLeftoverServer: boolean): Promise<boolean> {
+async function settleEarlierShare(
+  relay: RelayClient,
+  sessionId: string,
+  endLeftoverServer: LeftoverServerPolicy,
+): Promise<boolean> {
   const state = loadSessionState(sessionId)
   if (!state) return false
   if (shareBridgeRunning(state)) {
@@ -435,7 +447,14 @@ async function settleEarlierShare(relay: RelayClient, sessionId: string, endLeft
   // state already, and a failure of ours further on must not cost it that.
   clearOwnSessionState(sessionId, state.bridge_token)
   console.warn(`bridge: ended the earlier share of session ${sessionId}; its bridge (pid ${state.pid}) was no longer running`)
-  if (endLeftoverServer && terminateSpawnedServer(state.server_pid, state.started_at)) {
+  // The state just dropped was the only record of that server: kept here, it
+  // is left running with nothing that would ever end it.
+  const endServer =
+    typeof endLeftoverServer === 'boolean'
+      ? endLeftoverServer
+      : state.server_pid !== undefined &&
+        (await serverListensOnPort(state.server_pid, endLeftoverServer.namedPort)) === false
+  if (endServer && terminateSpawnedServer(state.server_pid, state.started_at)) {
     // Detection runs next, and a server still shutting down answers its health
     // probe like any other: the new share would attach to it and lose it a
     // moment later.
@@ -475,6 +494,72 @@ function shareRelay(state: SessionState, current: RelayClient): RelayClient {
 
 /** How long a start waits for the `opencode serve` of a dead share to exit once signalled. */
 const LEFTOVER_SERVER_EXIT_WAIT_MS = 5_000
+
+/**
+ * Whether settling a dead share may end the `opencode serve` it left behind:
+ * yes or no outright, or — for a start that names its server (--port, a URL)
+ * — the port it named, and then only when that leftover is known to listen on
+ * another port (serverListensOnPort answers false). While it may be the named
+ * server (listed on that port, or not listed at all) it is kept: ending it left
+ * the start nothing to run on, "local opencode server unreachable" on the port
+ * it had just emptied itself.
+ */
+type LeftoverServerPolicy = boolean | { namedPort: number | undefined }
+
+/** The port an http(s) URL names, or its scheme's default; undefined for anything else. */
+function urlPort(url: string): number | undefined {
+  try {
+    const parsed = new URL(url)
+    if (parsed.port !== '') return Number(parsed.port)
+    return parsed.protocol === 'http:' ? 80 : parsed.protocol === 'https:' ? 443 : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether the `opencode serve` a share recorded as `serverPid` listens on
+ * `port`: true when a listener on that port is the server or runs under it (an
+ * `opencode` on PATH that is a wrapper starts the real binary, which is what
+ * listens), false when every listener that is the server's is on another port,
+ * and undefined when there is nothing to decide from — no listener of the
+ * server's is listed (no lsof, or it is already gone) or no port is known.
+ *
+ * Never throws. `listeners` and `inspectParent` are injectable so the decision
+ * can be tested deterministically.
+ */
+export async function serverListensOnPort(
+  serverPid: number,
+  port: number | undefined,
+  listeners: () => Promise<Listener[]> = listListeners,
+  inspectParent: (pid: number) => ProcessParent | null = describeParent,
+): Promise<boolean | undefined> {
+  if (port === undefined || !(serverPid > 1)) return undefined
+  let listed: Listener[]
+  try {
+    listed = await listeners()
+  } catch {
+    return undefined
+  }
+  // The listener itself or one of its SHARE_ANCESTRY_DEPTH nearest ancestors.
+  const underServer = (pid: number): boolean => {
+    let current = pid
+    for (let depth = 0; depth < SHARE_ANCESTRY_DEPTH && current !== serverPid; depth++) {
+      let parentPid: number | undefined
+      try {
+        parentPid = inspectParent(current)?.ppid
+      } catch {
+        return false
+      }
+      if (parentPid === undefined || !(parentPid > 1)) return false
+      current = parentPid
+    }
+    return current === serverPid
+  }
+  const servers = listed.filter((l) => underServer(l.pid))
+  if (servers.length === 0) return undefined
+  return servers.some((l) => l.port === port)
+}
 
 /**
  * Whether the bridge a state file names is still running.

@@ -5,8 +5,9 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type { AddressInfo } from 'node:net'
+import { config as relayConfig } from '../../relay/src/config'
 import { startServer } from '../../relay/src/server'
-import { spawnedByRecordedShare, startBridge, stopBridge } from '../src/index'
+import { serverListensOnPort, spawnedByRecordedShare, startBridge, stopBridge } from '../src/index'
 import { RelayClient } from '../src/relay'
 import { loadSessionState, saveSessionState } from '../src/state'
 
@@ -44,6 +45,7 @@ let root: string
 let spawnLog: string
 let sessionsFile: string
 const saved: Record<string, string | undefined> = {}
+const savedRegistrationsPerWindow = relayConfig.registrationsPerWindow
 const ENV_KEYS = ['HOME', 'PATH', 'FAKE_LSOF_LINES'] as const
 const servers: Server[] = []
 /** Registrations made by the tests themselves, removed after each test. */
@@ -131,6 +133,31 @@ function lsofLine(pid: number, port: number): string {
   return `node ${pid} user 20u IPv4 0x0 0t0 TCP 127.0.0.1:${port} (LISTEN)`
 }
 
+/** The owner's own server, run by this process: no bridge among its ancestors, no state names it. Resolves with its port. */
+async function ownerServer(): Promise<number> {
+  const owner = createServer((req, res) => {
+    const url = new URL(req.url ?? '', 'http://x')
+    const send = (status: number, body: unknown) => {
+      res.writeHead(status, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(body))
+    }
+    const sessions = JSON.parse(readFileSync(sessionsFile, 'utf8')) as { id: string }[]
+    if (url.pathname === '/global/health') return send(200, { healthy: true })
+    if (url.pathname === '/event') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write(': connected\n\n')
+      return
+    }
+    if (url.pathname === '/session') return send(200, sessions)
+    const m = /^\/session\/([^/]+)$/.exec(url.pathname)
+    const s = m && sessions.find((x) => x.id === m[1])
+    return s ? send(200, s) : send(404, {})
+  })
+  servers.push(owner)
+  await new Promise<void>((resolve) => owner.listen(0, '127.0.0.1', resolve))
+  return (owner.address() as AddressInfo).port
+}
+
 beforeAll(async () => {
   for (const key of ENV_KEYS) saved[key] = process.env[key]
   root = mkdtempSync(path.join(tmpdir(), 'rc-leftover-picked-'))
@@ -177,6 +204,9 @@ process.on('SIGTERM', () => process.exit(0))
   chmodSync(path.join(bin, 'opencode'), 0o755)
   chmodSync(path.join(bin, 'lsof'), 0o755)
   process.env.PATH = `${bin}${path.delimiter}${saved.PATH ?? ''}`
+  // Every test registers twice from 127.0.0.1 (the dead share, then the start),
+  // more than one address may in a window.
+  ;(relayConfig as { registrationsPerWindow: number }).registrationsPerWindow = 100
   relay = await startServer(0)
   relayUrl = `http://127.0.0.1:${(relay.address() as AddressInfo).port}`
 })
@@ -197,6 +227,7 @@ afterAll(async () => {
   for (const pid of spawned().keys()) if (alive(pid)) process.kill(pid, 'SIGKILL')
   relay.closeAllConnections()
   await new Promise((resolve) => relay.close(resolve))
+  ;(relayConfig as { registrationsPerWindow: number }).registrationsPerWindow = savedRegistrationsPerWindow
   for (const key of ENV_KEYS) {
     if (saved[key] === undefined) delete process.env[key]
     else process.env[key] = saved[key]
@@ -262,28 +293,7 @@ test.skipIf(process.platform === 'win32')(
   'the owner\'s own server is still used, and the server a dead share left next to it is ended when that share is taken back',
   async () => {
     listSessions(['ses_owner_server'])
-    // The owner's own server, run by this process: no bridge among its ancestors, no state names it.
-    const owner = createServer((req, res) => {
-      const url = new URL(req.url ?? '', 'http://x')
-      const send = (status: number, body: unknown) => {
-        res.writeHead(status, { 'content-type': 'application/json' })
-        res.end(JSON.stringify(body))
-      }
-      const sessions = JSON.parse(readFileSync(sessionsFile, 'utf8')) as { id: string }[]
-      if (url.pathname === '/global/health') return send(200, { healthy: true })
-      if (url.pathname === '/event') {
-        res.writeHead(200, { 'content-type': 'text/event-stream' })
-        res.write(': connected\n\n')
-        return
-      }
-      if (url.pathname === '/session') return send(200, sessions)
-      const m = /^\/session\/([^/]+)$/.exec(url.pathname)
-      const s = m && sessions.find((x) => x.id === m[1])
-      return s ? send(200, s) : send(404, {})
-    })
-    servers.push(owner)
-    await new Promise<void>((resolve) => owner.listen(0, '127.0.0.1', resolve))
-    const ownerPort = (owner.address() as AddressInfo).port
+    const ownerPort = await ownerServer()
     const leftover = await leftoverServer()
     await deadShare('ses_owner_server', leftover.pid)
     // The owner's server is listed first, so detection attaches to it either way.
@@ -314,22 +324,38 @@ test.skipIf(process.platform === 'win32')(
  * by hand is the natural retry. The start SIGTERMed it, waited for it to exit,
  * then failed with "local opencode server unreachable" on the port it had just
  * emptied itself.
+ *
+ * Keeping the leftover whenever a server is named went too far the other way:
+ * a start naming the owner's OWN server dropped the dead share's state — the
+ * only record of the leftover — and left that unsecured `opencode serve`
+ * running for good, where the next detection took it for the owner's server.
+ * The leftover is kept only while it may be the named server: lsof lists it on
+ * that port, or does not list it at all (no lsof, nothing to decide from).
  */
 
-for (const [how, named] of [
-  ['--port', (port: number) => ({ port })],
-  ['a URL', (port: number) => ({ opencodeUrl: `http://127.0.0.1:${port}` })],
+const NAMED = {
+  '--port': (port: number) => ({ port }),
+  'a URL': (port: number) => ({ opencodeUrl: `http://127.0.0.1:${port}` }),
+}
+
+for (const [how, withId, listed] of [
+  ['--port', true, false],
+  ['a URL', true, false],
+  ['--port', true, true],
+  ['--port', false, true],
 ] as const) {
   test.skipIf(process.platform === 'win32')(
-    `a start with a session id and its server named by ${how} runs on the server a dead share of it left behind`,
+    `a start ${withId ? 'with' : 'without'} a session id and its server named by ${how} runs on the server a dead share of it left behind` +
+      (listed ? ', which lsof lists on that port' : ', which lsof does not list'),
     async () => {
-      const id = how === '--port' ? 'ses_named_port' : 'ses_named_url'
+      const id = `ses_named_${how === '--port' ? 'port' : 'url'}_${withId ? 'id' : 'picked'}_${listed ? 'listed' : 'unlisted'}`
       listSessions([id])
       const leftover = await leftoverServer()
       const earlier = await deadShare(id, leftover.pid)
+      if (listed) process.env.FAKE_LSOF_LINES = lsofLine(leftover.pid, leftover.port)
       vi.spyOn(console, 'warn').mockImplementation(() => {})
 
-      const handle = await startBridge(relayUrl, API_KEY, { sessionId: id, ...named(leftover.port) })
+      const handle = await startBridge(relayUrl, API_KEY, { ...(withId ? { sessionId: id } : {}), ...NAMED[how](leftover.port) })
       try {
         expect(handle.session_id).toBe(id)
         const state = loadSessionState(id)
@@ -341,6 +367,43 @@ for (const [how, named] of [
           leftoverAlive: true,
           recorded: undefined,
         })
+      } finally {
+        await handle.stop()
+      }
+    },
+    30_000,
+  )
+}
+
+for (const [how, withId] of [
+  ['--port', true],
+  ['a URL', true],
+  ['--port', false],
+] as const) {
+  test.skipIf(process.platform === 'win32')(
+    `a start ${withId ? 'with' : 'without'} a session id naming the owner's own server by ${how} ends the server a dead share left on another port`,
+    async () => {
+      const id = `ses_owner_named_${how === '--port' ? 'port' : 'url'}_${withId ? 'id' : 'picked'}`
+      listSessions([id])
+      const ownerPort = await ownerServer()
+      const leftover = await leftoverServer()
+      const earlier = await deadShare(id, leftover.pid)
+      process.env.FAKE_LSOF_LINES = `${lsofLine(process.pid, ownerPort)}\n${lsofLine(leftover.pid, leftover.port)}`
+      const serversBefore = spawned().size
+      vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+      const handle = await startBridge(relayUrl, API_KEY, { ...(withId ? { sessionId: id } : {}), ...NAMED[how](ownerPort) })
+      try {
+        expect(handle.session_id).toBe(id)
+        const state = loadSessionState(id)
+        expect(state?.bridge_token).not.toBe(earlier.bridge_token)
+        // Runs on the owner's server, which is never recorded as the share's...
+        expect({ recorded: state?.server_pid, spawnedAny: spawned().size !== serversBefore }).toEqual({
+          recorded: undefined,
+          spawnedAny: false,
+        })
+        // ...and the leftover, which no state names any more, is not left running.
+        expect(await until(() => !alive(leftover.pid), 5000)).toBe(true)
       } finally {
         await handle.stop()
       }
@@ -393,4 +456,35 @@ test('a listener is a recorded share\'s server when it, or a wrapper above it, i
   const inspect = vi.fn(noPs)
   expect(spawnedByRecordedShare(500, [states[1]!], inspect, inspect)).toBe(false)
   expect(inspect).not.toHaveBeenCalled()
+})
+
+test('a recorded server listens on a named port when a listener on it is that server or runs under it, and nobody can tell without its listener', async () => {
+  const listed = (...listeners: { pid: number; port: number }[]) => async () => listeners
+  const parents = (table: Record<number, number>) => (pid: number) =>
+    table[pid] === undefined ? null : { ppid: table[pid]!, command: 'x' }
+  const noParents = parents({})
+
+  // The server itself on the named port: it may be the named server, so it is kept.
+  expect(await serverListensOnPort(500, 4096, listed({ pid: 500, port: 4096 }), noParents)).toBe(true)
+  // The real binary under a recorded `opencode` wrapper, on the named port.
+  expect(await serverListensOnPort(500, 4096, listed({ pid: 501, port: 4096 }), parents({ 501: 500, 500: 1 }))).toBe(true)
+  // The server on another port, the owner's own on the named one: known not to be it.
+  expect(
+    await serverListensOnPort(500, 4096, listed({ pid: 700, port: 4096 }, { pid: 501, port: 38000 }), parents({ 700: 120, 120: 1, 501: 500, 500: 1 })),
+  ).toBe(false)
+  // No listener of the server's is listed (no lsof, or it is gone): undecidable.
+  expect(await serverListensOnPort(500, 4096, listed({ pid: 700, port: 4096 }), parents({ 700: 120, 120: 1 }))).toBeUndefined()
+  expect(await serverListensOnPort(500, 4096, listed(), noParents)).toBeUndefined()
+  expect(
+    await serverListensOnPort(500, 4096, async () => {
+      throw new Error('lsof unavailable')
+    }, noParents),
+  ).toBeUndefined()
+  // No port to compare with (a URL that names none this can read).
+  expect(await serverListensOnPort(500, undefined, listed({ pid: 500, port: 38000 }), noParents)).toBeUndefined()
+  // Without `ps` only the server's own listeners are recognised, and nothing throws.
+  const noPs = () => {
+    throw new Error('ps unavailable')
+  }
+  expect(await serverListensOnPort(500, 4096, listed({ pid: 501, port: 4096 }, { pid: 500, port: 38000 }), noPs)).toBe(false)
 })
