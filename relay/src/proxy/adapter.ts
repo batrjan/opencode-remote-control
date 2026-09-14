@@ -219,12 +219,23 @@ const PROXY_BODY_LIMIT = '25mb'
 const MAX_STREAMS_PER_SESSION = 64
 
 /**
- * Cap on the ancestry cache (see ancestryOk). Entries are never removed when
- * their share ends: they only become unreachable (the cache is keyed per
- * registration), so without a bound it grows for the life of the process. The
- * event filter reads its subagents from the same cache.
+ * Cap on the subagents one registration's ancestry cache remembers (see
+ * ancestryOk). The event filter reads its subagents from the same cache.
+ *
+ * Per registration, not one bound for the whole relay: a cache shared by every
+ * share let any registrant's bridge evict the rest. 10,050 session.created
+ * events naming its own share as parent pushed every other share's learned
+ * subagents out of a 10,000-entry set, and the live filter (which cannot walk a
+ * chain) then dropped a working subagent's permission and question prompts
+ * until the viewer reloaded. Now a bridge can only evict its own.
+ *
+ * Real shares need far fewer: only subagents still producing events must stay
+ * known, a request re-walks an evicted one, and each re-announcement moves an
+ * entry to the newest end. The total is this times the live shares, about
+ * 70 bytes an entry for an opencode-length id: some 35 MB at the default
+ * RELAY_MAX_SESSIONS, and only when every share's bridge announces this many.
  */
-const ANCESTRY_CACHE_MAX = 10_000
+const ANCESTRY_CACHE_MAX = 256
 
 /**
  * How many of the latest messages a bridge re-dial replays to open viewer
@@ -621,7 +632,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   // child and a nested grandchild read correctly instead of showing the parent
   // transcript under their title.
   //
-  // Keyed per REGISTRATION (see registrationOf), never per session id. The
+  // Keyed per REGISTRATION (see below), never per session id. The
   // cache holds what one bridge claimed, and a claim is only as good as that
   // bridge: an id is not a secret, and one registered without an owner_key (or
   // whose reservation lapsed) goes to whoever registers it first. Keyed on the
@@ -633,48 +644,38 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   // the owner's own bridge. A new registration starts with nothing proven, so
   // what one bridge reports can never widen what another share's viewers see
   // — not another id's, and not a later share of the same id.
-  const ancestryOk = new Set<string>()
+  //
+  // The store builds a new Session record for every registration
+  // (createSession, including an owner's replacement of its own) and drops it
+  // when the share ends (deleteSession, reapOrphans), so the record's identity
+  // is the registration. Keyed weakly on it, an ended registration's set goes
+  // with its record. A record rebuilt for the same registration (a restore)
+  // only starts an empty set, which costs a re-walk and never grants anything.
+  //
+  // One bounded set PER registration, not one bound over all of them: a bridge
+  // filling its own set evicts only its own entries (see ANCESTRY_CACHE_MAX).
+  const ancestryOk = new WeakMap<Session, Set<string>>()
 
   /**
-   * A number unique to one registration of a session id, for the ancestry
-   * cache keys. The store builds a new Session record for every registration
-   * (createSession, including an owner's replacement of its own) and drops it
-   * when the share ends (deleteSession, reapOrphans), so the record's identity
-   * is the registration. Keyed weakly: a number is never reused, and an ended
-   * registration's record is not kept alive by it. A record rebuilt for the
-   * same registration (a restore) would only get a fresh number, which costs
-   * a re-walk and never grants anything.
+   * Remember a verified ancestry in one registration's set, evicting that set's
+   * oldest entry when full (a Set iterates in insertion order, so the first id
+   * is the oldest). Losing a positive is harmless for requests: the next one
+   * simply walks the parent chain again and re-caches it. The cache is an
+   * optimisation, never the authority on what a viewer may read. An id seen
+   * again moves to the newest end, so a subagent that keeps working is not the
+   * one evicted.
    */
-  const registrations = new WeakMap<Session, number>()
-  let nextRegistration = 0
-  function registrationOf(session: Session): number {
-    let n = registrations.get(session)
-    if (n === undefined) {
-      n = nextRegistration++
-      registrations.set(session, n)
-    }
-    return n
-  }
-
-  /**
-   * Remember a verified ancestry, evicting the oldest entry when full (a Set
-   * iterates in insertion order, so the first key is the oldest). Losing a
-   * positive is harmless for requests: the next one simply walks the parent
-   * chain again and re-caches it. The cache is an optimisation, never the
-   * authority on what a viewer may read. A key seen again moves to the newest
-   * end, so a subagent that keeps working is not the one evicted.
-   */
-  function rememberAncestry(key: string): void {
-    if (ancestryOk.delete(key)) {
-      ancestryOk.add(key)
+  function rememberAncestry(known: Set<string>, id: string): void {
+    if (known.delete(id)) {
+      known.add(id)
       return
     }
-    while (ancestryOk.size >= ANCESTRY_CACHE_MAX) {
-      const oldest = ancestryOk.values().next().value
+    while (known.size >= ANCESTRY_CACHE_MAX) {
+      const oldest = known.values().next().value
       if (oldest === undefined) break
-      ancestryOk.delete(oldest)
+      known.delete(oldest)
     }
-    ancestryOk.add(key)
+    known.add(id)
   }
 
   /**
@@ -685,10 +686,11 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
    * this registration's: see ancestryOk.
    */
   function subagentsOf(session: Session): SubagentIndex {
-    const registration = registrationOf(session)
+    let known = ancestryOk.get(session)
+    if (!known) ancestryOk.set(session, (known = new Set()))
     return {
-      has: (id) => ancestryOk.has(`${registration}\u0000${id}`),
-      add: (id) => rememberAncestry(`${registration}\u0000${id}`),
+      has: (id) => known.has(id),
+      add: (id) => rememberAncestry(known, id),
     }
   }
 
