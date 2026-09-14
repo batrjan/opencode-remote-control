@@ -69,6 +69,38 @@ export function runsTui(argv = process.argv.slice(2), env = process.env) {
   return !argv.some((arg) => NON_TUI_SUBCOMMANDS.has(arg))
 }
 
+/**
+ * Whether this process is `opencode run`, whose terminal never shows the
+ * command's message. Its event loop prints only finished text parts
+ * (`time.end`) — the model's reply — and the user message carrying the output
+ * has none, so `opencode run --command remote-control/stop` printed just the
+ * model's "OK", whether the share ended, there was nothing to stop, or the stop
+ * failed. The first subcommand word decides. With `--attach` the command runs
+ * in the attached server, never in this process, so nothing is printed here.
+ */
+export function runPrintsReplyOnly(argv = process.argv.slice(2), env = process.env) {
+  const client = env.OPENCODE_CLIENT
+  if (client && client !== "cli") return false
+  return argv.find((arg) => NON_TUI_SUBCOMMANDS.has(arg)) === "run"
+}
+
+/**
+ * Put the command's output on the terminal of an `opencode run`. stderr, not
+ * stdout: stdout carries the model's reply, or the event stream a
+ * `--format json` consumer parses line by line, and stderr is where `run`
+ * prints its own lines (`> build · model`). The terminal UI (whose screen this
+ * would scribble over) and servers (whose clients show the message; their
+ * stderr is a service log) get nothing.
+ */
+export function showInRunTerminal(text) {
+  if (!runPrintsReplyOnly()) return
+  try {
+    process.stderr.write(`${text}\n`)
+  } catch {
+    // Best effort: a closed stderr must not cost the session its message.
+  }
+}
+
 /** Config files the TUI plugin loader reads, most specific last. */
 function tuiConfigPaths(directory, env) {
   const configDir = env.OPENCODE_CONFIG_DIR || path.join(env.HOME || homedir(), ".config", "opencode")
@@ -110,8 +142,15 @@ export const id = "remote-control"
  * spawn the real bridge or touch the relay. `parentOf` resolves a session's
  * parent (see sharedSessionOf), so stop and status typed in a subagent session
  * reach the share it belongs to; without it they act on the typed session only.
+ * `show` gets the output as well, for a client that never displays the message
+ * (see showInRunTerminal).
  */
-export function createHooks(run = runAction, registerCommands = defaultRegisterCommands, parentOf = undefined) {
+export function createHooks(
+  run = runAction,
+  registerCommands = defaultRegisterCommands,
+  parentOf = undefined,
+  show = showInRunTerminal,
+) {
   return {
     // Register the commands so they appear in the `/` menu of every client
     // that has no TUI plugin support (desktop GUI, web UI).
@@ -148,6 +187,10 @@ export function createHooks(run = runAction, registerCommands = defaultRegisterC
       output.parts.length = 0
       output.parts.push({ type: "text", text })
       output.parts.push({ type: "text", text: RELAY_INSTRUCTION, synthetic: true })
+      // `opencode run` prints only the model's reply — the "OK" asked for above —
+      // so the owner would otherwise never learn whether a stop ended anything
+      // or what URL and code a start produced.
+      show(text)
     },
   }
 }

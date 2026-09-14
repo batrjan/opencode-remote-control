@@ -159,7 +159,10 @@ or `opencode run`, which starts a new session every time) they end nothing and
 name the sessions shared from this machine instead; type the command in that
 session, or from a terminal run
 `opencode run --session <id> --command remote-control/stop` (or
-`--command remote-control/status`).
+`opencode run --session <id> --command remote-control/status`). The result —
+the share ended, nothing to stop in that session, or why the stop failed — is
+printed on stderr; the `OK` after it is only the model acknowledging the turn
+and looks the same whatever happened.
 
 The bridge also stops on its own when OpenCode quits (watchdog) or on SIGINT/SIGTERM;
 every stop path deletes the relay session, revokes the code, terminates the bridge
@@ -197,7 +200,10 @@ and `/remote-control/status`, running the bridge directly — no LLM prompt, ins
 In the desktop GUI, the web UI and `opencode run` the same four commands come from
 the server entry (`plugin/server.js`): it registers them through the `config` hook
 and runs the action itself in `command.execute.before`, so the share is started by
-the plugin and the model only relays the resulting URL and code.
+the plugin. Its output — the URL and code, or what stop and status found — is the
+command's message, and the model only acknowledges it with `OK`. `opencode run`
+prints a turn's reply but never that message, so there the plugin also writes the
+output to stderr (stdout stays the reply, or the events of `--format json`).
 `opencode run` reaches that hook only through `--command`
 (`opencode run --command remote-control/start`): a message such as
 `/remote-control/stop` is sent to the model as an ordinary prompt, runs

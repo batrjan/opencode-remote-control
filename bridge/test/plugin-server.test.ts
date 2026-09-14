@@ -3,6 +3,7 @@ import { expect, test } from 'vitest'
 import serverPlugin, {
   createHooks,
   defaultRegisterCommands,
+  runPrintsReplyOnly,
   runsTui,
   server,
   tuiEntryRegistered,
@@ -141,6 +142,30 @@ test('runsTui rejects clients that never render a TUI', () => {
   }
   expect(runsTui([], { OPENCODE_CLIENT: 'desktop' })).toBe(false)
   expect(runsTui([], { OPENCODE_CLIENT: 'acp' })).toBe(false)
+})
+
+/**
+ * `opencode run` prints only the model's reply, so the output of a command run
+ * there is written to stderr as well (plugin-run-command-output.test.ts). Only
+ * `run` qualifies: a TUI would get its screen scribbled over, a server's
+ * clients already show the message.
+ */
+test('runPrintsReplyOnly recognises `opencode run` and nothing else', () => {
+  expect(runPrintsReplyOnly(['run', '--command', 'remote-control/stop'], {})).toBe(true)
+  expect(runPrintsReplyOnly(['--print-logs', 'run', 'hello'], { OPENCODE_CLIENT: 'cli' })).toBe(true)
+  for (const argv of [[], ['/path/to/project'], ['serve'], ['web'], ['acp'], ['attach', 'url'], ['session', 'run']]) {
+    expect(runPrintsReplyOnly(argv, {}), argv.join(' ')).toBe(false)
+  }
+  expect(runPrintsReplyOnly(['run', 'hello'], { OPENCODE_CLIENT: 'desktop' })).toBe(false)
+})
+
+test('command.execute.before hands the output to the terminal hook as well', async () => {
+  const shown: string[] = []
+  const hooks = createHooks(async () => 'nothing to stop', () => true, undefined, (text: string) => shown.push(text))
+  const output = { parts: [] as Array<Record<string, unknown>> }
+  await hooks['command.execute.before']({ command: 'remote-control/stop', sessionID: 'ses_x' }, output)
+  expect(shown).toEqual(['nothing to stop'])
+  expect(output.parts.filter((p) => !p.synthetic)).toEqual([{ type: 'text', text: 'nothing to stop' }])
 })
 
 test('tuiEntryRegistered finds the plugin in a tui.json', async () => {
