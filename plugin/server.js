@@ -271,8 +271,30 @@ function tuiConfigPaths(directory, env) {
 }
 
 /**
+ * Fill in {env:NAME} and {file:path} as opencode does in the raw text of a
+ * tui.json before parsing it, so an entry named through either counts. A
+ * variable goes in as it is, unset as ""; a file's trimmed text is escaped into
+ * the JSON string it stands in, a relative path starting at the tui.json's
+ * folder, one that cannot be read giving "".
+ */
+function substituteVariables(text, file, env) {
+  return text
+    .replace(/\{env:([^}]+)\}/g, (_, name) => env[name] || "")
+    .replace(/\{file:[^}]+\}/g, (match) => {
+      let target = match.slice("{file:".length, -1)
+      if (target.startsWith("~/")) target = path.join(env.HOME || homedir(), target.slice(2))
+      try {
+        return JSON.stringify(readFileSync(path.resolve(path.dirname(file), target), "utf8").trim()).slice(1, -1)
+      } catch {
+        return ""
+      }
+    })
+}
+
+/**
  * Parse a config file as opencode does: JSON with comments and trailing commas.
- * Anything else malformed throws, and opencode skips such a file too.
+ * Anything else malformed throws, and opencode skips such a file too; so does
+ * a file that parses but fails the schema (see validTuiConfig).
  */
 function parseJsonc(text) {
   const json = text
@@ -290,17 +312,91 @@ function parseJsonc(text) {
   return JSON.parse(json)
 }
 
+// The schema TuiConfig of opencode 1.18.30 checks a tui.json against. A setting
+// it knows with a value of the wrong type makes it skip the whole file ("skipping
+// invalid tui config"), plugin list included; fields it does not know are
+// ignored, here as there. Read from the binary; a sample (a tuple of three, a
+// null theme, an array for cursor, volume 2, a number as a known key binding)
+// was tried on it and skipped as expected.
+const isObject = (v) => !!v && typeof v === "object" && !Array.isArray(v)
+const isString = (v) => typeof v === "string"
+const isBoolean = (v) => typeof v === "boolean"
+const isPositiveInt = (v) => Number.isInteger(v) && v > 0
+const optional = (check) => (v) => v === undefined || check(v)
+const oneOf = (...values) => (v) => values.includes(v)
+const arrayOf = (check) => (v) => Array.isArray(v) && v.every(check)
+const recordOf = (check) => (v) => isObject(v) && Object.values(v).every(check)
+/** An object whose listed fields pass their checks. */
+const struct = (fields) => (v) => isObject(v) && Object.entries(fields).every(([key, check]) => check(v[key]))
+/** The same optional check for each of `keys`. */
+const each = (keys, check) => Object.fromEntries(keys.map((key) => [key, optional(check)]))
+
+const keyStroke = struct({ name: isString, ...each(["ctrl", "shift", "meta", "super", "hyper"], isBoolean) })
+const keyBinding = struct({
+  key: (key) => isString(key) || keyStroke(key),
+  event: optional(oneOf("press", "release")),
+  ...each(["preventDefault", "fallthrough"], isBoolean),
+})
+const binding = (v) => isString(v) || keyStroke(v) || keyBinding(v)
+const validTuiInfo = struct({
+  ...each(["$schema", "theme"], isString),
+  // opencode first drops the names it has no action for, and only its own list
+  // of names tells those apart, so every value is checked here. A wrong value
+  // under an unknown name then leaves the commands to the server entry (a model
+  // turn), rather than a wrong one under a known name leaving none at all.
+  keybinds: optional(recordOf((v) => v === false || binding(v) || arrayOf(binding)(v))),
+  // An entry with options is exactly [spec, options object].
+  plugin: optional(
+    arrayOf((v) => isString(v) || (Array.isArray(v) && v.length === 2 && isString(v[0]) && isObject(v[1]))),
+  ),
+  plugin_enabled: optional(recordOf(isBoolean)),
+  leader_timeout: optional(isPositiveInt),
+  attention: optional(
+    struct({
+      ...each(["enabled", "notifications", "sound"], isBoolean),
+      volume: optional((v) => typeof v === "number" && v >= 0 && v <= 1),
+      sound_pack: optional(isString),
+      sounds: optional(struct(each(["default", "question", "permission", "error", "done", "subagent_done"], isString))),
+    }),
+  ),
+  prompt: optional(
+    struct({ max_height: optional(isPositiveInt), max_width: optional((v) => v === "auto" || isPositiveInt(v)) }),
+  ),
+  scroll_speed: optional((v) => typeof v === "number" && v >= 0.001),
+  scroll_acceleration: optional(struct({ enabled: isBoolean })),
+  diff_style: optional(oneOf("auto", "stacked")),
+  cursor: optional(
+    struct({ style: optional(oneOf("block", "underline", "line", "default")), blinking: optional(isBoolean) }),
+  ),
+  mouse: optional(isBoolean),
+})
+
+/**
+ * The settings of a parsed tui.json as opencode takes them, or undefined when
+ * it skips the file. The settings of a "tui" object are lifted to the top level
+ * first (a top-level one wins; a "tui" that is no object is dropped), so its
+ * plugin list counts as well.
+ */
+function validTuiConfig(config) {
+  if (!isObject(config)) return undefined
+  const { tui, ...rest } = config
+  const settings = isObject(tui) ? { ...tui, ...rest } : rest
+  return validTuiInfo(settings) ? settings : undefined
+}
+
 /** Whether the TUI entry of THIS plugin is registered in a tui.json. */
 export function tuiEntryRegistered(directory = process.cwd(), env = process.env) {
   for (const file of tuiConfigPaths(directory, env)) {
     let entries
     try {
-      entries = parseJsonc(readFileSync(file, "utf8")).plugin
+      entries = validTuiConfig(parseJsonc(substituteVariables(readFileSync(file, "utf8"), file, env)))?.plugin
     } catch {
       // Missing, unreadable or malformed: opencode loads nothing from it either.
       // A match on the raw text used to count an entry that was commented out,
       // and the server entry stepped aside for a TUI entry that never loaded,
-      // leaving the terminal UI with no /remote-control command at all.
+      // leaving the terminal UI with no /remote-control command at all. A file
+      // the schema rejects (`"scroll_speed": "fast"` beside the entry) did the
+      // same, and an entry named through {env:…}, or under "tui", was missed.
       continue
     }
     if (Array.isArray(entries) && entries.some((e) => /remote-control/.test(String(Array.isArray(e) ? e[0] : e)))) {

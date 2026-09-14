@@ -209,10 +209,14 @@ when it finds the TUI entry in a file the terminal UI reads: `tui.json` or
 `tui.jsonc` in `$XDG_CONFIG_HOME/opencode` (`~/.config/opencode`),
 `$OPENCODE_CONFIG_DIR`, `~/.opencode`, the project directory and each of its
 parents (and their `.opencode/`, unless `OPENCODE_DISABLE_PROJECT_CONFIG` is
-set), or `$OPENCODE_TUI_CONFIG`. An entry commented out there does not count. An
-entry switched off with `plugin_enabled` (or in the terminal UI's plugin list)
-still does, so that terminal has no `/remote-control` command until the plugin is
-switched back on.
+set), or `$OPENCODE_TUI_CONFIG`. An entry commented out there does not count,
+nor does one in a file the terminal UI skips as invalid: a setting of the wrong
+type, such as `"scroll_speed": "fast"`, drops the whole file, its plugins
+included (`skipping invalid tui config` in opencode's log). An entry written
+with `{env:…}` or `{file:…}`, or listed under `"tui"`, counts, as it does for
+opencode. An entry switched off with `plugin_enabled` (or in the terminal UI's
+plugin list) still does, so that terminal has no `/remote-control` command until
+the plugin is switched back on.
 
 `opencode attach <url>` is a terminal UI too, but its server is a separate
 process, and one that has the server entry (an `opencode serve` with it in

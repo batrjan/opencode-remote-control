@@ -21,7 +21,9 @@ import { tuiEntryRegistered } from '../../plugin/server.js'
  * - ~/.opencode/tui.json(c);
  * - $OPENCODE_CONFIG_DIR/tui.json(c), in addition to the global folder;
  *
- * each parsed as JSONC with trailing commas allowed, a malformed file skipped.
+ * each with {env:NAME} and {file:path} filled in, then parsed as JSONC with
+ * trailing commas allowed; a malformed file, or one its schema rejects, is
+ * skipped whole.
  *
  * The plugin read ~/.config/opencode (or OPENCODE_CONFIG_DIR instead of it),
  * <cwd>/.opencode and OPENCODE_TUI_CONFIG, and matched "remote-control" in the
@@ -161,5 +163,122 @@ test('a tui.json that starts with a UTF-8 byte order mark is read as opencode re
 
   // The mark does not make a commented-out entry count.
   write(path.join(project, '.opencode', 'tui.jsonc'), `${BOM}{\n  // "plugin": ["${SPEC}"],\n  "plugin": []\n}\n`)
+  expect(tuiEntryRegistered(project, { HOME: home })).toBe(false)
+})
+
+test('a tui.json that fails the terminal UI schema does not count', () => {
+  // TuiConfig of opencode 1.18.30 checks each file against its schema, after
+  // lifting the settings of a "tui" object to the top level. A setting it knows
+  // with a value of the wrong type makes it skip the whole file ("skipping
+  // invalid tui config"), plugin list included. The plugin looked at the plugin
+  // list alone: on the real binary `{ "plugin": [<TUI entry>], "scroll_speed":
+  // "fast" }` left the server entry stepping aside for a TUI entry opencode
+  // never loaded, and the terminal UI had no /remote-control command at all.
+  const { home, project, write } = tree()
+  const file = path.join(home, '.config', 'opencode', 'tui.json')
+  const env = { HOME: home }
+  const registered = (config: object) => {
+    write(file, JSON.stringify(config))
+    return tuiEntryRegistered(project, env)
+  }
+
+  for (const setting of [
+    { scroll_speed: 'fast' },
+    { scroll_speed: 0 },
+    { theme: null },
+    { mouse: 'off' },
+    { diff_style: 'side-by-side' },
+    { leader_timeout: 1.5 },
+    { plugin_enabled: { other: 'yes' } },
+    { scroll_acceleration: {} },
+    { cursor: [] },
+    { cursor: { style: 'bar' } },
+    { attention: { volume: 2 } },
+    { attention: { sounds: { done: 1 } } },
+    { prompt: { max_width: 'wide' } },
+    { keybinds: { leader: 5 } },
+    { keybinds: { app_exit: [true] } },
+    { keybinds: { app_exit: { ctrl: true } } },
+    { tui: { scroll_speed: 'fast' } },
+  ]) {
+    expect(registered({ plugin: [SPEC], ...setting }), JSON.stringify(setting)).toBe(false)
+  }
+  // An entry with options is exactly [spec, object]; anything else fails too.
+  for (const entry of [[SPEC], [SPEC, {}, 1], [SPEC, []]]) {
+    expect(registered({ plugin: [entry] }), JSON.stringify(entry)).toBe(false)
+  }
+  expect(registered({ plugin: [SPEC, 5] })).toBe(false)
+
+  // Valid settings keep the entry, and so do settings opencode does not know.
+  expect(
+    registered({
+      $schema: 'https://opencode.ai/tui.json',
+      plugin: [[SPEC, { any: 'options' }], 'some-other-plugin'],
+      plugin_enabled: { 'some-other-plugin': false },
+      theme: 'dark',
+      mouse: false,
+      diff_style: 'stacked',
+      leader_timeout: 500,
+      scroll_speed: 0.5,
+      scroll_acceleration: { enabled: true },
+      cursor: { style: 'line', blinking: false },
+      attention: { enabled: true, volume: 0.4, sound_pack: 'x', sounds: { done: './done.wav' }, other: 1 },
+      prompt: { max_height: 10, max_width: 'auto' },
+      keybinds: {
+        leader: 'ctrl+x',
+        app_exit: false,
+        app_debug: 'none',
+        command_list: ['ctrl+p', { name: 'k', ctrl: true }, { key: { name: 'p', meta: true }, event: 'press' }],
+      },
+      some_future_setting: { anything: true },
+    }),
+  ).toBe(true)
+  // A top-level setting wins over the same one under "tui", and a "tui" that
+  // is not an object is dropped.
+  expect(registered({ plugin: [SPEC], scroll_speed: 1, tui: { scroll_speed: 'fast' } })).toBe(true)
+  expect(registered({ plugin: [SPEC], tui: 'compact' })).toBe(true)
+})
+
+test('a plugin list under "tui" counts, as opencode lifts it to the top level', () => {
+  // On the real binary `{ "tui": { "plugin": [<TUI entry>] } }` loads the TUI
+  // entry, while the plugin saw no top-level list: the server entry registered
+  // its commands beside it and `/remote-control` ran a model turn.
+  const { home, project, write } = tree()
+  const file = path.join(home, '.config', 'opencode', 'tui.json')
+  write(file, JSON.stringify({ tui: { plugin: [SPEC] } }))
+  expect(tuiEntryRegistered(project, { HOME: home })).toBe(true)
+  write(file, JSON.stringify({ plugin: [], tui: { plugin: [SPEC] } }))
+  expect(tuiEntryRegistered(project, { HOME: home })).toBe(false)
+})
+
+test('{env:NAME} and {file:path} in a tui.json are filled in before it is read', () => {
+  // opencode substitutes both in the raw text of the file before parsing it.
+  // On the real binary `{ "plugin": ["{env:RC_TUI_SPEC}"] }` loads the TUI
+  // entry the variable names, while the plugin saw a spec without
+  // "remote-control" in it: the server entry registered its commands beside the
+  // TUI entry and `/remote-control` ran a model turn instead of the picker.
+  const { home, project, write } = tree()
+  const folder = path.join(home, '.config', 'opencode')
+  const file = path.join(folder, 'tui.json')
+
+  write(file, '{ "plugin": ["{env:RC_TUI_SPEC}"] }')
+  expect(tuiEntryRegistered(project, { HOME: home, RC_TUI_SPEC: SPEC })).toBe(true)
+  // A variable that is not set becomes "".
+  expect(tuiEntryRegistered(project, { HOME: home })).toBe(false)
+  // The value goes in as it is, not as a JSON string, so it can be a number.
+  write(file, `{ "plugin": ["${SPEC}"], "scroll_speed": {env:RC_SPEED} }`)
+  expect(tuiEntryRegistered(project, { HOME: home, RC_SPEED: '2' })).toBe(true)
+  expect(tuiEntryRegistered(project, { HOME: home, RC_SPEED: '"fast"' })).toBe(false)
+
+  // {file:path}: the file's text, trimmed and escaped into the JSON string; a
+  // relative path starts at the tui.json's folder, ~/ at the home folder.
+  write(path.join(folder, 'rc-spec.txt'), `  ${SPEC}"\n`)
+  write(file, '{ "plugin": ["{file:./rc-spec.txt}"] }')
+  expect(tuiEntryRegistered(project, { HOME: home })).toBe(true)
+  write(path.join(home, 'specs', 'rc.txt'), SPEC)
+  write(file, '{ "plugin": ["{file:~/specs/rc.txt}"] }')
+  expect(tuiEntryRegistered(project, { HOME: home })).toBe(true)
+  // A file that cannot be read becomes "".
+  write(file, '{ "plugin": ["{file:./missing-spec.txt}"] }')
   expect(tuiEntryRegistered(project, { HOME: home })).toBe(false)
 })
