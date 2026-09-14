@@ -54,10 +54,11 @@ test('deleteSession reports whether the session existed', () => {
 })
 
 /**
- * Memory-safety caps: codeFails / blockedCodes / ipAttempts must not grow
+ * Memory-safety caps: codeFails / blockedCodes / sessionFails must not grow
  * without bound. A small cap (constructor arg) keeps the eviction tests fast;
  * production uses config.maxTrackingEntries (100k). Eviction is FIFO
- * (insertion order) — acceptable because per-IP limits bound refill speed.
+ * (insertion order) — acceptable because every eviction costs at least one
+ * fresh wrong attempt, so forgetting one record takes up to the cap's worth.
  * Attempt keys are session-scoped ('sessX:CODE'), so each loop below uses a
  * distinct session id to keep keys distinct under the new binding.
  */
@@ -116,11 +117,11 @@ test('per-session brute-force lockout: many failed codes against one session loc
   const store = new Store()
   const { access_code } = store.createSession('sessB', '/path', 'title', 'test-ip')
   // Failed attempts against sessB until the per-session counter reaches the
-  // lock threshold (one attempt below may not register depending on ordering).
-  for (let i = 0; i < 21; i++) {
-    expect(() => store.activate(`WRONG${i}`.slice(0, 6).padEnd(6, 'X'), 'sessB', `ip_bf_${i}`)).toThrow()
+  // lock threshold.
+  for (let i = 0; i < config.sessionFailLockThreshold; i++) {
+    expect(() => store.activate(`WRONG${i}`.slice(0, 6).padEnd(6, 'X'), 'sessB')).toThrow('invalid code')
   }
-  // The 21st attempt — even with the CORRECT code — is rate limited.
+  // The next attempt — even with the CORRECT code — is rate limited.
   expect(() => store.activate(access_code, 'sessB')).toThrow('rate limited')
 })
 

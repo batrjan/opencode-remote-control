@@ -61,7 +61,7 @@ What the vhost adds beyond TLS termination:
 | Directive | Why |
 | --------- | --- |
 | `client_max_body_size 32m` (server), `64k` on `/api/activate` and `/api/sessions` | nginx's 1 MB default capped a viewer's prompt long before the relay's own 25 MB limit; the public endpoints are cut the other way, since a registration is a few hundred bytes. |
-| `limit_req zone=oc_activate` (20 r/m), `oc_register` (60 r/m), `oc_general` (50 r/s, burst 200) | A code-guessing flood is stopped at the edge instead of costing the relay a hash and a one-second timer per attempt. The relay's own limiter is still the security control; this is the shield in front of it. |
+| `limit_req zone=oc_activate` (120 r/m, burst 40), `oc_register` (60 r/m, burst 10), `oc_general` (200 r/s, burst 400) | A code-guessing flood is stopped at the edge instead of costing the relay a hash and a one-second timer per attempt. The relay's per-share lock (five wrong codes in a row, from any address) is still the security control; this is the shield in front of it, and the only per-address limit on activation. |
 | `limit_conn oc_conn 256` | One client cannot park thousands of SSE sockets. |
 | No limits on `location = /bridge` | One long-lived socket per share; throttling a reconnect storm would keep shares down rather than protect anything. |
 
@@ -120,13 +120,17 @@ is faster with `UI_SOURCE=prebuilt`.
 
 ## Client IP behind nginx (`RELAY_TRUST_PROXY`)
 
-Every per-IP limit (the activation brute-force brake, the registration caps)
-keys on the client address express derives from `X-Forwarded-For`, so the
-relay must trust exactly the hop nginx uses. In Docker that hop is the bridge
-gateway (`172.18.0.1`), **not** loopback — with the old hard-coded `loopback`
-the header was ignored and every client collapsed into one address: five
-wrong codes from anyone locked activation for everyone, and the whole service
-shared a single IP's five-session cap. Compose therefore sets
+The registration caps (12 registrations an hour and 5 active shares per
+address) key on the client address express derives from `X-Forwarded-For`, and
+so does the address in every `[activate]` log line, so the relay must trust
+exactly the hop nginx uses. Activation itself is not limited per address — its
+brake is the per-share lock, which counts wrong codes from every address alike
+— so this setting does not decide who can join. In Docker that hop is the
+bridge gateway (`172.18.0.1`), **not** loopback — with the old hard-coded
+`loopback` the header was ignored and every client collapsed into one address:
+the whole service shared a single IP's registration budget and five-share cap
+(and, back when activation still had a per-address limit, five wrong codes
+from anyone locked activation for everyone). Compose therefore sets
 `RELAY_TRUST_PROXY=loopback, uniquelocal`. The port is published on
 `127.0.0.1` only, so a private-range peer can only be the host's nginx, and
 nginx must append the real address (`proxy_set_header X-Forwarded-For

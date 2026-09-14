@@ -7,7 +7,12 @@ import { setViewerCookie } from './viewerCookie.js'
 /**
  * POST /api/activate — exchange an access code for a viewer token, issued as
  * the HttpOnly viewer cookie only; the body is `{ session_id }`.
- * Same error body for unknown/blocked codes; 429 only on per-IP limits.
+ * Outside a lockout every wrong code gets the same 400 'invalid code'
+ * (unknown, blocked, or bound to another session). 429 'rate limited' comes
+ * from the share, never from the caller's address: its failure lock, which
+ * refuses every code, the correct one included, or — for a correct code — its
+ * per-window cap on minted tokens. 429 'session full' means the code was right
+ * but every viewer seat is occupied.
  * Failed attempts are delayed (activateFailDelayMs, 1s by default) as a
  * brute-force brake; the delay is disabled in tests via the env flag.
  */

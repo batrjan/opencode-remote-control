@@ -70,8 +70,9 @@ export const config = {
   proxyTimeoutMs: 30_000,
   /**
    * Max entries in the in-memory tracking maps (codeFails, blockedCodes,
-   * ipAttempts). When a map is full the oldest entry is evicted (FIFO) so
-   * memory stays bounded under brute-force traffic.
+   * sessionFails, sessionActivations, registrations, claims). When a map is
+   * full the oldest entry is evicted (FIFO) so memory stays bounded under
+   * brute-force or registration floods.
    */
   maxTrackingEntries: 100_000,
   /**
@@ -131,7 +132,7 @@ export const config = {
   /**
    * Successful activations one SESSION may accept per window.
    *
-   * Separate from the per-address limit on wrong codes: this one bounds how
+   * Separate from the per-session lock on wrong codes: this one bounds how
    * fast viewer tokens can be minted at all, by anyone, including someone
    * holding a perfectly valid code. Sized well above a real team — the viewer
    * cap is 32, so this is every seat filled twice over inside ten minutes —
@@ -257,11 +258,12 @@ export function relayApiKey(): string {
 /**
  * Express `trust proxy`: which peers' X-Forwarded-For to believe.
  *
- * Every per-IP limit (activation brute-force brake, registration caps) keys
+ * The registration caps (registrationsPerWindow, maxActiveSessionsPerIp) key
  * on req.ip, so this must match the deployment exactly. Too narrow and every
- * client collapses into the proxy's own address: one attacker's five wrong
- * codes lock activation for EVERYONE, and the whole service shares a single
- * IP's session cap. Too wide and a client spoofs its way past the limits.
+ * client collapses into the proxy's own address: the whole service shares a
+ * single IP's registration budget and session cap. Too wide and a client
+ * spoofs its way past the caps. Activation does not key on it (see the NOTE
+ * above codeFailBlockThreshold); there req.ip only labels the log line.
  *
  * The default `loopback` fits nginx on the same host in front of a bare
  * `npm start`. Inside Docker the proxy reaches the container from the bridge

@@ -37,12 +37,12 @@ services:
       # plaintext and codes are not persisted (install.sh / the deploy generate
       # the key automatically).
       RELAY_STATE_KEY: "${RELAY_STATE_KEY:-}"
-      # Which proxy hop to believe for X-Forwarded-For. The per-IP limits key on
-      # the CLIENT address; inside Docker the peer is the bridge gateway
-      # (172.x), not loopback, so a bare 'loopback' collapsed every client into
-      # one address and made the brute-force/registration limits global. The
-      # port is published on 127.0.0.1 only, so the private-range peer can only
-      # be the host's own nginx.
+      # Which proxy hop to believe for X-Forwarded-For. The registration caps
+      # key on the CLIENT address (activation is not limited per address);
+      # inside Docker the peer is the bridge gateway (172.x), not loopback, so
+      # a bare 'loopback' collapsed every client into one address and made the
+      # registration caps global. The port is published on 127.0.0.1 only, so
+      # the private-range peer can only be the host's own nginx.
       RELAY_TRUST_PROXY: "${RELAY_TRUST_PROXY:-loopback, uniquelocal}"
     volumes:
       - relay-state:/data

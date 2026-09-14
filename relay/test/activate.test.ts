@@ -85,8 +85,9 @@ test('POST /api/activate normalizes code case', async () => {
 test('POST /api/activate rejects bad codes with a single error shape', async () => {
   const store = new Store()
   const app = createApp(store)
-  // Same IP hits IP limit quickly; use distinct IPs to prove uniform shape for
-  // unknown codes. Blocked-codes path is exercised in store unit tests.
+  // One unknown code, ten times: the first tries are evaluated and fail, the
+  // rest take the blocked-code path, and both must answer with the same kind
+  // of error body. The blocked-code path is exercised in store unit tests.
   for (let i = 0; i < 10; i++) {
     const res = await request(app).post('/api/activate').send({ code: 'BADC0D', session_id: 'sessX' })
     expect(res.status).toBeLessThan(500)

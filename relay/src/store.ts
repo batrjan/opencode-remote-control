@@ -292,24 +292,18 @@ export class Store {
   /**
    * Exchange an access code for a viewer token, bound to a specific session.
    * The code alone is NOT enough: callers must name the session (taken from
-   * the viewer URL path). Throws 'rate limited' or 'invalid code' (single
-   * error shape for missing/blocked codes and wrong sessions, per spec).
+   * the viewer URL path). Throws 'rate limited', 'session full' or 'invalid
+   * code' (single error shape for missing/blocked codes and wrong sessions,
+   * per spec). Nothing here knows the caller's address.
    */
   activate(code: string, session_id: string) {
-    // NOTE the order: the per-IP budget is checked on the FAILURE paths below,
-    // not here. Gating the whole call on it refused a CORRECT code from an
-    // address that had recently failed — and because this keys on the client
-    // address, "the address" is a whole office behind one NAT: one colleague
-    // mistyping five times locked out everyone else holding a good code. A
-    // caller who presents the right code is not grinding, so nothing about
-    // them needs throttling. Wrong guesses still cost exactly what they did.
-    //
     // Per-session failure cap: after N failed activations against one session
-    // (any code), that session is locked out for a window. This is the real
-    // brute-force brake — the per-attempt-key counter below only stops
-    // repeating the SAME wrong guess, which is pointless (one attempt already
-    // proved it wrong). The session id is high-entropy and known to the
-    // viewer (it's in their URL), so the threat is code-grinding per session.
+    // (any code, from any address), that session is locked out for a window.
+    // This is the real brute-force brake — the per-attempt-key counter below
+    // only stops repeating the SAME wrong guess, which is pointless (one
+    // attempt already proved it wrong). The session id is high-entropy and
+    // known to the viewer (it's in their URL), so the threat is code-grinding
+    // per session.
     const now = Date.now()
     const sessFails = this.sessionFails.get(session_id)
     if (sessFails && sessFails.count >= config.sessionFailLockThreshold) {
@@ -321,9 +315,9 @@ export class Store {
     const normalizedCode = normalizeCode(code)
     const attemptKey = hashAttempt(`${session_id}:${normalizedCode}`)
     if (this.blockedCodes.has(attemptKey)) {
-      // Charged like any other miss: this path short-circuits before the hash
-      // compare, so leaving it free would let an attacker spam a code they
-      // already know is blocked without ever touching their budget.
+      // Answered like any other miss, but not counted toward the session lock
+      // again: each of the repeats that blocked it was already counted, and
+      // trying a guess known to be wrong is not another try at the code.
       this.failActivation()
     }
     const session = this.sessions.get(session_id)
@@ -346,9 +340,9 @@ export class Store {
     // The code was right. From here on nothing that fails is an oracle: only a
     // caller who already holds the code can reach these branches.
     //
-    // Per-session mint rate. The per-address budget above only counts misses,
-    // so it says nothing about a caller who keeps presenting a VALID code —
-    // this is the bound on how fast tokens can be minted at all.
+    // Per-session mint rate. The failure lock above only counts misses, so it
+    // says nothing about a caller who keeps presenting a VALID code — this is
+    // the bound on how fast tokens can be minted at all.
     const activations = this.sessionActivations.get(session_id) ?? { count: 0, windowStart: now }
     if (now - activations.windowStart >= config.activationSessionWindowMs) {
       activations.count = 0
