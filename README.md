@@ -157,14 +157,16 @@ session belongs to, so a share running on this machine for another session is
 never ended by mistake. Typed anywhere else (a new session, a new desktop tab,
 or `opencode run`, which starts a new session every time) they end nothing and
 name the sessions shared from this machine instead; type the command in that
-session, or from a terminal run `opencode run --session <id> /remote-control/stop`.
+session, or from a terminal run
+`opencode run --session <id> --command remote-control/stop` (or
+`--command remote-control/status`).
 
 The bridge also stops on its own when OpenCode quits (watchdog) or on SIGINT/SIGTERM;
 every stop path deletes the relay session, revokes the code, terminates the bridge
 process recorded in its state file and the `opencode serve` it may have spawned.
 The watchdog follows the OpenCode process the share was started from (the plugin
 passes its pid as `--owner-pid`), not just the server the bridge talks to — so a
-share started with `opencode run "/remote-control/start"` ends when that `run`
+share started with `opencode run --command remote-control/start` ends when that `run`
 exits. For a share that should outlive a single command, start it from a long-running
 client (the TUI, the desktop app, `opencode web`) or run the bridge's `start` by hand,
 without `--owner-pid`.
@@ -196,6 +198,10 @@ In the desktop GUI, the web UI and `opencode run` the same four commands come fr
 the server entry (`plugin/server.js`): it registers them through the `config` hook
 and runs the action itself in `command.execute.before`, so the share is started by
 the plugin and the model only relays the resulting URL and code.
+`opencode run` reaches that hook only through `--command`
+(`opencode run --command remote-control/start`): a message such as
+`/remote-control/stop` is sent to the model as an ordinary prompt, runs
+nothing, and lands in the session where a viewer can read it.
 
 The TUI itself exposes no HTTP port, so the bridge starts its own
 `opencode serve` against the same project and stops it again on
