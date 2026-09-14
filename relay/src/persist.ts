@@ -74,6 +74,14 @@ export interface PersistedSession {
    */
   owner_hash?: string
   owner_salt?: string
+  /**
+   * True while no bridge had connected to the registration (see
+   * Session.unbound_since). Only a boolean: restore() starts that clock over.
+   * Absent means a bridge had, and so does a file from an older relay, which
+   * never tracked it: taking its live shares for registrations nobody took up
+   * would end them minutes after the deploy. An older relay ignores the field.
+   */
+  unbound?: true
   viewers: PersistedViewer[]
 }
 

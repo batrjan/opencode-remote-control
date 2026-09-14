@@ -92,6 +92,23 @@ export const config = {
   orphanReapMs: 24 * 3_600_000,
   orphanSweepIntervalMs: 15 * 60_000, // sweep every 15 minutes
   /**
+   * How long a registration may wait for its bridge before it stops holding a
+   * slot. A registration no bridge has connected to for longer is removed by
+   * the reaper, and by a full relay (see maxSessions) before it refuses anyone.
+   *
+   * Idle time alone let a registration nobody took up keep its slot for the
+   * full orphanReapMs. With five active sessions per address, 400 addresses
+   * filled a 2,000-session relay inside an hour with bare POSTs, and every new
+   * share after that got 503 "relay full" for a day, renewable at will. A real
+   * bridge dials the moment its registration comes back, and deletes the
+   * registration when that dial fails (its handshake times out after 15 s), so
+   * minutes are plenty. Counted from registration, or from a restart for one
+   * restored before its bridge had connected. A share whose bridge connected
+   * once keeps the day, however long it has been gone since: telling a laptop
+   * that is asleep from one that will never return is not possible here.
+   */
+  unboundReapMs: 5 * 60_000,
+  /**
    * How long an ended share's session id stays reserved for the install that
    * registered it with an owner_key (see Store.createSession). The id is in
    * the share link, and the owner registers the same id again whenever they
@@ -235,6 +252,10 @@ export function sseMaxBufferBytes(): number {
  * it sits in memory and is rewritten to the state file on every change, so the
  * total has to stop somewhere. Far above what the relay's real shares need; a
  * refusal is logged, so a relay that is merely busy can be given more.
+ *
+ * Only a share with a bridge keeps its slot for long: a full relay first drops
+ * the registrations no bridge connected to in time (config.unboundReapMs), so
+ * filling it takes a bridge connection per session, not a bare POST.
  */
 export function maxSessions(): number {
   return envInt('RELAY_MAX_SESSIONS', 2000)

@@ -74,7 +74,8 @@ What it does **not** protect against:
 
 Ending a share: `/remote-control/stop` (deletes the relay session, revokes the code and
 every viewer token, and disconnects the bridge), quitting OpenCode (the watchdog does the
-same), or leaving it alone — the relay reaps a session after 24 h without bridge traffic.
+same), or leaving it alone — the relay reaps a session after 24 h without bridge traffic,
+or 5 minutes after registration when no bridge ever connected to it.
 
 ## Quick start
 

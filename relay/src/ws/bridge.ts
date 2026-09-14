@@ -139,6 +139,12 @@ export class BridgeClient {
       this.missedPongs.set(ws, 0)
       const connectedAt = Date.now()
       this.logLifecycle(`connected session=${JSON.stringify(session_id)}${replaced ? ' (replacing previous socket)' : ''}`)
+      // The connection is the first sign of life, and what tells the store a
+      // bridge took this registration up: until then the registration holds
+      // its slot only briefly (config.unboundReapMs). Not left to the first
+      // pong or byte: a bridge with nothing to send says nothing until the
+      // first ping, a round after the connection.
+      this.store.touchSession(session_id)
       // A pong is proof the bridge is reachable — and proof the share is in
       // use, so it also keeps the orphan reaper away from an idle session.
       const alive = () => {

@@ -42,6 +42,14 @@ export interface Session {
    */
   owner_hash?: string
   owner_salt?: string
+  /**
+   * Set while no bridge has connected to this registration: when it was made,
+   * or when this process restored it (the file cannot say how long the bridge
+   * has had to reach this process). Cleared by the first touchSession, which
+   * the bridge hub calls on connection. A registration that stays unbound past
+   * config.unboundReapMs gives up its slot — see there.
+   */
+  unbound_since?: number
   viewers: Map<string, ViewerToken> // salted hash -> { salt, created_at, last_used, index }
 }
 
@@ -121,13 +129,21 @@ export class Store {
    * already: that one replaces its session or ends in 409, never grows the
    * set, and refusing it would keep an owner out of its own share (its bridge
    * died) until the reaper removed the stale registration a day later.
+   *
+   * A full relay first removes the registrations no bridge connected to in
+   * time (config.unboundReapMs) rather than wait up to a sweep interval for
+   * the reaper: without that, bare POSTs from a pool of addresses kept every
+   * new share out for as long as they cared to.
    */
   checkRegistrationLimit(ip: string, session_id?: string): void {
     if (
       this.sessions.size >= maxSessions() &&
       (session_id === undefined || !this.sessions.has(session_id))
     ) {
-      throw new Error('relay full')
+      // Only the unbound criterion (no idle limit): none of those has a bridge
+      // socket, so nothing is left for the caller to disconnect.
+      this.reapOrphans(Number.POSITIVE_INFINITY)
+      if (this.sessions.size >= maxSessions()) throw new Error('relay full')
     }
     const now = Date.now()
     const rec = this.registrations.get(ip)
@@ -251,6 +267,8 @@ export class Store {
       created_by_ip,
       owner_hash,
       owner_salt,
+      // A replacement too: the old bridge is dropped, and the new one dials in.
+      unbound_since: now,
       viewers: new Map(),
     }
     this.sessions.set(session_id, session)
@@ -566,17 +584,24 @@ export class Store {
   }
 
   /**
-   * Reap orphaned sessions: a session whose bridge never connected (or
-   * disconnected long ago) and that has been idle longer than `maxIdleMs`
-   * gets deleted (its code and tokens revoked). Prevents abandoned shares
-   * from living forever (e.g. bridge killed -9, or a registration the owner
-   * never followed through on). Returns the ids it removed.
+   * Reap orphaned sessions: a session idle longer than `maxIdleMs` (its
+   * bridge disconnected long ago), or one no bridge has connected to for
+   * longer than `maxUnboundMs`, gets deleted (its code and tokens revoked).
+   * Prevents abandoned shares from living forever (e.g. bridge killed -9, or
+   * a registration the owner never followed through on). Returns the ids it
+   * removed.
+   *
+   * The second limit is much shorter because a registration nobody took up is
+   * not a share anyone is waiting on (see config.unboundReapMs). It used to
+   * wait out the idle limit like any other, holding a slot of the relay's
+   * session cap for a day.
    */
-  reapOrphans(maxIdleMs: number): string[] {
+  reapOrphans(maxIdleMs: number, maxUnboundMs: number = config.unboundReapMs): string[] {
     const now = Date.now()
     const removed: string[] = []
     for (const [id, session] of this.sessions) {
-      if (now - session.last_seen > maxIdleMs) {
+      const neverBridged = session.unbound_since !== undefined && now - session.unbound_since > maxUnboundMs
+      if (now - session.last_seen > maxIdleMs || neverBridged) {
         this.dropViewers(session) // same revocation as deleteSession
         this.sessionActivations.delete(id)
         this.sessionFails.delete(id)
@@ -591,12 +616,23 @@ export class Store {
     return removed
   }
 
-  /** Refresh last_seen (bridge proxy/event traffic calls this). */
+  /**
+   * Refresh last_seen (bridge proxy/event traffic calls this, and so does a
+   * bridge connecting). The first call also records that a bridge took the
+   * registration up (see Session.unbound_since), and persists that at once
+   * rather than within the activity throttle: a restart that missed it would
+   * start the short unbound clock again for a share whose bridge may be asleep.
+   */
   touchSession(session_id: string): void {
     const s = this.sessions.get(session_id)
     if (!s) return
     const now = Date.now()
     s.last_seen = now
+    if (s.unbound_since !== undefined) {
+      delete s.unbound_since
+      this.changed()
+      return
+    }
     this.noteActivity(now)
   }
 
@@ -655,6 +691,7 @@ export class Store {
         ...(s.owner_hash === undefined || s.owner_salt === undefined
           ? {}
           : { owner_hash: s.owner_hash, owner_salt: s.owner_salt }),
+        ...(s.unbound_since === undefined ? {} : { unbound: true as const }),
         // Insertion order is recency order (see matchViewer), and restore()
         // preserves it, so the LRU eviction order survives a restart too.
         viewers: Array.from(s.viewers.entries()).map(([hash, v]) => ({
@@ -751,6 +788,10 @@ export class Store {
         ...(typeof s.owner_hash === 'string' && typeof s.owner_salt === 'string'
           ? { owner_hash: s.owner_hash, owner_salt: s.owner_salt }
           : {}),
+        // Its clock starts over: the file cannot say how long this process has
+        // been reachable. Only on an explicit mark, so a file from a relay that
+        // did not track bridges restores every session as a share with one.
+        ...(s.unbound === true ? { unbound_since: now } : {}),
         viewers,
       })
       // Rebuild the lookup index for this session. No stale entry can point at
