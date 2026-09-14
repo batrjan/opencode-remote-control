@@ -12,7 +12,7 @@
 // A module may export EITHER server() or tui(), never both — the two live in
 // separate files and share plugin/bridge-runner.js.
 
-import { existsSync, readFileSync, writeSync } from "node:fs"
+import { readFileSync, writeSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 
@@ -209,31 +209,64 @@ export function writeAllSync(fd, buf, deadlineMs = 2000) {
   return off
 }
 
-/** Config files the TUI plugin loader reads, most specific last. */
+/** An opencode boolean flag: set when it is "1" or "true", in any case. */
+const envFlag = (value) => ["1", "true"].includes(value?.toLowerCase())
+
+/**
+ * Every file the terminal UI takes plugins from, found the way TuiConfig of
+ * opencode 1.18.30 finds them. Each file adds its plugins to one list, so the
+ * order does not matter here. The plugin used to read only ~/.config/opencode
+ * (or OPENCODE_CONFIG_DIR instead of it), <cwd>/.opencode and
+ * OPENCODE_TUI_CONFIG, and so missed a TUI entry that opencode did load. The
+ * server entry then registered its commands as well, and the TUI entry left
+ * the slash names to them: `/remote-control` in a plain terminal UI became a
+ * model turn answering "OK" instead of the picker.
+ */
 function tuiConfigPaths(directory, env) {
-  const configDir = env.OPENCODE_CONFIG_DIR || path.join(env.HOME || homedir(), ".config", "opencode")
-  const paths = [path.join(configDir, "tui.json"), path.join(configDir, "tui.jsonc")]
-  if (directory) paths.push(path.join(directory, ".opencode", "tui.json"), path.join(directory, ".opencode", "tui.jsonc"))
+  const files = (dir) => [path.join(dir, "tui.json"), path.join(dir, "tui.jsonc")]
+  const home = env.HOME || homedir()
+  // The global folder: XDG_CONFIG_HOME decides, as for all of opencode's paths.
+  const paths = files(path.join(env.XDG_CONFIG_HOME || path.join(home, ".config"), "opencode"))
   if (env.OPENCODE_TUI_CONFIG) paths.push(env.OPENCODE_TUI_CONFIG)
+  // The project: tui.json(c) and .opencode/tui.json(c) in the working directory
+  // and every parent, up to the filesystem root rather than the worktree.
+  if (directory && !envFlag(env.OPENCODE_DISABLE_PROJECT_CONFIG)) {
+    for (let dir = path.resolve(directory); ; dir = path.dirname(dir)) {
+      paths.push(...files(dir), ...files(path.join(dir, ".opencode")))
+      if (path.dirname(dir) === dir) break
+    }
+  }
+  paths.push(...files(path.join(home, ".opencode")))
+  // In addition to the global folder, not instead of it.
+  if (env.OPENCODE_CONFIG_DIR) paths.push(...files(env.OPENCODE_CONFIG_DIR))
   return paths
+}
+
+/**
+ * Parse a config file as opencode does: JSON with comments and trailing commas.
+ * Anything else malformed throws, and opencode skips such a file too.
+ */
+function parseJsonc(text) {
+  const json = text
+    // Each comment becomes a space. A string is matched first and put back as
+    // it is, so the "//" of a git+https:// plugin spec is not taken for one.
+    .replace(/("(?:[^"\\]|\\.)*")|\/\/[^\n]*|\/\*[\s\S]*?\*\//g, (_, string) => string ?? " ")
+    // Then a comma that only a closing bracket follows goes, strings kept again.
+    .replace(/("(?:[^"\\]|\\.)*")|,(?=\s*[}\]])/g, (_, string) => string ?? "")
+  return JSON.parse(json)
 }
 
 /** Whether the TUI entry of THIS plugin is registered in a tui.json. */
 export function tuiEntryRegistered(directory = process.cwd(), env = process.env) {
   for (const file of tuiConfigPaths(directory, env)) {
-    if (!file || !existsSync(file)) continue
-    let raw
-    try {
-      raw = readFileSync(file, "utf8")
-    } catch {
-      continue
-    }
     let entries
     try {
-      entries = JSON.parse(raw).plugin
+      entries = parseJsonc(readFileSync(file, "utf8")).plugin
     } catch {
-      // jsonc / malformed: fall back to a text match rather than guessing.
-      if (/remote-control/.test(raw)) return true
+      // Missing, unreadable or malformed: opencode loads nothing from it either.
+      // A match on the raw text used to count an entry that was commented out,
+      // and the server entry stepped aside for a TUI entry that never loaded,
+      // leaving the terminal UI with no /remote-control command at all.
       continue
     }
     if (Array.isArray(entries) && entries.some((e) => /remote-control/.test(String(Array.isArray(e) ? e[0] : e)))) {

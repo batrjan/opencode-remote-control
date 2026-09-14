@@ -123,7 +123,7 @@ Restart OpenCode. The plugin ships a prebuilt bridge, so no build is needed.
 
 | Client | Loader | Config file | Entry point |
 | ------ | ------ | ----------- | ----------- |
-| Terminal UI (`opencode`) | TUI | `tui.json` (also `<project>/.opencode/tui.json`, `$OPENCODE_TUI_CONFIG`) | `./tui` → `plugin/remote-control.js` |
+| Terminal UI (`opencode`) | TUI | `tui.json` (also `$OPENCODE_CONFIG_DIR/tui.json`, `tui.json` and `.opencode/tui.json` in the project and its parents, `$OPENCODE_TUI_CONFIG`) | `./tui` → `plugin/remote-control.js` |
 | Desktop GUI, web UI, `opencode run`, `opencode serve`, `opencode --mini`, ACP clients (`opencode acp`) | server | `opencode.json` (also `<project>/.opencode/opencode.json`, auto-discovered `.opencode/{plugin,plugins}/*.js`) | `./server` → `plugin/server.js` |
 
 > Registering in only one file leaves the commands missing on the other side —
@@ -196,6 +196,15 @@ so and how to get a new link, instead of a bare 404.
 In the terminal UI the TUI entry (`plugin/remote-control.js`) provides
 `/remote-control` (a picker) plus `/remote-control/start`, `/remote-control/stop`
 and `/remote-control/status`, running the bridge directly — no LLM prompt, instant.
+The server entry, which a plain `opencode` loads too, leaves those names to it
+when it finds the TUI entry in a file the terminal UI reads: `tui.json` or
+`tui.jsonc` in `$XDG_CONFIG_HOME/opencode` (`~/.config/opencode`),
+`$OPENCODE_CONFIG_DIR`, `~/.opencode`, the project directory and each of its
+parents (and their `.opencode/`, unless `OPENCODE_DISABLE_PROJECT_CONFIG` is
+set), or `$OPENCODE_TUI_CONFIG`. An entry commented out there does not count. An
+entry switched off with `plugin_enabled` (or in the terminal UI's plugin list)
+still does, so that terminal has no `/remote-control` command until the plugin is
+switched back on.
 
 `opencode attach <url>` is a terminal UI too, but its server is a separate
 process, and one that has the server entry (an `opencode serve` with it in
