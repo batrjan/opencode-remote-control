@@ -133,6 +133,29 @@ test('a start run from a terminal shows the share URL and code', () => {
   expect(stderr).toContain('https://relay.example/s/ses_new\nCODE: TEST00')
 })
 
+/**
+ * `opencode run` typed into a terminal that OpenCode itself opened.
+ *
+ * OPENCODE_CLIENT is inherited: the desktop app sets it to "desktop" in its own
+ * environment, and every child — its sidecar server, the built-in terminal's
+ * shell, a bash tool call — starts with that value. An owner who typed the
+ * README's stop line into the desktop app's terminal therefore ran a plain
+ * `opencode run` with OPENCODE_CLIENT=desktop, and the output was withheld as if
+ * this were the desktop client itself: once more only the model's "OK". The
+ * subcommand is what says this process prints nothing but the reply.
+ */
+test('a run typed into a terminal OpenCode opened still shows the result', () => {
+  for (const client of ['desktop', 'acp', 'vscode']) {
+    const { stdout, stderr } = runOpencode(
+      ['run', '--session', 'ses_x', '--command', 'remote-control/stop'],
+      { text: 'Remote control stopped.' },
+      { OPENCODE_CLIENT: client },
+    )
+    expect({ client, stderr }).toEqual({ client, stderr: expect.stringContaining('Remote control stopped.') })
+    expect(stdout).toBe('')
+  }
+})
+
 test('processes that draw a screen or serve other clients write nothing to the terminal', () => {
   const quiet: Array<[string[], Record<string, string>]> = [
     // The terminal UI: stderr would scribble over the screen, which already

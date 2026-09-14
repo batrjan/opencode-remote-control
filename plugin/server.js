@@ -77,10 +77,14 @@ export function runsTui(argv = process.argv.slice(2), env = process.env) {
  * model's "OK", whether the share ended, there was nothing to stop, or the stop
  * failed. The first subcommand word decides. With `--attach` the command runs
  * in the attached server, never in this process, so nothing is printed here.
+ *
+ * argv alone decides, unlike runsTui: OPENCODE_CLIENT is inherited. The desktop
+ * app sets it for itself, so a `run` typed into a terminal the app opened
+ * carries OPENCODE_CLIENT=desktop and still prints only the reply. argv already
+ * rules out everything that must stay quiet — the TUI, `serve`/`web`, `acp`,
+ * and the desktop sidecar, which is started with no subcommand at all.
  */
-export function runPrintsReplyOnly(argv = process.argv.slice(2), env = process.env) {
-  const client = env.OPENCODE_CLIENT
-  if (client && client !== "cli") return false
+export function runPrintsReplyOnly(argv = process.argv.slice(2)) {
   return argv.find((arg) => NON_TUI_SUBCOMMANDS.has(arg)) === "run"
 }
 

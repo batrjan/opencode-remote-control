@@ -151,12 +151,11 @@ test('runsTui rejects clients that never render a TUI', () => {
  * clients already show the message.
  */
 test('runPrintsReplyOnly recognises `opencode run` and nothing else', () => {
-  expect(runPrintsReplyOnly(['run', '--command', 'remote-control/stop'], {})).toBe(true)
-  expect(runPrintsReplyOnly(['--print-logs', 'run', 'hello'], { OPENCODE_CLIENT: 'cli' })).toBe(true)
+  expect(runPrintsReplyOnly(['run', '--command', 'remote-control/stop'])).toBe(true)
+  expect(runPrintsReplyOnly(['--print-logs', 'run', 'hello'])).toBe(true)
   for (const argv of [[], ['/path/to/project'], ['serve'], ['web'], ['acp'], ['attach', 'url'], ['session', 'run']]) {
-    expect(runPrintsReplyOnly(argv, {}), argv.join(' ')).toBe(false)
+    expect(runPrintsReplyOnly(argv), argv.join(' ')).toBe(false)
   }
-  expect(runPrintsReplyOnly(['run', 'hello'], { OPENCODE_CLIENT: 'desktop' })).toBe(false)
 })
 
 test('command.execute.before hands the output to the terminal hook as well', async () => {
