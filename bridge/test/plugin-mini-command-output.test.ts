@@ -50,7 +50,10 @@ const FAKE_OPENCODE = `
 import { createHooks } from ${JSON.stringify(SERVER_ENTRY)}
 const hooks = createHooks(async () => ${JSON.stringify(OUTPUT)})
 const output = { parts: [{ type: 'text', text: ' ' }] }
-await hooks['command.execute.before']({ command: 'remote-control/start', sessionID: 'ses_cmd', arguments: '' }, output)
+// The command named by --command, as opencode run takes it; start otherwise.
+const commandArg = process.argv.indexOf('--command')
+const command = commandArg < 0 ? 'remote-control/start' : process.argv[commandArg + 1]
+await hooks['command.execute.before']({ command, sessionID: 'ses_cmd', arguments: '' }, output)
 async function complete(sessionID) {
   const hook = hooks['experimental.text.complete']
   if (!hook) return { held: false, ms: 0, text: 'reply' }
@@ -129,7 +132,7 @@ test('clients that show the message keep the plain OK acknowledgement and an und
     // prints the output on stderr instead.
     [['serve', '--port', '4096'], {}],
     [['web'], {}],
-    [['run', '--command', 'remote-control/start'], {}],
+    [['run', '--command', 'remote-control/status'], {}],
   ]
   for (const [args, env, entry] of clients) {
     const label = `${entry ?? OPENCODE_ENTRY} ${args.join(' ')} ${JSON.stringify(env)}`

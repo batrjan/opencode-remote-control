@@ -50,6 +50,9 @@ const value = (...flags) => {
 }
 const outcome = JSON.parse(process.env.RC_OUTCOME)
 const hooks = createHooks(async (action, sessionID) => {
+  // Record every action the runner was asked for, so a test can tell an action
+  // that ran from one the plugin declined without running.
+  if (process.env.RC_CALLS) (await import('node:fs')).appendFileSync(process.env.RC_CALLS, action + '\\n')
   if (outcome.error) throw new Error(outcome.error)
   const text = outcome.text.repeat(outcome.times ?? 1) + (outcome.tail ?? '')
   return text.replaceAll('{action}', action).replaceAll('{session}', String(sessionID))
@@ -106,8 +109,14 @@ test("README's `opencode run` lines show the command's result on the terminal, n
       text: 'session {session} is not shared from this machine — nothing to {action}.\nShared from this machine: ses_other.',
     })
     const action = words[words.indexOf('--command') + 1].split('/')[1]
-    expect(stderr, words.join(' ')).toContain(`is not shared from this machine — nothing to ${action}.`)
-    expect(stderr, words.join(' ')).toContain('Shared from this machine: ses_other.')
+    if (action === 'start') {
+      // A plain `opencode run` never starts a share; the line shows why and how.
+      expect(stderr, words.join(' ')).toContain('does nothing in `opencode run`')
+      expect(stderr, words.join(' ')).toContain('--attach')
+    } else {
+      expect(stderr, words.join(' ')).toContain(`is not shared from this machine — nothing to ${action}.`)
+      expect(stderr, words.join(' ')).toContain('Shared from this machine: ses_other.')
+    }
     // stdout is the model's reply (or the JSON event stream): left alone.
     expect(stdout, words.join(' ')).toBe('')
   }
@@ -131,11 +140,39 @@ test('a failed action reaches the terminal too, also with --format json', () => 
   }
 })
 
-test('a start run from a terminal shows the share URL and code', () => {
-  const { stderr } = runOpencode(['run', '--command', 'remote-control/start'], {
-    text: 'https://relay.example/s/{session}\nCODE: TEST00',
-  })
-  expect(stderr).toContain('https://relay.example/s/ses_new\nCODE: TEST00')
+/**
+ * A share cannot be started from a plain `opencode run`.
+ *
+ * The bridge follows the OpenCode process that started the share (the plugin
+ * passes its pid as --owner-pid) and ends the share when that process exits.
+ * `opencode run` exits right after its one command, so the share it started
+ * was gone within seconds — while the terminal had just printed its URL and
+ * access code, which the owner then sent to a viewer who found a dead link.
+ * The start is declined up front instead, with the ways that do keep a share
+ * running, and no bridge is spawned at all.
+ */
+test('a start from opencode run is declined with a way that works, and starts nothing', () => {
+  const calls = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'rc-run-calls-')), 'calls')
+  for (const format of [[], ['--format', 'json']]) {
+    fs.rmSync(calls, { force: true })
+    const { stdout, stderr } = runOpencode(
+      ['run', ...format, '--session', 'ses_x', '--command', 'remote-control/start'],
+      { text: 'https://relay.example/s/{session}\nCODE: TEST00' },
+      { RC_CALLS: calls },
+    )
+    expect(fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : '', 'the runner was never asked to start').toBe('')
+    expect(stderr).not.toContain('CODE: TEST00')
+    expect(stderr).toContain('opencode run')
+    expect(stderr).toMatch(/--attach/)
+    expect(stdout).toBe('')
+  }
+  // The same command still starts a share in a process that stays: a server
+  // (desktop sidecar, web, serve) and the TUI entry's host.
+  for (const args of [['serve', '--port', '4096'], ['web'], []]) {
+    fs.rmSync(calls, { force: true })
+    runOpencode([...args, '--command', 'remote-control/start'], { text: 'https://relay.example/s/{session}\nCODE: TEST00' }, { RC_CALLS: calls })
+    expect({ args, calls: fs.readFileSync(calls, 'utf8') }).toEqual({ args, calls: 'start\n' })
+  }
 })
 
 /**

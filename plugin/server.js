@@ -51,6 +51,24 @@ const RELAY_INSTRUCTION = [
 ].join(" ")
 
 /**
+ * What `opencode run --command remote-control/start` answers instead of starting.
+ *
+ * The bridge follows the OpenCode process that started the share (--owner-pid)
+ * and ends the share when that process exits, and `opencode run` exits right
+ * after its one command. A share started there died within seconds — after the
+ * terminal had printed its URL and access code, which the owner then sent to a
+ * viewer who found a dead link. With `--attach` the command runs in the server
+ * it attaches to, which stays, so that is the terminal way that works.
+ */
+const RUN_START_DECLINED = [
+  "remote-control start does nothing in `opencode run`: a share ends when the",
+  "OpenCode process that started it exits, and `opencode run` exits right after",
+  "this command. Start it from the terminal UI, the desktop app or `opencode web`,",
+  "or keep `opencode serve` running and start it through that server with",
+  "`opencode run --attach <server-url> --session <id> --command remote-control/start`.",
+].join("\n")
+
+/**
  * The instruction for the clients that show the model's reply but never the
  * command's message: `opencode --mini` (see runsMini) and ACP clients such as
  * Zed (see runsAcp). An "OK" there left the owner with no URL, no code and no
@@ -319,10 +337,15 @@ export function createHooks(
       if (name !== "remote-control" && !name.startsWith("remote-control/")) return
       const action = resolveAction(name, input?.arguments)
       let text
-      try {
-        text = await run(action, input?.sessionID, { parentOf })
-      } catch (err) {
-        text = `remote-control ${action} failed: ${String(err?.message ?? err)}`
+      if (action === "start" && runPrintsReplyOnly()) {
+        // Not started at all: the share would outlive this command by seconds.
+        text = RUN_START_DECLINED
+      } else {
+        try {
+          text = await run(action, input?.sessionID, { parentOf })
+        } catch (err) {
+          text = `remote-control ${action} failed: ${String(err?.message ?? err)}`
+        }
       }
       // Mutate in place: opencode keeps a reference to this array, so a
       // reassignment would be dropped. Clearing first drops the blank command

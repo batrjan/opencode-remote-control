@@ -44,7 +44,10 @@ const FAKE_OPENCODE = `
 import { createHooks } from ${JSON.stringify(SERVER_ENTRY)}
 const hooks = createHooks(async () => ${JSON.stringify(OUTPUT)})
 const output = { parts: [{ type: 'text', text: ' ' }] }
-await hooks['command.execute.before']({ command: 'remote-control/start', sessionID: 'ses_cmd', arguments: '' }, output)
+// The command named by --command, as opencode run takes it; start otherwise.
+const commandArg = process.argv.indexOf('--command')
+const command = commandArg < 0 ? 'remote-control/start' : process.argv[commandArg + 1]
+await hooks['command.execute.before']({ command, sessionID: 'ses_cmd', arguments: '' }, output)
 let held = false
 const hook = hooks['experimental.text.complete']
 if (hook) {
@@ -102,7 +105,7 @@ test('processes that only inherited OPENCODE_CLIENT=acp keep the plain OK acknow
   // running `opencode run`, or a terminal UI opened from one. Those show the
   // output in their own way (stderr for run, the message for the TUI).
   const clients: Array<[string[], string?]> = [
-    [['run', '--command', 'remote-control/start']],
+    [['run', '--command', 'remote-control/status']],
     [['serve', '--port', '4096']],
     [[], TUI_WORKER_ENTRY],
     [['attach', 'http://127.0.0.1:4096']],

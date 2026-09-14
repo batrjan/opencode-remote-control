@@ -168,11 +168,14 @@ The bridge also stops on its own when OpenCode quits (watchdog) or on SIGINT/SIG
 every stop path deletes the relay session, revokes the code, terminates the bridge
 process recorded in its state file and the `opencode serve` it may have spawned.
 The watchdog follows the OpenCode process the share was started from (the plugin
-passes its pid as `--owner-pid`), not just the server the bridge talks to — so a
-share started with `opencode run --command remote-control/start` ends when that `run`
-exits. For a share that should outlive a single command, start it from a long-running
-client (the TUI, the desktop app, `opencode web`) or run the bridge's `start` by hand,
-without `--owner-pid`.
+passes its pid as `--owner-pid`), not just the server the bridge talks to. A plain
+`opencode run` exits right after its command, so a share it started would be gone
+within seconds; `opencode run --command remote-control/start` therefore starts
+nothing and says so, instead of printing a code that stops working at once. Start a
+share from a long-running client (the TUI, the desktop app, `opencode web`); from a
+terminal, keep `opencode serve` running and point `opencode run --attach` at it, so
+the command runs in that server and the share lives as long as the server does. The
+bridge's `start` can also be run by hand, without `--owner-pid`.
 
 ### Surviving a bad network
 
@@ -226,7 +229,7 @@ command's message, and the model only acknowledges it with `OK`. `opencode run`
 prints a turn's reply but never that message, so there the plugin also writes the
 output to stderr (stdout stays the reply, or the events of `--format json`).
 `opencode run` reaches that hook only through `--command`
-(`opencode run --command remote-control/start`): a message such as
+(`opencode run --command remote-control/status`): a message such as
 `/remote-control/stop` is sent to the model as an ordinary prompt, runs
 nothing, and lands in the session where a viewer can read it.
 
