@@ -215,6 +215,13 @@ export class Store {
       if (claim && !ownerKeyMatches(claim.hash, claim.salt, owner_key)) throw new Error('session exists')
       this.claims.delete(session_id)
     }
+    // A fresh code starts with a clean failure lock. Misses counted under this
+    // id were guesses at a code that ends here (the replaced share's) or at no
+    // code at all (an id nobody held), so they say nothing about the new one —
+    // and kept, they refused every viewer holding it for the rest of the
+    // window. Only past the checks above: a refused registration must leave a
+    // live share's lock alone, or anyone could lift it with a 409.
+    this.sessionFails.delete(session_id)
     const access_code = generateCode()
     const code_salt = newSalt()
     const code_hash = saltedHash(access_code, code_salt)
@@ -535,10 +542,12 @@ export class Store {
     // Revoke the viewer tokens with the session: a leftover index entry would
     // outlive what it points at.
     this.dropViewers(session)
-    // ...and its mint counter. An opencode session id is reused when the same
-    // session is shared again, so a surviving counter would charge the new
-    // share for the old one's joins.
+    // ...and its mint counter and failure lock. An opencode session id is
+    // reused when the same session is shared again, so a surviving counter
+    // would charge the new share for the old one's joins, and a surviving lock
+    // would refuse its fresh code for the old one's typos.
     this.sessionActivations.delete(session_id)
+    this.sessionFails.delete(session_id)
     this.sessions.delete(session_id)
     // The id is free now, and it is in every link the owner handed out.
     this.recordClaim(session, Date.now())
@@ -573,6 +582,7 @@ export class Store {
       if (now - session.last_seen > maxIdleMs) {
         this.dropViewers(session) // same revocation as deleteSession
         this.sessionActivations.delete(id)
+        this.sessionFails.delete(id)
         this.sessions.delete(id)
         this.recordClaim(session, now)
         removed.push(id)

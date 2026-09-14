@@ -128,6 +128,110 @@ test('the lock lifts on its own after the window', async () => {
   expect(store.activate(access_code, 'ses_window').viewer_token).toBeTruthy()
 })
 
+/**
+ * A lock belongs to the share it was earned against, not to the session id.
+ *
+ * The id outlives a share: the plugin shares the conversation it was typed in
+ * and the CLI picks the newest session in the directory, so stopping and
+ * starting again registers the SAME id with a fresh random code. The lock used
+ * to be keyed on the id alone and cleared only by a successful join or by its
+ * window running out — not by the stop, the reaper or the new registration.
+ * So an owner whose viewer fat-fingered the code five times did the obvious
+ * thing, stopped and shared again for a new code, and every viewer holding
+ * that new, correct code was told "Too many attempts" for up to 15 minutes.
+ *
+ * Clearing it on a re-share admits nothing: guesses at the old code say
+ * nothing about the new one, and only the owner can end a share (its bridge
+ * token) or replace it (its owner_key). A share that is still live keeps its
+ * lock — a stranger re-registering its id gets a 409 and changes nothing.
+ */
+test('stopping and re-sharing a locked session gives the new code a clean lock', async () => {
+  const app = createApp(new Store())
+  const first = await share(app, 'ses_relock')
+
+  for (let i = 0; i < config.sessionFailLockThreshold; i++) {
+    expect((await activate(app, 'ses_relock', `NO${i}`, OFFICE)).status).toBe(400)
+  }
+  expect((await activate(app, 'ses_relock', first.access_code, OFFICE)).status).toBe(429)
+
+  // The owner stops the share...
+  const stopped = await request(app).delete('/api/sessions/ses_relock').set('x-bridge-token', first.bridge_token)
+  expect(stopped.status).toBe(204)
+  // ...and shares the same conversation again: same id, new code.
+  const second = await share(app, 'ses_relock')
+  expect(second.access_code).not.toBe(first.access_code)
+
+  const joined = await activate(app, 'ses_relock', second.access_code, OFFICE)
+  expect(joined.status).toBe(200)
+  expect(viewerTokenFrom(joined)).toBeTruthy()
+})
+
+test('a stranger re-registering a live locked share does not lift its lock', async () => {
+  const app = createApp(new Store())
+  const { access_code } = await share(app, 'ses_keeplock')
+
+  for (let i = 0; i < config.sessionFailLockThreshold; i++) {
+    expect((await activate(app, 'ses_keeplock', `NO${i}`, OFFICE)).status).toBe(400)
+  }
+  // Refused before anything of the live share is touched...
+  const squat = await request(app)
+    .post('/api/sessions')
+    .set('X-Forwarded-For', '203.0.113.50')
+    .send({ session_id: 'ses_keeplock', directory: '/work', title: 't' })
+  expect(squat.status).toBe(409)
+  // ...so the grind is still locked out, correct code and all.
+  expect((await activate(app, 'ses_keeplock', 'NO99', '203.0.113.51')).status).toBe(429)
+  expect((await activate(app, 'ses_keeplock', access_code, OFFICE)).status).toBe(429)
+})
+
+test('the owner replacing its own locked share gives the new code a clean lock', () => {
+  const store = new Store()
+  const ownerKey = 'k'.repeat(43)
+  store.createSession('ses_replace', '/work', 't', OFFICE, ownerKey)
+
+  for (let i = 0; i < config.sessionFailLockThreshold; i++) {
+    expect(() => store.activate(`NO${i}`, 'ses_replace')).toThrow('invalid code')
+  }
+
+  // Its bridge died without a word; the restart proves the install and takes
+  // the id over with a new code.
+  const second = store.createSession('ses_replace', '/work', 't', OFFICE, ownerKey)
+  expect(second.replaced).toBe(true)
+  expect(store.activate(second.access_code, 'ses_replace').viewer_token).toBeTruthy()
+})
+
+test('a share the reaper removed while locked comes back with a clean lock', () => {
+  vi.useFakeTimers()
+  const store = new Store()
+  const start = Date.now()
+  store.createSession('ses_reaped', '/work', 't', OFFICE)
+
+  // Locked a minute before the share goes idle for good...
+  vi.setSystemTime(start + config.orphanReapMs - 60_000)
+  for (let i = 0; i < config.sessionFailLockThreshold; i++) {
+    expect(() => store.activate(`NO${i}`, 'ses_reaped')).toThrow('invalid code')
+  }
+  // ...reaped a minute later, well inside the lock window...
+  vi.setSystemTime(start + config.orphanReapMs + 1000)
+  expect(store.reapOrphans(config.orphanReapMs)).toEqual(['ses_reaped'])
+
+  // ...and shared again straight away.
+  const second = store.createSession('ses_reaped', '/work', 't', OFFICE)
+  expect(store.activate(second.access_code, 'ses_reaped').viewer_token).toBeTruthy()
+})
+
+test('misses against an id nobody holds do not lock the next share of it', () => {
+  const store = new Store()
+  // Failures against an id no share holds — viewers still trying the old
+  // link and code after the owner stopped, say. There is no code for them to
+  // be guesses at.
+  for (let i = 0; i < config.sessionFailLockThreshold; i++) {
+    expect(() => store.activate(`NO${i}`, 'ses_early')).toThrow('invalid code')
+  }
+  const { access_code } = store.createSession('ses_early', '/work', 't', OFFICE)
+  expect(store.activate(access_code, 'ses_early').viewer_token).toBeTruthy()
+})
+
 test('a lockout caps guessing far below what the code space needs', () => {
   // The number that makes five-in-a-row safe rather than merely tidy: the
   // lockout admits sessionFailLockThreshold guesses per sessionFailLockMs, and
