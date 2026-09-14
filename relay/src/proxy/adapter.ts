@@ -4,7 +4,7 @@ import type { Request, Response } from 'express'
 import type { Store, Session } from '../store.js'
 import type { BridgeClient } from '../ws/bridge.js'
 import { setViewerCookie } from '../api/viewerCookie.js'
-import { bridgeReconnectWaitMs, config, promptTimeoutMs, sseHeartbeatMs, sseMaxBufferBytes, sseMaxExemptBytes, sseRetryMs } from '../config.js'
+import { bridgeReconnectWaitMs, config, promptTimeoutMs, sseHeartbeatMs, sseMaxBufferBytes, sseMaxExemptBytes, sseMaxParkedBytes, sseRetryMs } from '../config.js'
 
 /**
  * HTTP → WS → opencode proxy adapter, mounted at the server ROOT.
@@ -849,6 +849,16 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   }
 
   /**
+   * Every viewer stream that went over the stuck-viewer cap since it was last
+   * seen under it, each as a function reading how far over the cap that
+   * stream is right now (0 once it is destroyed). Shared by all sessions: it
+   * is what the fan-out's budget on parked bytes sums (see sseEvents' send).
+   * A stream only grows through its own send, which adds it here, so pruning
+   * the ones found back under the cap while summing loses nobody.
+   */
+  const overCap = new Set<() => number>()
+
+  /**
    * SSE fan-out of the session's opencode events to one viewer response.
    *
    * `global` selects the envelope: opencode's `/event` emits the bare event,
@@ -962,9 +972,36 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // on the next frame instead of pinning the whole thing against the cap.
     const unsentOfExempt = () =>
       Math.min(maxExempt, exemptLength, Math.max(0, exemptEnd - (queued - res.writableLength)))
+    // Everything above bounds ONE stream, and only from the next write or beat
+    // on: before a write, a fresh stream holds nothing, so one large event went
+    // whole into every open stream in the same tick (the bridge hands it to all
+    // listeners synchronously, and each builds its own copy of the frame). N
+    // streams times the frame was in memory before any check could run — 16
+    // stuck streams and one 40 MB event took the heap from 30 MB to 780 MB, and
+    // 64 streams of one anonymous owner and a 100 MiB ws frame are 6.4 GB. So
+    // what all streams hold over the cap, together, is capped too, and checked
+    // BEFORE the write: a frame that would take it past the budget is not
+    // written, the stream is dropped and its viewer reconnects. The other
+    // streams are read live (a destroyed one counts 0: its writableLength stays
+    // put but its buffers are being freed), so nothing has to be kept in step
+    // with drains and closes.
+    const maxParked = sseMaxParkedBytes()
+    const overBy = () => (res.destroyed ? 0 : Math.max(0, res.writableLength - maxBuffer))
+    const parkedElsewhere = () => {
+      let total = 0
+      for (const other of overCap) {
+        if (other === overBy) continue
+        const over = other()
+        if (over === 0) overCap.delete(other)
+        else total += over
+      }
+      return total
+    }
     const send = (frame: string) => {
       const exempt = unsentOfExempt()
-      if (res.writableLength - exempt > maxBuffer) {
+      // Only a write that leaves this stream over the cap needs the sum.
+      const overAfter = res.writableLength + frame.length - maxBuffer
+      if (res.writableLength - exempt > maxBuffer || (overAfter > 0 && overAfter + parkedElsewhere() > maxParked)) {
         clearInterval(heartbeat)
         unsubscribe()
         res.destroy()
@@ -978,6 +1015,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
         exemptEnd = queued
         exemptLength = added
       }
+      if (overBy() > 0) overCap.add(overBy)
     }
     // How much has left the process as of the previous heartbeat. The watchdog
     // in the heartbeat compares against it; the exemption above does NOT enter
@@ -1035,7 +1073,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       send(`data: ${envelope(JSON.stringify(heartbeatEvent()))}\n\n`)
     }, sseHeartbeatMs())
     heartbeat.unref?.()
-    res.on('close', () => clearInterval(heartbeat))
+    res.on('close', () => {
+      clearInterval(heartbeat)
+      overCap.delete(overBy)
+    })
 
     const unsubscribeEvents = bridge.subscribeEvents(session.id, (data) => {
       // Belt and braces for the ordering above: whatever path ended the

@@ -26,6 +26,10 @@ import { BridgeClient } from '../src/ws/bridge'
  *    so it is dropped within a beat instead of pinning the frame forever;
  *  - a bound on how much of one frame is exempt, so a frame larger than that
  *    trips the ordinary per-write check on the very next frame.
+ *
+ * Both act on one stream at a time, after the fact. A third bound covers the
+ * moment of fan-out: a budget, shared by all streams, on bytes held over the
+ * cap, checked before the write.
  */
 
 process.env.ACTIVATE_FAIL_DELAY_MS = '0'
@@ -37,15 +41,20 @@ let relay: http.Server
 let relayUrl: string
 let savedHeartbeat: string | undefined
 let savedExempt: string | undefined
+let savedParked: string | undefined
 /** Relay-side responses of every viewer event stream, in arrival order. */
 let streams: { res: http.ServerResponse; peak: number; writes: number }[]
+/** Largest backlog all live streams held together, sampled after every write. */
+let peakTotal: number
 
 beforeEach(async () => {
   streams = []
+  peakTotal = 0
   // Fast heartbeats so the watchdog fires in test time rather than 15 s.
   savedHeartbeat = process.env.RELAY_SSE_HEARTBEAT_MS
   process.env.RELAY_SSE_HEARTBEAT_MS = '120'
   savedExempt = process.env.RELAY_SSE_MAX_EXEMPT_BYTES
+  savedParked = process.env.RELAY_SSE_MAX_PARKED_BYTES
   const store = new Store()
   relay = http.createServer()
   const bridge = new BridgeClient(relay, store)
@@ -60,6 +69,10 @@ beforeEach(async () => {
       const ok = write(...args)
       entry.writes++
       entry.peak = Math.max(entry.peak, res.writableLength)
+      // A destroyed response keeps its old writableLength, but its memory is
+      // on its way out: only live streams count toward what the relay holds.
+      const total = streams.reduce((sum, s) => sum + (s.res.destroyed ? 0 : s.res.writableLength), 0)
+      peakTotal = Math.max(peakTotal, total)
       return ok
     }) as typeof res.write
   })
@@ -76,6 +89,8 @@ afterEach(async () => {
   else process.env.RELAY_SSE_HEARTBEAT_MS = savedHeartbeat
   if (savedExempt === undefined) delete process.env.RELAY_SSE_MAX_EXEMPT_BYTES
   else process.env.RELAY_SSE_MAX_EXEMPT_BYTES = savedExempt
+  if (savedParked === undefined) delete process.env.RELAY_SSE_MAX_PARKED_BYTES
+  else process.env.RELAY_SSE_MAX_PARKED_BYTES = savedParked
 })
 
 /** Register a share, join it once, and connect its bridge. */
@@ -182,6 +197,61 @@ test('a frame larger than the exempt bound trips the cap on the next frame', asy
   } finally {
     bridge.terminate()
     stuck.destroy()
+  }
+}, 30_000)
+
+test('one large event fanned out to many non-reading viewers parks at most the shared budget', async () => {
+  // Every check above looks at one stream, and before the write only at what
+  // that stream already held. A fresh stream holds nothing, so one big event
+  // was written whole into EVERY open stream in the same tick: N streams times
+  // the frame sat in memory before the per-write check (next frame) or the
+  // watchdog (next beat) could run. 16 streams and one 40 MB event took the
+  // relay from 30 MB to 780 MB of heap at once, and an OOM under a 512 MB
+  // limit; an anonymous owner may hold 64 streams, and a frame may be 100 MiB.
+  // With 8 stuck streams and one 12 MiB event that is ~96 MiB here.
+  process.env.RELAY_SSE_MAX_PARKED_BYTES = String(16 * MiB)
+  const STREAMS = 8
+  const id = 'ses_exempt_fanout'
+  const { viewerToken, bridge } = await share(id)
+  const stuck: net.Socket[] = []
+  try {
+    for (let i = 0; i < STREAMS; i++) {
+      const viewer = await openViewer(viewerToken)
+      viewer.pause()
+      stuck.push(viewer)
+    }
+    // The handshake is written just before the stream subscribes to events.
+    await until(() => streams.length === STREAMS && streams.every((s) => s.writes > 0), 5000)
+    expect(streams.length).toBe(STREAMS)
+
+    bridge.send(JSON.stringify({ type: 'event', data: bigPartEvent(id, 12 * MiB) }))
+    await until(() => streams.some((s) => s.peak > 8 * MiB), 5000)
+    expect(streams.some((s) => s.peak > 8 * MiB)).toBe(true) // the frame really landed
+    await sleep(100) // the fan-out is one tick; let any stragglers show up
+
+    // At most the budget over the cap in total, plus each stream up to the cap
+    // (and a little chunked-encoding framing per write).
+    // Degraded, not wiped out: the viewers that fit in the budget got it (the
+    // assertion above).
+    expect(peakTotal).toBeLessThan(16 * MiB + STREAMS * 2 * MiB + 64 * KiB)
+
+    // Room in the budget comes back once the parked streams are gone: a viewer
+    // that reads still gets the next big event whole.
+    for (const viewer of stuck) viewer.destroy()
+    await until(() => streams.every((s) => s.res.destroyed), 5000)
+    expect(streams.every((s) => s.res.destroyed)).toBe(true)
+    const reader = await openViewer(viewerToken)
+    stuck.push(reader)
+    const received = collect(reader)
+    await until(() => streams.length === STREAMS + 1 && streams[STREAMS].writes > 0, 5000)
+    const next = bigPartEvent(id, 12 * MiB)
+    bridge.send(JSON.stringify({ type: 'event', data: next }))
+    await until(() => streams[STREAMS].res.destroyed || received().includes(`data: ${next}\n\n`), 10_000)
+    expect(streams[STREAMS].res.destroyed).toBe(false)
+    expect(received().includes(`data: ${next}\n\n`)).toBe(true)
+  } finally {
+    bridge.terminate()
+    for (const viewer of stuck) viewer.destroy()
   }
 }, 30_000)
 

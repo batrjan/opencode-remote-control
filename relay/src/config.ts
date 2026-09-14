@@ -263,6 +263,24 @@ export function sseMaxExemptBytes(): number {
 }
 
 /**
+ * Most all viewer streams together may hold over the stuck-viewer cap, across
+ * every session (see the SSE fan-out in the proxy adapter).
+ *
+ * The cap and the exemption bound each stream, and only from its next write
+ * or heartbeat: one large event is written into every open stream at once, so
+ * without a shared bound 64 non-reading streams and one 100 MiB ws frame put
+ * 6.4 GB in memory before either could act. Checked before each write, so a
+ * frame that would take the total past it is not written: its stream is
+ * dropped and the viewer reconnects. Room for a few maximal exempt frames at
+ * once, or a pasted photo reaching a couple of dozen streams; while it is used
+ * up, a viewer is dropped for a large event instead of the relay running out
+ * of memory. Counted in the same units as the cap.
+ */
+export function sseMaxParkedBytes(): number {
+  return envInt('RELAY_SSE_MAX_PARKED_BYTES', 128 * 1024 * 1024)
+}
+
+/**
  * Most sessions the relay holds at once, whoever registered them.
  *
  * Registration is public and the other caps are per client address, so on
