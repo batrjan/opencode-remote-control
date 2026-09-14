@@ -8,6 +8,7 @@ import { WebSocket } from 'ws'
 import { createApp } from '../src/server'
 import { Store } from '../src/store'
 import { BridgeClient } from '../src/ws/bridge'
+import { replayEvents } from '../src/proxy/adapter'
 import { OpencodeClient } from '../../bridge/src/opencode'
 import { RelayWSClient } from '../../bridge/src/relay'
 
@@ -286,6 +287,112 @@ test('a viewer gets the events it missed while the bridge link was down', async 
   expect(viewerB.ids('message.part.updated')).toEqual([])
   expect(messageFetches.some((u) => u.pathname === `/session/${B}/message`)).toBe(false)
 }, 20_000)
+
+/**
+ * What the web UI shows for a text part: `message.part.updated` replaces the
+ * part whole and forgets the deltas it had accumulated, `message.part.delta`
+ * appends to it (relay/public/assets/index-*.js, the two `case`s of the same
+ * name). Only the frames for `partID`, in stream order.
+ */
+function shownText(frames: Frame[], partID: string): string | undefined {
+  let text: string | undefined
+  for (const { payload } of frames) {
+    if (payload.type === 'message.part.updated' && payload.properties?.part?.id === partID) {
+      text = payload.properties.part.text
+    } else if (payload.type === 'message.part.delta' && payload.properties?.partID === partID && text !== undefined) {
+      text += payload.properties.delta
+    }
+  }
+  return text
+}
+
+test('a re-dial in the middle of an answer keeps the text a viewer already shows', async () => {
+  // opencode stores a text or reasoning part when it starts, as `text: ""`
+  // with `time.start` and no `time.end`, and only PUBLISHES the deltas that
+  // follow: the full text is written once, at its end. A snapshot taken
+  // mid-answer therefore holds that empty part, and replaying it replaced
+  // everything the viewer had read so far with nothing.
+  const S = 'ses_gap_streaming'
+  const { bridgeToken, viewerToken } = await share(S)
+  const bridge = await realBridge(S, bridgeToken)
+  expect(await waitFor(() => eventStreams.size === 1)).toBe(true)
+  const view = await viewer(viewerToken)
+
+  const delta = (text: string) => ({
+    type: 'message.part.delta',
+    properties: { sessionID: S, messageID: 'msg_live', partID: 'prt_live', field: 'text', delta: text },
+  })
+  const streaming = { ...part('prt_live', 'msg_live', S, ''), time: { start: 2 } }
+  push({ type: 'message.updated', properties: { sessionID: S, info: info('msg_live', S) } })
+  push({ type: 'message.part.updated', properties: { part: streaming } })
+  push(delta('Everything the viewer read before the drop. '))
+  expect(await waitFor(() => view.frames.some((f) => f.payload.type === 'message.part.delta'))).toBe(true)
+
+  bridge.dropLink()
+  expect(await waitFor(() => !hub.isConnected(S))).toBe(true)
+  const sinceDrop = view.frames.length
+  transcript.set(S, [
+    // A user's text part carries no `time` at all: it is complete.
+    { info: info('msg_user', S, 'user'), parts: [part('prt_user', 'msg_user', S)] },
+    {
+      info: info('msg_live', S),
+      parts: [
+        // Finished during the outage: the viewer needs this one.
+        { ...part('prt_think', 'msg_live', S, 'thought it through'), type: 'reasoning', time: { start: 1, end: 2 } },
+        // Still streaming: what opencode has stored for it so far.
+        streaming,
+      ],
+    },
+    // A prompt queued behind the answer; its part is replayed last.
+    { info: info('msg_queued', S, 'user'), parts: [part('prt_queued', 'msg_queued', S)] },
+  ])
+  expect(await waitFor(() => bridge.reconnects() === 1, 5000)).toBe(true)
+
+  // A replay reaches the stream in order, so once its last part is here every
+  // part it was going to send is too.
+  expect(await waitFor(() => view.ids('message.part.updated').includes('prt_queued'), 3000)).toBe(true)
+
+  // The answer keeps growing on top of what was already on screen.
+  push(delta('And what came after it.'))
+  expect(await waitFor(() => view.frames.filter((f) => f.payload.type === 'message.part.delta').length === 2)).toBe(true)
+  expect(shownText(view.frames, 'prt_live')).toBe('Everything the viewer read before the drop. And what came after it.')
+  // Everything else the snapshot holds is still replayed; the streaming part's
+  // full text arrives live, with its `time.end`.
+  const replayed = view.frames
+    .slice(sinceDrop)
+    .filter((f) => f.payload.type === 'message.part.updated')
+    .map((f) => f.payload.properties?.part?.id)
+  expect(replayed).toEqual(['prt_user', 'prt_think', 'prt_queued'])
+}, 20_000)
+
+test('a replay skips only the text and reasoning parts still streaming', () => {
+  const S = 'ses_gap_shapes'
+  const body = JSON.stringify([
+    {
+      info: info('msg_1', S),
+      parts: [
+        { ...part('prt_text_done', 'msg_1', S), time: { start: 1, end: 2 } },
+        { ...part('prt_text_live', 'msg_1', S, ''), time: { start: 1 } },
+        { ...part('prt_reasoning_done', 'msg_1', S), type: 'reasoning', time: { start: 1, end: 2 } },
+        { ...part('prt_reasoning_live', 'msg_1', S, ''), type: 'reasoning', time: { start: 1 } },
+        // Complete parts with no `time` of their own.
+        part('prt_text_untimed', 'msg_1', S),
+        { id: 'prt_step', messageID: 'msg_1', sessionID: S, type: 'step-start' },
+        // A running tool is a whole part in every update, so it is replayed.
+        { id: 'prt_tool', messageID: 'msg_1', sessionID: S, type: 'tool', state: { status: 'running', time: { start: 1 } } },
+      ],
+    },
+  ])
+  const events = replayEvents(body, S).map((data) => JSON.parse(data))
+  expect(events[0]).toMatchObject({ type: 'message.updated', properties: { info: { id: 'msg_1' } } })
+  expect(events.slice(1).map((e) => e.properties.part.id)).toEqual([
+    'prt_text_done',
+    'prt_reasoning_done',
+    'prt_text_untimed',
+    'prt_step',
+    'prt_tool',
+  ])
+})
 
 test('a replay larger than the viewer buffer cap reaches a reading viewer without dropping it', async () => {
   // Transcripts are big (tool output, file diffs): written in one burst, the

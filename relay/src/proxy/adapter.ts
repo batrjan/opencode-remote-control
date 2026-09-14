@@ -1060,9 +1060,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
    *
    * What it does not do: a message or part REMOVED during the outage stays on
    * screen (a snapshot cannot replay a deletion); subagent (child) sessions are
-   * not resynced; and a part streaming across the re-dial can briefly lose the
-   * text of the deltas that raced the snapshot, until that part's next update
-   * rewrites it whole.
+   * not resynced; and a text or reasoning part still streaming is not replayed
+   * (opencode has not stored its text yet, see isStreamingPart), so the deltas
+   * lost in the outage stay missing from it, and one that started during the
+   * outage shows up only when it ends — in both cases whole at that point.
    */
   async function resyncViewers(session_id: string): Promise<void> {
     const session = store.getSession(session_id)
@@ -1293,7 +1294,8 @@ function stripParentId(raw: string, contentType?: string): string {
  * then `message.part.updated` for each of its parts. Only what provably belongs
  * to `sessionId` is kept — a message of another session, or a part that does
  * not name its own message and session — and anything unparseable yields no
- * events at all.
+ * events at all. A text or reasoning part still streaming is left out too (see
+ * isStreamingPart).
  */
 export function replayEvents(body: string, sessionId: string): string[] {
   let items: unknown
@@ -1312,10 +1314,35 @@ export function replayEvents(body: string, sessionId: string): string[] {
     if (!Array.isArray(parts)) continue
     for (const part of parts as Array<Record<string, unknown> | null>) {
       if (!part || typeof part.id !== 'string' || part.messageID !== info.id || part.sessionID !== sessionId) continue
+      if (isStreamingPart(part)) continue
       events.push(JSON.stringify({ type: 'message.part.updated', properties: { part } }))
     }
   }
   return events
+}
+
+/**
+ * Whether a stored part is a text or reasoning part opencode is still writing,
+ * which a replay must not send.
+ *
+ * opencode stores such a part when it starts, as `text: ""` with `time.start`,
+ * and after that only PUBLISHES its deltas: the full text is stored once, with
+ * `time.end` (at the part's end, or in the processor's cleanup when the turn is
+ * aborted or fails). The web UI's `message.part.updated` replaces a part whole
+ * and discards the delta text it had built up, so replaying that stored copy
+ * blanked every word a viewer had already read of the answer, and the text only
+ * came back when the part ended — minutes later for a long answer. Left out, a
+ * viewer that saw the part start keeps its text and the deltas that follow; one
+ * that did not (it started during the outage) gets it whole when it ends.
+ * Older opencode stores the text with every delta instead, and sends that copy
+ * live each time, so skipping loses nothing there either.
+ */
+function isStreamingPart(part: Record<string, unknown>): boolean {
+  if (part.type !== 'text' && part.type !== 'reasoning') return false
+  // `time` present but not ended. A part with no `time` at all (the text of a
+  // user's prompt) is complete and is still replayed.
+  const time = part.time
+  return !!time && typeof time === 'object' && (time as { end?: unknown }).end == null
 }
 
 /**
