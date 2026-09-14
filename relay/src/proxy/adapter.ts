@@ -254,6 +254,23 @@ const RESYNC_MESSAGE_LIMIT = 20
 const RESYNC_DRAIN_TIMEOUT_MS = 30_000
 
 /**
+ * How long a viewer stream the relay ENDS (its share ended, its viewer was
+ * revoked, a shutdown) may take to send its final chunk before it is cut.
+ *
+ * end() only queues that chunk behind the viewer's backlog, and the stream's
+ * slot (MAX_STREAMS_PER_SESSION) comes back only when the connection closes. A
+ * viewer that stopped reading never takes the chunk, so its streams, their
+ * backlogs and their slots stayed for the life of the TCP connection — up to a
+ * day behind nginx — and a revoked viewer's 64 of them answered the next share
+ * of the same conversation 429 on /event. A viewer that is reading has
+ * normally nothing queued in the process at all (the kernel takes the chunk at
+ * once), and one a little behind catches up well within this. Cutting the rest
+ * costs a viewer that is being turned away anyway one reconnect delay before
+ * the 401 that sends it to the code-entry page.
+ */
+const SSE_END_GRACE_MS = 1_000
+
+/**
  * Set on the 401 the relay answers for a viewer it does not know: a token that
  * expired, was evicted, or belongs to a deleted share.
  *
@@ -274,7 +291,7 @@ interface ViewerStream {
   handshake(): void
   /** Write each event (bare opencode JSON, already filtered to the session), keeping the viewer's backlog under its cap. */
   replay(events: string[]): Promise<void>
-  /** Stop feeding the stream and end it with its final chunk. */
+  /** Stop feeding the stream and end it with its final chunk (cut if that chunk does not go out in SSE_END_GRACE_MS). */
   end(): void
 }
 
@@ -925,10 +942,22 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // gap was written to an ended response. Node raises that as an 'error' on
     // the response, nothing listens, and an unhandled 'error' ends the process:
     // one revoked viewer on a slow link took down the relay and every share.
+    //
+    // Ended, then cut if the final chunk has not gone out within
+    // SSE_END_GRACE_MS: stopping the heartbeat also stops the stuck-viewer
+    // watchdog, and nothing else ever closed a connection whose peer reads
+    // nothing — it kept its backlog and its stream slot.
     const endStream = () => {
       clearInterval(heartbeat)
       unsubscribe()
-      if (!res.writableEnded) res.end()
+      if (res.writableEnded) return
+      res.end()
+      if (res.writableFinished) return
+      const cut = setTimeout(() => {
+        if (!res.writableFinished) res.destroy()
+      }, SSE_END_GRACE_MS)
+      cut.unref?.()
+      res.once('close', () => clearTimeout(cut))
     }
     // A viewer that stops reading is dropped, not buffered for. Nothing here
     // used to look at whether the viewer kept up: every event it did not take
@@ -1312,7 +1341,9 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   // stream tracked under the id belongs to the registration that ended: the
   // store calls this before anyone holds the next one's code. Ended rather
   // than cut, as on shutdown: the UI reconnects promptly, and that request
-  // gets the 401 that sends the viewer to the code-entry page.
+  // gets the 401 that sends the viewer to the code-entry page. A viewer that
+  // does not take the final chunk is cut shortly after (see SSE_END_GRACE_MS),
+  // so its streams cannot hold the id's slots against the next share.
   store.onRegistrationEnd((session_id) => {
     for (const stream of [...(viewerStreams.get(session_id) ?? [])]) stream.end()
   })

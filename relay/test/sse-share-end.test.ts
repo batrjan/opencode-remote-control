@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import http from 'node:http'
 import { randomBytes } from 'node:crypto'
+import net from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { WebSocket } from 'ws'
 import { createApp } from '../src/server'
@@ -198,3 +199,83 @@ test('a registration-end listener that throws neither fails the delete nor the s
   expect(seen).toEqual(['ses_endthrow1', 'ses_endthrow2'])
   expect(warn).toHaveBeenCalledTimes(2)
 })
+
+/**
+ * Ending a share must free the stream slots of its viewers, even of one that
+ * stopped reading.
+ *
+ * Slots are counted per session id and given back when a stream's connection
+ * closes. The end of a registration only ended the streams: end() queues the
+ * final chunk BEHIND the backlog, so for a peer that reads nothing it never
+ * completes, 'close' never comes, and the heartbeat that could have noticed
+ * was stopped with the stream. A revoked viewer holding the session's 64
+ * streams with a small backlog (under the stuck-viewer cap) therefore kept all
+ * of them after a stop and a new share of the same conversation: the next
+ * viewer, with the new code, got 429 on /event and no live updates for as long
+ * as those TCP connections lived (up to a day behind nginx), and their
+ * backlogs stayed in memory just as long.
+ */
+test("a revoked viewer that stopped reading does not keep the session's stream slots from the next share", async () => {
+  const id = 'ses_endslots1'
+  const K = randomBytes(32).toString('base64url')
+  const first = await register(id, K)
+  const oldBridge = await connectBridge(id, first.bridge_token)
+  const mallory = store.activate(first.access_code, id).viewer_token
+
+  // The relay-side response of every /event stream, to see its backlog.
+  const held: http.ServerResponse[] = []
+  server.on('request', (req: http.IncomingMessage, res: http.ServerResponse) => {
+    if (req.url === '/event') held.push(res)
+  })
+  const port = (server.address() as AddressInfo).port
+  const raw: net.Socket[] = []
+  try {
+    // Every slot the session has, on sockets that never read.
+    for (let i = 0; i < 64; i++) {
+      const socket = net.connect(port, '127.0.0.1')
+      raw.push(socket)
+      await new Promise((resolve) => socket.once('connect', resolve))
+      socket.write(`GET /event HTTP/1.1\r\nHost: x\r\nx-viewer-token: ${mallory}\r\n\r\n`)
+      socket.pause()
+    }
+    expect(await eventually(() => held.length === 64 && held.every((res) => res.headersSent))).toBe(true)
+
+    // A busy share: output until each stream has bytes the kernel did not take
+    // (so its final chunk cannot go out), far below the stuck-viewer cap.
+    const delta = JSON.stringify({ type: 'message.part.delta', properties: { sessionID: id, delta: 'x'.repeat(64 * 1024) } })
+    for (let round = 0; round < 200 && !held.every((res) => res.writableLength > 0); round++) {
+      oldBridge.emit(JSON.parse(delta))
+      await settle(5)
+    }
+    expect(held.every((res) => !res.destroyed && res.writableLength > 0)).toBe(true)
+    expect(Math.max(...held.map((res) => res.writableLength))).toBeLessThan(1024 * 1024)
+    const revoked = held.slice()
+
+    // The owner stops, shares the same conversation again, and a new viewer joins.
+    const deleted = await fetch(`http://${base}/api/sessions/${id}`, {
+      method: 'DELETE',
+      headers: { 'x-bridge-token': first.bridge_token },
+    })
+    expect(deleted.status).toBe(204)
+    const again = await register(id, K)
+    const victor = store.activate(again.access_code, id).viewer_token
+
+    // Its live stream opens (a 429 is retried, as the web UI's reader would).
+    let status = 0
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      const ac = new AbortController()
+      streams.push(ac)
+      const res = await fetch(`http://${base}/event`, { headers: { 'x-viewer-token': victor }, signal: ac.signal })
+      status = res.status
+      if (status !== 429) break
+      await res.body?.cancel()
+      await settle(100)
+    }
+    expect(status).toBe(200)
+    // And the revoked viewer's backlogs were let go, not parked for its TCP lifetime.
+    expect(await eventually(() => revoked.every((res) => res.destroyed || res.writableFinished))).toBe(true)
+  } finally {
+    for (const socket of raw) socket.destroy()
+  }
+}, 20_000)
