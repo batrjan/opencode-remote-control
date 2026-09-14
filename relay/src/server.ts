@@ -41,9 +41,37 @@ const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url))
  * plain words, so the name alone cannot tell them apart.
  */
 const ASSETS_DIR = path.join(PUBLIC_DIR, 'assets') + path.sep
-const HASHED_ASSET_NAME = /-[A-Za-z0-9_-]{8}\.[a-z0-9]+(?:\.map)?$/
+const HASHED_ASSET_NAME = /-[A-Za-z0-9_-]{8}\.[a-z0-9]+$/
 function isHashedAsset(filePath: string): boolean {
   return filePath.startsWith(ASSETS_DIR) && HASHED_ASSET_NAME.test(path.basename(filePath))
+}
+
+/**
+ * Whether a request names one of the UI build's source maps, which the static
+ * handler does not serve.
+ *
+ * The upstream Vite build leaves a .js.map beside every bundle in /assets, 835
+ * of them and about 48 MB (the largest 11.5 MB), and express.static handed each
+ * one to anyone who asked, no cookie needed: an anonymous client could make the
+ * host send, and nginx gzip, 11.5 MB per request. No viewer needs them. The UI
+ * never fetches one, and a browser asks only with DevTools open. They hold
+ * the public upstream source, so this saves weight and bandwidth; it hides no
+ * secret. The bundles keep their sourceMappingURL comments; a developer with
+ * DevTools open sees a 404 for each.
+ *
+ * Checked on the decoded path, as the static handler decodes it before looking
+ * on disk: /assets/x.js%2Emap and /%61ssets/x.js.map are the same file.
+ * Case-insensitive, for a filesystem that is (a macOS checkout). A path that
+ * does not decode is left to the handler, which refuses it with 400.
+ */
+function isSourceMapPath(urlPath: string): boolean {
+  let decoded: string
+  try {
+    decoded = decodeURIComponent(urlPath)
+  } catch {
+    return false
+  }
+  return /\.map$/i.test(decoded)
 }
 
 /** index.html split at </head>, where the shell's scripts go. */
@@ -335,13 +363,13 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
   // Content-hashed assets are immutable (see isHashedAsset). setHeaders runs
   // before send writes its own Cache-Control, which it skips when one is set;
   // everything else keeps the default and revalidates.
-  app.use(
-    express.static(PUBLIC_DIR, {
-      setHeaders(res, filePath) {
-        if (isHashedAsset(filePath)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
-      },
-    }),
-  )
+  const serveStatic = express.static(PUBLIC_DIR, {
+    setHeaders(res, filePath) {
+      if (isHashedAsset(filePath)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+    },
+  })
+  // Source maps are passed over and end at the JSON 404 (see isSourceMapPath).
+  app.use((req, res, next) => (isSourceMapPath(req.path) ? next() : serveStatic(req, res, next)))
   app.get('/join', (req, res) => {
     const home = viewerHome(req)
     if (home) return res.redirect(home)

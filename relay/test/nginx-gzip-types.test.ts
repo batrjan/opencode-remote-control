@@ -97,6 +97,8 @@ test('every type in public/ that gzip would shrink by over 20% is listed in gzip
         // nginx leaves a body under gzip_min_length alone whatever its type.
         if (size < minLength) continue
         const ext = path.extname(p).toLowerCase()
+        // Source maps are on disk but never served (static-sourcemaps.test.ts).
+        if (ext === '.map') continue
         byExt.set(ext, [...(byExt.get(ext) ?? []), p])
       }
     }
