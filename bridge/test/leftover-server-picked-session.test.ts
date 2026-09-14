@@ -304,6 +304,51 @@ test.skipIf(process.platform === 'win32')(
   30_000,
 )
 
+/*
+ * A start with a session id that also names its server (--port, or a URL).
+ *
+ * The earlier share is settled before anything else, and that early settle
+ * used to end the server it left behind unconditionally — but the named server
+ * may be exactly that leftover: after `kill -9` of a bridge, its re-parented
+ * `opencode serve` keeps the port, and `bridge start --session-id S --port N`
+ * by hand is the natural retry. The start SIGTERMed it, waited for it to exit,
+ * then failed with "local opencode server unreachable" on the port it had just
+ * emptied itself.
+ */
+
+for (const [how, named] of [
+  ['--port', (port: number) => ({ port })],
+  ['a URL', (port: number) => ({ opencodeUrl: `http://127.0.0.1:${port}` })],
+] as const) {
+  test.skipIf(process.platform === 'win32')(
+    `a start with a session id and its server named by ${how} runs on the server a dead share of it left behind`,
+    async () => {
+      const id = how === '--port' ? 'ses_named_port' : 'ses_named_url'
+      listSessions([id])
+      const leftover = await leftoverServer()
+      const earlier = await deadShare(id, leftover.pid)
+      vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+      const handle = await startBridge(relayUrl, API_KEY, { sessionId: id, ...named(leftover.port) })
+      try {
+        expect(handle.session_id).toBe(id)
+        const state = loadSessionState(id)
+        expect(state?.bridge_token).not.toBe(earlier.bridge_token)
+        // The dead share was still ended on the relay...
+        expect(await new RelayClient(relayUrl).deleteSession(id, earlier.bridge_token)).toBe(404)
+        // ...but the server this share runs on was kept, and is not recorded as its own.
+        expect({ leftoverAlive: alive(leftover.pid), recorded: state?.server_pid }).toEqual({
+          leftoverAlive: true,
+          recorded: undefined,
+        })
+      } finally {
+        await handle.stop()
+      }
+    },
+    30_000,
+  )
+}
+
 /* Which listener detection treats as a recorded share's server, in process with a fake process table. */
 
 test('a listener is a recorded share\'s server when it, or a wrapper above it, is the server_pid a share recorded and still that server', () => {

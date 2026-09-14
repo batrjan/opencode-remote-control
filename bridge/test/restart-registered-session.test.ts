@@ -227,8 +227,11 @@ test.skipIf(process.platform === 'win32')('a share whose bridge died is taken ba
   // The `opencode serve` the dead bridge spawned, re-parented and still running.
   const leftoverServer = lookalike('leftover', 'opencode', ['serve'])
   earlierState('sess-crashed', earlier, { pid: await exitedPid(), server_pid: leftoverServer.pid })
+  // The server comes from detection (stood in for), as on the plugin path. A
+  // start that names its server itself keeps the leftover: it may be that server.
+  const serverSpawner = vi.fn(async () => ({ port: opencodePort }))
 
-  const handle = await startBridge(relayUrl, API_KEY, { opencodeUrl, sessionId: 'sess-crashed' })
+  const handle = await startBridge(relayUrl, API_KEY, { sessionId: 'sess-crashed', serverSpawner })
   try {
     expect(handle.access_code).toBeTruthy()
     expect(handle.access_code).not.toBe(earlier.access_code)

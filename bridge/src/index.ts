@@ -87,7 +87,13 @@ export async function startBridge(
   // before any server is detected or spawned: a live one is refused without
   // anything being started, and the `opencode serve` a dead one left behind
   // has to be gone before detection could mistake it for the user's own.
-  if (opts.sessionId !== undefined) await settleEarlierShare(relay, opts.sessionId, true)
+  // Unless this start names its server (--port, a URL): that may be exactly
+  // the leftover (see endLeftoverServer below), and ending it here left the
+  // start nothing to run on — "local opencode server unreachable" on the port
+  // it had just emptied itself.
+  if (opts.sessionId !== undefined) {
+    await settleEarlierShare(relay, opts.sessionId, opts.port === undefined && !opts.opencodeUrl)
+  }
   // When no opencode server is listening (plain console runs use an
   // in-process server with no HTTP port), spawn `opencode serve` ourselves so
   // remote control works without the TUI. The spawned server is tied to the

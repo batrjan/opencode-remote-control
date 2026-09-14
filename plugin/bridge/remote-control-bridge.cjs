@@ -8322,7 +8322,9 @@ function latestSessionState() {
 var import_meta = {};
 async function startBridge(relayUrl, apiKey, opts = {}) {
   const relay = new RelayClient(relayUrl, apiKey);
-  if (opts.sessionId !== void 0) await settleEarlierShare(relay, opts.sessionId, true);
+  if (opts.sessionId !== void 0) {
+    await settleEarlierShare(relay, opts.sessionId, opts.port === void 0 && !opts.opencodeUrl);
+  }
   let spawnedServer;
   let resolvedPort;
   let endLeftoverServer = false;
