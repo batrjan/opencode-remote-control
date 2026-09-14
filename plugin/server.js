@@ -51,15 +51,16 @@ const RELAY_INSTRUCTION = [
 ].join(" ")
 
 /**
- * The instruction for `opencode --mini` (see runsMini). Mini never draws the
- * command's message live, only the model's reply, so an "OK" there left the
- * owner with no URL, no code and no status. The reply has to be the output.
- * Only mini gets this: every other client shows the message itself, and a
- * model copying a share link and code is one more place for them to go wrong.
+ * The instruction for the clients that show the model's reply but never the
+ * command's message: `opencode --mini` (see runsMini) and ACP clients such as
+ * Zed (see runsAcp). An "OK" there left the owner with no URL, no code and no
+ * status, so the reply has to be the output. Only they get this: every other
+ * client shows the message itself, and a model copying a share link and code
+ * is one more place for them to go wrong.
  */
-const MINI_RELAY_INSTRUCTION = [
+const REPEAT_RELAY_INSTRUCTION = [
   "The remote-control plugin already ran this command locally; its output is",
-  "the message above. This terminal does not show that message, so reply with",
+  "the message above. This client does not show that message, so reply with",
   "that output verbatim: every line exactly as written, with nothing added.",
   "Do not explain it, do not run any tools.",
 ].join(" ")
@@ -118,7 +119,7 @@ export function runsTui(argv = process.argv.slice(2), env = process.env, entry =
 /**
  * Whether this process is `opencode --mini`, which runs the commands typed into
  * it itself and shows only the model's reply to them (see
- * MINI_RELAY_INSTRUCTION). argv alone decides, as in runPrintsReplyOnly:
+ * REPEAT_RELAY_INSTRUCTION). argv alone decides, as in runPrintsReplyOnly:
  * OPENCODE_CLIENT is inherited. `opencode attach <url> --mini` is not one: its
  * commands run in the server it is attached to, which cannot tell a mini
  * client from the web UI or a full terminal UI, so they keep the plain "OK".
@@ -126,6 +127,24 @@ export function runsTui(argv = process.argv.slice(2), env = process.env, entry =
 export function runsMini(argv = process.argv.slice(2), entry = process.argv[1]) {
   if (typeof entry === "string" && TUI_WORKER_RE.test(entry)) return false
   return hasMiniFlag(argv) && !argv.some((arg) => NON_TUI_SUBCOMMANDS.has(arg))
+}
+
+/**
+ * Whether this process is `opencode acp`, the agent an ACP client (Zed and other
+ * editors) talks to. It runs its own server, so the commands typed in the
+ * client run here, and the client shows only the model's reply to them (see
+ * REPEAT_RELAY_INSTRUCTION): on opencode 1.18.30 the ACP agent streams the
+ * assistant's text, tool calls and permission requests while a prompt runs,
+ * but a user message's parts — the command's output — only when a thread is
+ * reopened (session/load). stdout is the JSON-RPC stream and stderr the
+ * editor's log, so the reply is the only way the output reaches the owner.
+ *
+ * The first subcommand word decides, as in runPrintsReplyOnly: `opencode acp`
+ * sets OPENCODE_CLIENT=acp for itself, and every child it starts (an
+ * `opencode run` in a bash tool call, a terminal UI) inherits it.
+ */
+export function runsAcp(argv = process.argv.slice(2)) {
+  return argv.find((arg) => NON_TUI_SUBCOMMANDS.has(arg)) === "acp"
 }
 
 /**
@@ -280,7 +299,11 @@ export function createHooks(
       output.parts.length = 0
       output.parts.push({ type: "text", text })
       const mini = runsMini()
-      output.parts.push({ type: "text", text: mini ? MINI_RELAY_INSTRUCTION : RELAY_INSTRUCTION, synthetic: true })
+      // Clients that show only the reply get the output from the model instead.
+      const repeat = mini || runsAcp()
+      output.parts.push({ type: "text", text: repeat ? REPEAT_RELAY_INSTRUCTION : RELAY_INSTRUCTION, synthetic: true })
+      // Only mini needs the reply held back: the ACP agent answers the prompt
+      // after the session goes idle, once every reply delta has gone out.
       if (mini) settling.add(input?.sessionID)
       // `opencode run` prints only the model's reply — the "OK" asked for above —
       // so the owner would otherwise never learn whether a stop ended anything

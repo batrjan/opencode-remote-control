@@ -124,7 +124,7 @@ Restart OpenCode. The plugin ships a prebuilt bridge, so no build is needed.
 | Client | Loader | Config file | Entry point |
 | ------ | ------ | ----------- | ----------- |
 | Terminal UI (`opencode`) | TUI | `tui.json` (also `<project>/.opencode/tui.json`, `$OPENCODE_TUI_CONFIG`) | `./tui` → `plugin/remote-control.js` |
-| Desktop GUI, web UI, `opencode run`, `opencode serve`, `opencode --mini` | server | `opencode.json` (also `<project>/.opencode/opencode.json`, auto-discovered `.opencode/{plugin,plugins}/*.js`) | `./server` → `plugin/server.js` |
+| Desktop GUI, web UI, `opencode run`, `opencode serve`, `opencode --mini`, ACP clients (`opencode acp`) | server | `opencode.json` (also `<project>/.opencode/opencode.json`, auto-discovered `.opencode/{plugin,plugins}/*.js`) | `./server` → `plugin/server.js` |
 
 > Registering in only one file leaves the commands missing on the other side —
 > the GUI has no TUI at all, so a TUI plugin can never reach it. A single module
@@ -219,6 +219,16 @@ a mini that runs its own server. With `opencode attach <url> --mini` the command
 runs in the attached server, which cannot tell a mini client from the others, so
 the reply stays `OK` and the output is not drawn: resize the terminal (mini then
 redraws the session, output included), or attach without `--mini`.
+
+ACP clients (Zed and other editors that run `opencode acp`) get the server
+entry's commands too, and never see the command's message either: while a prompt
+runs, `opencode acp` streams the model's reply to the editor but not the user
+message, and its stdout and stderr belong to the protocol and the editor's log.
+So there, too, the model is asked to repeat the output verbatim, and what the
+editor shows is the model's copy of the URL and code. Reopening the thread
+replays the session, the plugin's own message included, so the output then
+appears twice, and an editor that ignores the "for the assistant" marking on the
+plugin's instruction to the model shows that instruction as well.
 
 The TUI itself exposes no HTTP port, so the bridge starts its own
 `opencode serve` against the same project and stops it again on

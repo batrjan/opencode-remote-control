@@ -241,6 +241,8 @@ test('processes that draw a screen or serve other clients write nothing to the t
     // is a service log, not the owner's terminal.
     [['serve', '--port', '4096'], {}],
     [['web'], {}],
+    // ACP: stdout is the JSON-RPC stream and stderr the editor's log; the model's
+    // reply carries the output there (plugin-acp-command-output.test.ts).
     [['acp'], { OPENCODE_CLIENT: 'acp' }],
     [['serve'], { OPENCODE_CLIENT: 'desktop' }],
   ]
