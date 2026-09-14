@@ -13,13 +13,14 @@ import { BridgeClient } from '../src/ws/bridge'
  * decode, gzip that does not inflate — went to express's final handler, which
  * answered an HTML page and printed the error's full stack: about 950 bytes
  * and 11 lines per request, for anyone, since the public routes parse before
- * any check. nginx's tight zone on /api/activate is an exact match that
- * /api/activate/x and /API/activate both miss, while express routes them to
- * the same parser. And the SyntaxError's message quotes the raw body around
- * the fault, newlines included, so a caller could write lines of its own
- * choosing into the relay's log. NODE_ENV=production does not stop the
- * logging (express skips it only for 'test'), so the app is put there below:
- * under vitest's NODE_ENV=test this half of the bug is invisible.
+ * any check. (nginx's tight zone on /api/activate is an exact match that
+ * /api/activate/x and /API/activate both miss; express routed them to the
+ * same parser until the relay came to answer only the exact spelling, see
+ * activate-canonical-path.test.ts.) And the SyntaxError's message quotes the
+ * raw body around the fault, newlines included, so a caller could write lines
+ * of its own choosing into the relay's log. NODE_ENV=production does not stop
+ * the logging (express skips it only for 'test'), so the app is put there
+ * below: under vitest's NODE_ENV=test this half of the bug is invisible.
  */
 
 let relay: http.Server
@@ -66,9 +67,6 @@ test('a malformed JSON body on the public API is a JSON 400, not logged', async 
   const cases: Array<[string, string, string]> = [
     ['post', '/api/activate', '{"code":'],
     ['post', '/api/sessions', '{"session_id":'],
-    // Outside nginx's exact-match zone for /api/activate, same parser here.
-    ['post', '/api/activate/x', '{bad'],
-    ['post', '/API/activate', '{bad'],
     ['delete', '/api/sessions/ses_x', '{bad'],
     // V8 quotes the body around the fault: this would forge a log line.
     ['post', '/api/activate', '{"a": x\n[forged] line\n}'],
@@ -78,6 +76,12 @@ test('a malformed JSON body on the public API is a JSON 400, not logged', async 
       .set('Content-Type', 'application/json')
       .send(body)
     expectJson(res, 400, 'invalid json')
+  }
+  // Outside nginx's exact-match zone for /api/activate: refused before the
+  // parser reads the body, so the same JSON, not logged, only a 404.
+  for (const path of ['/api/activate/x', '/API/activate']) {
+    const res = await request(relay).post(path).set('Content-Type', 'application/json').send('{bad')
+    expectJson(res, 404, 'not found')
   }
   await nothingLogged()
 })

@@ -61,7 +61,7 @@ What the vhost adds beyond TLS termination:
 | Directive | Why |
 | --------- | --- |
 | `client_max_body_size 32m` (server), `64k` on `/api/activate` and `/api/sessions` | nginx's 1 MB default capped a viewer's prompt long before the relay's own 25 MB limit; the public endpoints are cut the other way, since a registration is a few hundred bytes. |
-| `limit_req zone=oc_activate` (120 r/m, burst 40), `oc_register` (60 r/m, burst 10), `oc_general` (200 r/s, burst 400) | A code-guessing flood is stopped at the edge instead of costing the relay a hash and a one-second timer per attempt. The relay's per-share lock (five wrong codes in a row, from any address) is still the security control; this is the shield in front of it, and the only per-address limit on activation. |
+| `limit_req zone=oc_activate` (120 r/m, burst 40), `oc_register` (60 r/m, burst 10), `oc_general` (200 r/s, burst 400) | A code-guessing flood is stopped at the edge instead of costing the relay a hash and a one-second timer per attempt. The relay's per-share lock (five wrong codes in a row, from any address) is still the security control; this is the shield in front of it, and the only per-address limit on activation. The zone sits on `location = /api/activate`, an exact, case-sensitive match; the relay activates at exactly that path and answers 404 to any other spelling (`/API/activate`, `/api/activate/`), so no activation reaches the relay through `oc_general` instead. |
 | `limit_conn oc_conn 256` | One client cannot park thousands of SSE sockets. |
 | No limits on `location = /bridge` | One long-lived socket per share; throttling a reconnect storm would keep shares down rather than protect anything. |
 

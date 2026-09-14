@@ -371,7 +371,16 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
   // few hundred bytes (session id, directory, title, access code), so cap the
   // body well below express's default rather than letting an anonymous caller
   // make the relay buffer 100 KB per request.
-  app.use('/api/activate', express.json({ limit: PUBLIC_BODY_LIMIT }), activateRouter(store))
+  //
+  // Activation answers under ONE spelling: the path nginx's exact-match
+  // `location = /api/activate` covers, whose oc_activate zone is the only
+  // per-address throttle on code guessing. An express mount ignores case and a
+  // trailing slash, and its URL parser turns `\` into `/` once the request line
+  // carries a `#`, so /API/activate, /api/activate/ and /api\activate#x all
+  // activated while nginx matched none of them and passed them to `location /`
+  // under oc_general, a hundred times looser. Any other spelling is now the
+  // JSON 404 before its body is read; the join page posts to exactly this one.
+  app.use('/api/activate', exactPathOnly('/api/activate'), express.json({ limit: PUBLIC_BODY_LIMIT }), activateRouter(store))
   app.use('/api/sessions', express.json({ limit: PUBLIC_BODY_LIMIT }), skillRouter(store, bridge))
   /**
    * Send a viewer who lands here back to their own share, if we can tell which
@@ -547,6 +556,26 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
  * not a tunable of the relay.
  */
 const PUBLIC_BODY_LIMIT = '32kb'
+
+/**
+ * Pass a request on only when its request-target, up to any query string, is
+ * `path` byte for byte; answer everything else under the mount with the JSON
+ * 404 an unknown path gets.
+ *
+ * Read from the raw originalUrl on purpose, not req.path or req.baseUrl:
+ * express's own parsing is what folds case, drops a trailing slash and turns
+ * `\` into `/`, so a check on its output would pass the very spellings nginx's
+ * exact-match location does not see (nginx proxies the target as the client
+ * sent it, in origin form).
+ */
+function exactPathOnly(path: string): express.RequestHandler {
+  return (req, res, next) => {
+    const target = req.originalUrl
+    const query = target.indexOf('?')
+    if ((query === -1 ? target : target.slice(0, query)) === path) return next()
+    res.status(404).json({ error: 'not found' })
+  }
+}
 
 /**
  * The official UI's canonical session URL: /<base64url(directory)>/session/<id>.
