@@ -19,6 +19,7 @@ import {
   saveSessionState,
   loadSessionState,
   clearSessionState,
+  clearOwnSessionState,
   latestSessionState,
   ownerKey,
   type SessionState,
@@ -167,7 +168,11 @@ export async function startBridge(
       // Never leave an orphaned session behind when the WS/SSE setup fails.
       ws.close()
       await relay.deleteSession(session_id, bridge_token).catch(() => {})
-      clearSessionState(session_id)
+      // Only our own state, as in stop() below. A concurrent start of this
+      // session that registered after us replaced our registration (the relay
+      // then refuses our bridge with 401) and has written ITS state under the
+      // same name by now.
+      clearOwnSessionState(session_id, bridge_token)
       throw err
     }
   } catch (err) {
@@ -213,7 +218,7 @@ export async function startBridge(
     // replaces our registration on the relay (which is how we got here, with a
     // 4001) and has already written ITS state under the same name: removing
     // that would leave the live share without the token `stop` needs.
-    if (loadSessionState(session_id)?.bridge_token === bridge_token) clearSessionState(session_id)
+    clearOwnSessionState(session_id, bridge_token)
     resolveClosed(reason)
   }
   // The relay only closes us on purpose when the session is gone (stopped
@@ -382,7 +387,10 @@ async function settleEarlierShare(relay: RelayClient, sessionId: string, endLeft
         `and it could not be ended on the relay (${failure}) — try again`,
     )
   }
-  clearSessionState(sessionId)
+  // By token, not by name: a concurrent start that settled this same dead share
+  // while our DELETE was on its way may have registered and written its own
+  // state already, and a failure of ours further on must not cost it that.
+  clearOwnSessionState(sessionId, state.bridge_token)
   console.warn(`bridge: ended the earlier share of session ${sessionId}; its bridge (pid ${state.pid}) was no longer running`)
   if (endLeftoverServer && terminateSpawnedServer(state.server_pid, state.started_at)) {
     // Detection runs next, and a server still shutting down answers its health

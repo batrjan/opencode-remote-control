@@ -74,6 +74,22 @@ export function clearSessionState(sessionId: string): void {
 }
 
 /**
+ * Remove the state of `sessionId` only while it still holds `bridgeToken`: the
+ * share that token belongs to is ending, and the file is its to remove.
+ *
+ * The file is named after the session, not the share, and a start only sees a
+ * share this install runs once that share has written it — after registering.
+ * Two overlapping starts of one session can therefore both register, the relay
+ * letting the later one replace the earlier (same owner_key), and the later
+ * one's state is then already on disk when the earlier one tears down. Removing
+ * the file by name there took the live share's token with it: `stop` answered
+ * "not shared from this machine" and nothing local could end that share.
+ */
+export function clearOwnSessionState(sessionId: string, bridgeToken: string): void {
+  if (loadSessionState(sessionId)?.bridge_token === bridgeToken) clearSessionState(sessionId)
+}
+
+/**
  * The owner_key this install registers `sessionId` with on the relay at
  * `relayUrl`: HMAC-SHA256 of the relay's origin and the id under the install
  * secret (see loadOrCreateOwnerSecret), base64url.

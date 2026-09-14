@@ -8233,6 +8233,9 @@ function clearSessionState(sessionId) {
   } catch {
   }
 }
+function clearOwnSessionState(sessionId, bridgeToken) {
+  if (loadSessionState(sessionId)?.bridge_token === bridgeToken) clearSessionState(sessionId);
+}
 function ownerKey(relayUrl, sessionId) {
   let url;
   try {
@@ -8361,7 +8364,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
       ws.close();
       await relay.deleteSession(session_id, bridge_token).catch(() => {
       });
-      clearSessionState(session_id);
+      clearOwnSessionState(session_id, bridge_token);
       throw err;
     }
   } catch (err) {
@@ -8385,7 +8388,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
       await relay.deleteSession(session_id, bridge_token);
     } catch {
     }
-    if (loadSessionState(session_id)?.bridge_token === bridge_token) clearSessionState(session_id);
+    clearOwnSessionState(session_id, bridge_token);
     resolveClosed(reason);
   };
   ws.onFatal = (err) => void stop(`the relay ended the session (${err.message})`);
@@ -8481,7 +8484,7 @@ async function settleEarlierShare(relay, sessionId, endLeftoverServer) {
       `session ${sessionId} is still registered by an earlier share whose bridge (pid ${state.pid}) is gone, and it could not be ended on the relay (${failure}) \u2014 try again`
     );
   }
-  clearSessionState(sessionId);
+  clearOwnSessionState(sessionId, state.bridge_token);
   console.warn(`bridge: ended the earlier share of session ${sessionId}; its bridge (pid ${state.pid}) was no longer running`);
   if (endLeftoverServer && terminateSpawnedServer(state.server_pid, state.started_at)) {
     const deadline = Date.now() + LEFTOVER_SERVER_EXIT_WAIT_MS;
