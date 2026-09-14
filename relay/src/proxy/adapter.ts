@@ -895,7 +895,9 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // revoked by the first share silently received the second one's events
     // without ever seeing the new code. Re-validating on the beat closes the
     // stream within one heartbeat. It also slides last_used, which is correct:
-    // a viewer holding an open stream is present, not idle.
+    // a viewer holding an open stream is present, not idle. The end of the
+    // whole registration does not wait for the beat (see onRegistrationEnd
+    // below); the beat is what catches a single viewer's expiry or eviction.
     const viewerToken = extractViewerToken(req)
     const subagents = subagentsOf(session)
     let unsubscribe: () => void = () => {}
@@ -1198,6 +1200,18 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       for (const stream of [...streams]) stream.end()
     }
   }
+
+  // End a share's viewer streams the moment its registration ends, not at the
+  // next heartbeat (see Store.onRegistrationEnd). Streams are fed by session
+  // id, and that id's next registration (an owner's replacement dials in at
+  // once) otherwise streamed its live events to the revoked viewers. Every
+  // stream tracked under the id belongs to the registration that ended: the
+  // store calls this before anyone holds the next one's code. Ended rather
+  // than cut, as on shutdown: the UI reconnects promptly, and that request
+  // gets the 401 that sends the viewer to the code-entry page.
+  store.onRegistrationEnd((session_id) => {
+    for (const stream of [...(viewerStreams.get(session_id) ?? [])]) stream.end()
+  })
 
   return Object.assign(router, { endEventStreams })
 }

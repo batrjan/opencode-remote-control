@@ -99,6 +99,8 @@ export class Store {
   private claims: Map<string, OwnerClaim> = new Map()
   /** Called after anything that changes the session set, or activity on it (see setChangeListener). */
   private onChange: (() => void) | null = null
+  /** Told when a registration ends — see onRegistrationEnd. */
+  private endListeners: Set<(session_id: string) => void> = new Set()
   /** When the store last marked itself dirty — see noteActivity. */
   private lastDirtyAt = 0
 
@@ -273,6 +275,9 @@ export class Store {
     }
     this.sessions.set(session_id, session)
     this.changed()
+    // Before the secrets go out: the new bridge cannot dial in, nor a new
+    // viewer join, until the caller has them.
+    if (existing) this.registrationEnded(session_id)
     return { session_id, access_code, bridge_token, viewer_url: `/${session_id}`, replaced: existing !== undefined }
   }
 
@@ -567,6 +572,7 @@ export class Store {
     // The id is free now, and it is in every link the owner handed out.
     this.recordClaim(session, Date.now())
     this.changed()
+    this.registrationEnded(session_id)
     return true
   }
 
@@ -613,6 +619,7 @@ export class Store {
     // Registration counters are otherwise pruned only by the next registration.
     this.pruneRegistrations(now)
     if (removed.length) this.changed()
+    for (const id of removed) this.registrationEnded(id)
     return removed
   }
 
@@ -661,6 +668,41 @@ export class Store {
    */
   setChangeListener(listener: (() => void) | null): void {
     this.onChange = listener
+  }
+
+  /**
+   * Be told whenever a registration ends: deleted by its bridge, reaped, or
+   * replaced by its owner's new registration of the same id. Returns an
+   * unsubscribe function. The listener runs after the store has let go of the
+   * registration (its viewer tokens are already revoked) and, for a
+   * replacement, before its caller hands out the new share's secrets.
+   *
+   * What it is for: a viewer's open event stream. It authenticates once, at
+   * open, and is fed by session id, so a revoked viewer used to keep it until
+   * the heartbeat's re-check, up to 15 s. Meanwhile the same id's next
+   * registration (an owner's replacement dials in within a second) had its
+   * live events delivered to every viewer of the share that had just ended.
+   */
+  onRegistrationEnd(listener: (session_id: string) => void): () => void {
+    this.endListeners.add(listener)
+    return () => {
+      this.endListeners.delete(listener)
+    }
+  }
+
+  /**
+   * Runs on the request path and inside the reaper's timer, where an exception
+   * would fail a finished delete with a 500 or end the process: a listener
+   * that throws is logged, never rethrown.
+   */
+  private registrationEnded(session_id: string): void {
+    for (const listener of [...this.endListeners]) {
+      try {
+        listener(session_id)
+      } catch (err) {
+        console.warn(`[store] registration end listener failed: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
   }
 
   private changed(): void {
