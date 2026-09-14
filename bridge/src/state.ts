@@ -74,19 +74,40 @@ export function clearSessionState(sessionId: string): void {
 }
 
 /**
- * The owner_key this install registers `sessionId` with: HMAC-SHA256 of the id
- * under the install secret (see loadOrCreateOwnerSecret), base64url.
+ * The owner_key this install registers `sessionId` with on the relay at
+ * `relayUrl`: HMAC-SHA256 of the relay's origin and the id under the install
+ * secret (see loadOrCreateOwnerSecret), base64url.
  *
  * The share link names the session id, and the owner registers that same id
  * again every time the conversation is shared. The relay used to hand a freed
  * id to whoever registered it first, so anyone holding an old link could take
  * it the moment the owner stopped, and the owner's next start failed with a
  * 409 it had no token to clear. The relay now reserves an id for the key it
- * was registered with. Derived per id, so the key sent for one share proves
- * nothing about any other; the secret itself never leaves this machine.
+ * was registered with, and lets that key replace a live registration of it.
+ *
+ * Derived per id, so the key sent for one share proves nothing about any
+ * other, and per relay, because every relay the bridge registers with reads
+ * the key in the clear: a self-hosted one, or a mistyped address. Keyed on the
+ * id alone, whoever ran that relay could replay it on the public one and take
+ * over the owner's live share there (code, viewers and bridge revoked, fresh
+ * credentials handed to them) or claim its id. The origin, not the URL as
+ * typed: a trailing slash, a default port or credentials in the URL name the
+ * same relay and must not cost the owner its reservation. The secret itself
+ * never leaves this machine.
  */
-export function ownerKey(sessionId: string): string {
-  return createHmac('sha256', loadOrCreateOwnerSecret()).update(sessionId).digest('base64url')
+export function ownerKey(relayUrl: string, sessionId: string): string {
+  let url: URL | undefined
+  try {
+    url = new URL(relayUrl)
+  } catch {
+    url = undefined
+  }
+  // Other schemes have no relay to register with (fetch refuses them), and
+  // some share one opaque origin ('null'): fail before anything is sent.
+  if (url?.protocol !== 'http:' && url?.protocol !== 'https:') {
+    throw new Error('relay URL must be an http:// or https:// URL')
+  }
+  return createHmac('sha256', loadOrCreateOwnerSecret()).update(`${url.origin}\n${sessionId}`).digest('base64url')
 }
 
 const OWNER_SECRET_BYTES = 32

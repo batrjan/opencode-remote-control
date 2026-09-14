@@ -8233,8 +8233,18 @@ function clearSessionState(sessionId) {
   } catch {
   }
 }
-function ownerKey(sessionId) {
-  return (0, import_node_crypto.createHmac)("sha256", loadOrCreateOwnerSecret()).update(sessionId).digest("base64url");
+function ownerKey(relayUrl, sessionId) {
+  let url;
+  try {
+    url = new URL(relayUrl);
+  } catch {
+    url = void 0;
+  }
+  if (url?.protocol !== "http:" && url?.protocol !== "https:") {
+    throw new Error("relay URL must be an http:// or https:// URL");
+  }
+  return (0, import_node_crypto.createHmac)("sha256", loadOrCreateOwnerSecret()).update(`${url.origin}
+${sessionId}`).digest("base64url");
 }
 var OWNER_SECRET_BYTES = 32;
 function ownerSecretPath() {
@@ -8433,7 +8443,7 @@ async function startBridge(relayUrl, apiKey, opts = {}) {
 }
 async function registerShare(relay, sessionId, directory, title, endLeftoverServer, settleFirst) {
   const isConflict = (err) => err instanceof RelayHttpError && err.status === 409;
-  const key = ownerKey(sessionId);
+  const key = ownerKey(relay.url, sessionId);
   if (settleFirst) await settleEarlierShare(relay, sessionId, endLeftoverServer);
   try {
     return await relay.createSession(sessionId, directory, title, key);

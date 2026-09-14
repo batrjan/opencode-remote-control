@@ -323,7 +323,9 @@ async function registerShare(
   settleFirst: boolean,
 ): Promise<RelaySession> {
   const isConflict = (err: unknown) => err instanceof RelayHttpError && err.status === 409
-  const key = ownerKey(sessionId)
+  // Bound to this relay: the key is sent in the clear, and must prove nothing
+  // on any other one (see ownerKey).
+  const key = ownerKey(relay.url, sessionId)
   if (settleFirst) await settleEarlierShare(relay, sessionId, endLeftoverServer)
   try {
     return await relay.createSession(sessionId, directory, title, key)

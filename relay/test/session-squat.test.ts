@@ -25,7 +25,8 @@ import { config } from '../src/config'
  * real bridge library: attacker 201, owner 409, no DELETE recourse.
  *
  * A bridge now proves which install shared an id with an owner_key (an HMAC of
- * the id under a secret that never leaves the owner's machine). The relay
+ * the relay's origin and the id under a secret that never leaves the owner's
+ * machine; bridge/test/owner-key.test.ts checks the relay binding). The relay
  * keeps a salted hash of it on the session, and after the session ends as a
  * claim that outlives it: only the same key may register that id again, and
  * the same key may replace its own registration outright — a start after a

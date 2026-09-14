@@ -191,7 +191,10 @@ export class Store {
    * stopped (or the reaper removed a share whose bridge died), hold it for
    * good with a connected socket, and leave the owner a 409 with no token to
    * clear it. `owner_key` is the bridge's proof of which install shared the id
-   * (an HMAC of the id under a secret kept on the owner's machine):
+   * (an HMAC of this relay's origin and the id under a secret kept on the
+   * owner's machine — bound to the relay, because every relay the bridge
+   * registers with reads it in the clear, and a key some other relay was sent
+   * must not replace a live share here):
    * - a live session registered with a key is replaced by a registration with
    *   the same key — its bridge died without a word, and a restart must not
    *   wait a day — and refused to anyone else. `replaced` tells the caller to
