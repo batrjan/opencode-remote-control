@@ -50,6 +50,13 @@ export interface Session {
    * config.unboundReapMs gives up its slot — see there.
    */
   unbound_since?: number
+  /**
+   * In memory only: the last sign of life from a bridge socket that had stayed
+   * open for at least a ping interval (see touchSession). What a full relay
+   * ranks departed shares by (evictDepartedShare) — not last_seen, which every
+   * connection moves the moment it opens.
+   */
+  bridge_alive_at?: number
   viewers: Map<string, ViewerToken> // salted hash -> { salt, created_at, last_used, index }
 }
 
@@ -141,19 +148,28 @@ export class Store {
    * gives up the slot of the share whose bridge has been gone longest (see
    * evictDepartedShare): one handshake per registration used to keep such a
    * relay full for a day.
+   *
+   * Making room ends someone's share, so it is done only for a registration
+   * that will then exist: after the per-address limits, and never for an id
+   * reserved for another install's owner_key (createSession answers that one
+   * 409). Both used to be checked after the eviction, so a request refused
+   * anyway had already ended a share. `owner_key` is the registration's, for
+   * that check; `isConnected` says which sessions have a bridge socket right
+   * now (the bridge hub's), none of which may be ended.
    */
-  checkRegistrationLimit(ip: string, session_id?: string): void {
-    if (
-      this.sessions.size >= maxSessions() &&
-      (session_id === undefined || !this.sessions.has(session_id))
-    ) {
-      // Only the unbound criterion (no idle limit): none of those has a bridge
-      // socket, so nothing is left for the caller to disconnect. Nor does the
-      // share evicted next (see departedBridgeMs).
-      this.reapOrphans(Number.POSITIVE_INFINITY)
-      if (this.sessions.size >= maxSessions()) this.evictDepartedShare()
-      if (this.sessions.size >= maxSessions()) throw new Error('relay full')
-    }
+  checkRegistrationLimit(
+    ip: string,
+    session_id?: string,
+    owner_key?: string,
+    isConnected: (session_id: string) => boolean = () => false,
+  ): void {
+    const full = () =>
+      this.sessions.size >= maxSessions() && (session_id === undefined || !this.sessions.has(session_id))
+    // Only the unbound criterion (no idle limit): none of those has a bridge
+    // socket, so nothing is left for the caller to disconnect, and none is a
+    // share anyone waits on — the reaper drops them anyway, so this may run for
+    // a request refused below.
+    if (full()) this.reapOrphans(Number.POSITIVE_INFINITY)
     const now = Date.now()
     const rec = this.registrations.get(ip)
     if (rec && now - rec.windowStart < config.registrationWindowMs && rec.count >= config.registrationsPerWindow) {
@@ -165,6 +181,16 @@ export class Store {
     }
     if (active >= config.maxActiveSessionsPerIp) {
       throw new Error('rate limited')
+    }
+    if (full()) {
+      // Refused as 'session exists' by createSession, whatever room it got.
+      if (session_id !== undefined) {
+        const claim = this.liveClaim(session_id, now)
+        if (claim && !ownerKeyMatches(claim.hash, claim.salt, owner_key)) return
+      }
+      // Nor has the share evicted here a bridge socket (isConnected).
+      this.evictDepartedShare(isConnected)
+      if (full()) throw new Error('relay full')
     }
   }
 
@@ -639,16 +665,27 @@ export class Store {
    * the restore: its bridge was connected to the previous process and is
    * re-dialling this one on a backoff the downtime stretched, and last_seen in
    * the file says nothing about that (the same reasoning as unbound_since).
+   *
+   * "Silent" is counted from the last sign of life of a bridge that stayed a
+   * ping interval (Session.bridge_alive_at), or from the registration when none
+   * has. It used to be last_seen, which a connection moves as it opens, so a
+   * handshake (connect, close) per session every departedBridgeMs, a few a
+   * second for a whole relay from one host, kept sessions nobody bridged in
+   * their slots — and the share ended in their place was an honest one whose
+   * owner's laptop had gone to sleep. A bridge back from such a sleep has not
+   * shown that life yet, so a connected session is never a candidate:
+   * `isConnected` is the bridge hub's view.
    */
-  private evictDepartedShare(): void {
+  private evictDepartedShare(isConnected: (session_id: string) => boolean): void {
     const now = Date.now()
     const silentFor = departedBridgeMs()
     let victim: Session | undefined
     let victimSeen = 0
     for (const session of this.sessions.values()) {
       if (session.unbound_since !== undefined) continue
+      if (isConnected(session.id)) continue
       // A session this process created was seen after any restore anyway.
-      const seen = Math.max(session.last_seen, this.restoredAt)
+      const seen = Math.max(session.bridge_alive_at ?? session.created_at, this.restoredAt)
       if (now - seen <= silentFor) continue
       if (victim === undefined || seen < victimSeen) {
         victim = session
@@ -665,7 +702,7 @@ export class Store {
     // registration fills it, so there is at most one line per registration.
     console.warn(
       `[store] relay full: ended share session=${JSON.stringify(victim.id)} ` +
-        `(no bridge for ${Math.round((now - victimSeen) / 60_000)} min) to make room (RELAY_MAX_SESSIONS)`,
+        `(no live bridge for ${Math.round((now - victimSeen) / 60_000)} min) to make room (RELAY_MAX_SESSIONS)`,
     )
   }
 
@@ -689,12 +726,18 @@ export class Store {
    * registration up (see Session.unbound_since), and persists that at once
    * rather than within the activity throttle: a restart that missed it would
    * start the short unbound clock again for a share whose bridge may be asleep.
+   *
+   * `provenLife` marks a sign of life from a bridge socket that has stayed open
+   * a ping interval: only that renews the clock a full relay ranks by (see
+   * Session.bridge_alive_at). A connection as it opens, or a byte sent before
+   * the socket has been around that long, still counts for everything else.
    */
-  touchSession(session_id: string): void {
+  touchSession(session_id: string, provenLife = false): void {
     const s = this.sessions.get(session_id)
     if (!s) return
     const now = Date.now()
     s.last_seen = now
+    if (provenLife) s.bridge_alive_at = now
     if (s.unbound_since !== undefined) {
       delete s.unbound_since
       this.changed()

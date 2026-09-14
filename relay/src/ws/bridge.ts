@@ -147,9 +147,13 @@ export class BridgeClient {
       this.store.touchSession(session_id)
       // A pong is proof the bridge is reachable — and proof the share is in
       // use, so it also keeps the orphan reaper away from an idle session.
+      // What a full relay ranks shares by moves only once the socket has
+      // stayed a ping interval (see Store.evictDepartedShare): a connect, a
+      // byte and a close cost nothing, and repeated they held a slot. Its age,
+      // not our ping being answered: ws reports an unsolicited pong the same.
       const alive = () => {
         this.missedPongs.set(ws, 0)
-        this.store.touchSession(session_id)
+        this.store.touchSession(session_id, Date.now() - connectedAt >= wsPingIntervalMs())
       }
       ws.on('pong', alive)
       // So is ANY byte from the bridge. Its pong travels on the same socket as

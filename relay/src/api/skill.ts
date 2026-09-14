@@ -67,7 +67,7 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
     }
     const ip = req.ip ?? 'unknown'
     try {
-      store.checkRegistrationLimit(ip, session_id)
+      store.checkRegistrationLimit(ip, session_id, owner_key, (id) => bridge?.isConnected(id) ?? false)
     } catch (err) {
       // Not the caller's doing, so not a 429: the relay holds all the sessions
       // it will (config maxSessions). Logged, because the operator is the one

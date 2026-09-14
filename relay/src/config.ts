@@ -295,7 +295,8 @@ export function sseMaxParkedBytes(): number {
  * the registrations no bridge connected to in time (config.unboundReapMs), and
  * then gives one new registration the slot of the share whose bridge has been
  * gone longest (departedBridgeMs). Filling it takes a bridge per session that
- * keeps answering, not a bare POST, nor one handshake a day.
+ * keeps answering, not a bare POST, nor a handshake every few minutes (only a
+ * socket that stays a ping interval renews a slot, see Store.touchSession).
  */
 export function maxSessions(): number {
   return envInt('RELAY_MAX_SESSIONS', 2000)
