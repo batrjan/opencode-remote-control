@@ -14,7 +14,7 @@ import {
 import { detectOpenCodePort, ensureOpenCodeServer, listListeners, type Listener } from './detect.js'
 import { describeError, originOf } from './errors.js'
 import { OpencodeClient } from './opencode.js'
-import { RelayClient, RelayHttpError, RelayWSClient, type RelaySession } from './relay.js'
+import { RelayClient, RelayHttpError, RelayWSClient, type RelaySession, type SessionStatus } from './relay.js'
 import {
   saveSessionState,
   loadSessionState,
@@ -691,7 +691,7 @@ export async function stopBridge(
   )
 }
 
-/** A relay DELETE that threw, in words the owner can act on. */
+/** A relay DELETE (or status probe, under the same deadline) that threw, in words the owner can act on. */
 function describeRelayError(err: unknown): string {
   if (err instanceof Error && err.name === 'TimeoutError') {
     return `relay did not answer within ${Math.round(relayDeleteTimeoutMs() / 1000)} s`
@@ -1202,7 +1202,21 @@ program
       const current = new RelayClient(opts.relay, opts.apiKey)
       const probe = local ? shareRelay(local, current) : current
       const where = probe === current ? '' : ` (relay ${originOf(probe.url) ?? 'unknown'})`
-      const { status, body } = await probe.getSession(sessionId, ownerToken)
+      let probed: { status: number; body?: SessionStatus }
+      try {
+        probed = await probe.getSession(sessionId, ownerToken)
+      } catch (err) {
+        // That relay is not always the one --relay names and the health check
+        // above found "ok": an owner who moved off a relay that is down now
+        // asks it all the same. Its failure used to escape the command as a
+        // stack trace on stderr, which the plugin does not show for a status,
+        // and took the session line and the stale-share hint with it.
+        console.log(`session ${sessionId}${where}: unknown — ${describeRelayError(err)}`)
+        if (bridgeProcess) console.log(bridgeProcess)
+        process.exitCode = 1
+        return
+      }
+      const { status, body } = probed
       if (status === 404) {
         console.log(`session ${sessionId}${where}: not found`)
         if (bridgeProcess) console.log(bridgeProcess)

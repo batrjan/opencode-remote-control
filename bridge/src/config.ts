@@ -86,6 +86,7 @@ export function wsHandshakeTimeoutMs(): number {
  * nothing torn down. The request is a few hundred bytes, which even a
  * 0.7 Mbit/s uplink moves in well under a second; the deadline leaves `stop`
  * room inside that 15 s to take the share down locally and say what happened.
+ * `status` bounds its session probe by the same deadline, for the same reason.
  */
 export function relayDeleteTimeoutMs(): number {
   const v = Number(process.env.REMOTE_CONTROL_RELAY_DELETE_TIMEOUT_MS)

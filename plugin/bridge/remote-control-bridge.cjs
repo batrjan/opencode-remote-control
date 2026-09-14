@@ -7547,12 +7547,21 @@ var RelayClient = class {
     });
     return res.status;
   }
-  /** Session status probe for `bridge status`. Returns parsed body + HTTP status. */
-  async getSession(sessionId, bridgeToken) {
+  /**
+   * Session status probe for `bridge status`. Returns parsed body + HTTP status.
+   *
+   * Bounded by `timeoutMs` (rejects with a TimeoutError), as deleteSession is:
+   * `status` asks the relay a share was registered on, which after a move to
+   * another relay may be one that accepts the connection and never answers —
+   * and the plugin kills a status that takes 15 s, with nothing said about why.
+   */
+  async getSession(sessionId, bridgeToken, timeoutMs = relayDeleteTimeoutMs()) {
     const res = await fetchFrom("relay", `${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
       // The bridge_token unlocks the owner-only fields (directory, title) that
       // the public presence view withholds.
-      headers: { ...this.headers(), ...bridgeToken ? { "x-bridge-token": bridgeToken } : {} }
+      headers: { ...this.headers(), ...bridgeToken ? { "x-bridge-token": bridgeToken } : {} },
+      // Covers reading the body below too.
+      signal: AbortSignal.timeout(timeoutMs)
     });
     if (res.status !== 200) return { status: res.status };
     return { status: 200, body: await res.json() };
@@ -8898,7 +8907,16 @@ program2.command("status").description("Probe relay health, local opencode detec
     const current = new RelayClient(opts.relay, opts.apiKey);
     const probe = local ? shareRelay(local, current) : current;
     const where = probe === current ? "" : ` (relay ${originOf(probe.url) ?? "unknown"})`;
-    const { status, body } = await probe.getSession(sessionId, ownerToken);
+    let probed;
+    try {
+      probed = await probe.getSession(sessionId, ownerToken);
+    } catch (err) {
+      console.log(`session ${sessionId}${where}: unknown \u2014 ${describeRelayError(err)}`);
+      if (bridgeProcess) console.log(bridgeProcess);
+      process.exitCode = 1;
+      return;
+    }
+    const { status, body } = probed;
     if (status === 404) {
       console.log(`session ${sessionId}${where}: not found`);
       if (bridgeProcess) console.log(bridgeProcess);

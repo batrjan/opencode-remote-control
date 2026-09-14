@@ -148,12 +148,25 @@ export class RelayClient {
     return res.status
   }
 
-  /** Session status probe for `bridge status`. Returns parsed body + HTTP status. */
-  async getSession(sessionId: string, bridgeToken?: string): Promise<{ status: number; body?: SessionStatus }> {
+  /**
+   * Session status probe for `bridge status`. Returns parsed body + HTTP status.
+   *
+   * Bounded by `timeoutMs` (rejects with a TimeoutError), as deleteSession is:
+   * `status` asks the relay a share was registered on, which after a move to
+   * another relay may be one that accepts the connection and never answers —
+   * and the plugin kills a status that takes 15 s, with nothing said about why.
+   */
+  async getSession(
+    sessionId: string,
+    bridgeToken?: string,
+    timeoutMs = relayDeleteTimeoutMs(),
+  ): Promise<{ status: number; body?: SessionStatus }> {
     const res = await fetchFrom('relay', `${this.url}/api/sessions/${encodeURIComponent(sessionId)}`, {
       // The bridge_token unlocks the owner-only fields (directory, title) that
       // the public presence view withholds.
       headers: { ...this.headers(), ...(bridgeToken ? { 'x-bridge-token': bridgeToken } : {}) },
+      // Covers reading the body below too.
+      signal: AbortSignal.timeout(timeoutMs),
     })
     if (res.status !== 200) return { status: res.status }
     return { status: 200, body: (await res.json()) as SessionStatus }

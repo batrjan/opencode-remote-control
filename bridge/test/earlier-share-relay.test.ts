@@ -125,12 +125,15 @@ function recordShare(id: string, relay: StubRelay, recordedUrl: string, pid?: nu
   return bridge_token
 }
 
-function runCli(args: string[]): Promise<{ code: number; stdout: string }> {
+function runCli(args: string[], env: NodeJS.ProcessEnv = {}): Promise<{ code: number; stdout: string }> {
   return new Promise((resolve) => {
     execFile(
       process.execPath,
       [BUNDLE, ...args],
-      { env: { ...process.env, HOME: home, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}` }, timeout: 15_000 },
+      {
+        env: { ...process.env, ...env, HOME: home, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}` },
+        timeout: 15_000,
+      },
       (err, stdout) => resolve({ code: err ? Number((err as { code?: unknown }).code ?? 1) : 0, stdout: String(stdout) }),
     )
   })
@@ -242,3 +245,69 @@ test('status through another relay asks the relay the share was registered on, a
   expect(stdout).toContain(`session ses_moved_status (relay ${original.url}): active`)
   expect(stdout).toContain('title: owner-only title')
 }, 30_000)
+
+/*
+ * Asking the share's own relay made that relay a second one `status` depends
+ * on — and exactly in the case it was made for, the owner has left it. When it
+ * could not be reached the probe threw out of the command: the CLI died with a
+ * stack trace on stderr, after "relay: ok" for the relay it was pointed at, and
+ * never printed the session line or the "run stop to end it" hint for a dead
+ * bridge. The plugin shows only stdout for a failed status, so the owner saw a
+ * near-healthy report. A relay that accepted the connection and never answered
+ * held `status` open until the plugin killed it 15 s later, with the same
+ * report.
+ */
+
+// POSIX only: whether the recorded bridge is gone comes from `ps`.
+test.skipIf(process.platform === 'win32')(
+  'status of a dead share whose own relay is gone says so, and still says to stop it',
+  async () => {
+    await twoRelays()
+    const token = recordShare('ses_gone_relay', original, original.url, await exitedPid())
+    // The owner moved to the other relay, and the one the share lived on is down.
+    original.server.closeAllConnections()
+    await new Promise((resolve) => original.server.close(resolve))
+
+    const { code, stdout } = await runCli(['status', '--relay', other.url, '--session-id', 'ses_gone_relay'])
+
+    expect(code).toBe(1)
+    expect(stdout).toContain(`relay: ok (${other.url})`)
+    const port = new URL(original.url).port
+    expect(stdout).toContain(
+      `session ses_gone_relay (relay ${original.url}): unknown — relay ${original.url} unreachable: fetch failed (connect ECONNREFUSED 127.0.0.1:${port})`,
+    )
+    expect(stdout).toMatch(/bridge process: not running \(pid \d+\) — this share is stale, run stop to end it/)
+    expect(other.seen.filter((r) => r.token === token)).toEqual([])
+  },
+  30_000,
+)
+
+test.skipIf(process.platform === 'win32')(
+  'status of a dead share whose own relay never answers gives up on it in time',
+  async () => {
+    await twoRelays()
+    // The share's own relay accepts the connection and never answers: a wedged
+    // upstream, a black-holed path.
+    const silent = createServer(() => {})
+    await new Promise<void>((resolve) => silent.listen(0, '127.0.0.1', resolve))
+    const silentUrl = `http://127.0.0.1:${(silent.address() as AddressInfo).port}`
+    const token = recordShare('ses_silent_relay', original, silentUrl, await exitedPid())
+    try {
+      const startedAt = Date.now()
+      const { code, stdout } = await runCli(['status', '--relay', other.url, '--session-id', 'ses_silent_relay'], {
+        REMOTE_CONTROL_RELAY_DELETE_TIMEOUT_MS: '500',
+      })
+
+      // Well inside the 15 s the plugin gives a status (and this runner's own kill).
+      expect(Date.now() - startedAt).toBeLessThan(10_000)
+      expect(code).toBe(1)
+      expect(stdout).toContain(`session ses_silent_relay (relay ${silentUrl}): unknown — relay did not answer within 1 s`)
+      expect(stdout).toMatch(/bridge process: not running \(pid \d+\) — this share is stale, run stop to end it/)
+      expect(other.seen.filter((r) => r.token === token)).toEqual([])
+    } finally {
+      silent.closeAllConnections()
+      await new Promise((resolve) => silent.close(resolve))
+    }
+  },
+  30_000,
+)
