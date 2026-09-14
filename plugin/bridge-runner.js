@@ -85,6 +85,40 @@ export function clearLog(file = logPath()) {
   }
 }
 
+/**
+ * Delete the bridge log after a stop, unless the access code it holds is still
+ * the code of a share recorded on this machine.
+ *
+ * bridge.log is the log of whichever share came up LAST, and its bridge goes on
+ * writing into it (how that share ended, later). The stop that ran before this
+ * may have ended another share, or none: a stop typed in a session that is not
+ * shared from here, or one that ended share A after share B had made its log
+ * bridge.log. Clearing unconditionally deleted the URL and code of a share
+ * that was still up. The code in the log names its share exactly (a share of
+ * the same session started again has a new one), and the share's state file
+ * (`<session>.json`, with that access_code) exists for as long as `stop` has
+ * something to end — so once no recorded share holds that code, the code is
+ * spent and the log goes, whichever stop got there. A log with no code in it
+ * (or none that can be read) is cleared, as before.
+ *
+ * Same best-effort contract as clearLog: never throws; true when the log is
+ * gone, false when it was kept or could not be deleted.
+ */
+export function clearSpentLog(file = logPath()) {
+  let code
+  try {
+    const line = readFileSync(file, "utf8")
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => l.startsWith("CODE:"))
+    code = line?.slice("CODE:".length).trim() || undefined
+  } catch {
+    // Missing (nothing to do) or unreadable: clearLog says which.
+  }
+  if (code !== undefined && recordedShares(path.dirname(file)).some((share) => share.access_code === code)) return false
+  return clearLog(file)
+}
+
 /** Create the private log dir/file and return a write fd for the bridge. */
 export function openLog(file = logPath()) {
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
@@ -194,6 +228,30 @@ export function startTimeoutMs(env = process.env) {
 const CANCEL_EXIT_WAIT_MS = 3_000
 
 /**
+ * The shares recorded in the state files the bridge writes beside the log
+ * (`<session>.json`), parsed. Unreadable or half-written entries are skipped;
+ * an unreadable directory records nothing.
+ */
+function recordedShares(dir = path.dirname(logPath())) {
+  let files
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".json"))
+  } catch {
+    return []
+  }
+  const shares = []
+  for (const file of files) {
+    try {
+      const state = JSON.parse(readFileSync(path.join(dir, file), "utf8"))
+      if (state && typeof state.session_id === "string") shares.push(state)
+    } catch {
+      // Unreadable or half-written entry: not a share anyone can act on.
+    }
+  }
+  return shares
+}
+
+/**
  * The share a bridge registered, found by that bridge's pid in the state files
  * it writes beside the log (`<session>.json`, `pid` = the `start` process).
  * Matching the pid rather than the session id keeps an older, live share of
@@ -201,21 +259,7 @@ const CANCEL_EXIT_WAIT_MS = 3_000
  * its own session. Undefined when that bridge registered nothing.
  */
 function registeredShare(pid, dir = path.dirname(logPath())) {
-  let files
-  try {
-    files = readdirSync(dir).filter((f) => f.endsWith(".json"))
-  } catch {
-    return undefined
-  }
-  for (const file of files) {
-    try {
-      const state = JSON.parse(readFileSync(path.join(dir, file), "utf8"))
-      if (state && state.pid === pid && typeof state.session_id === "string") return state.session_id
-    } catch {
-      // Unreadable or half-written entry: not the one we are looking for.
-    }
-  }
-  return undefined
+  return recordedShares(dir).find((state) => state.pid === pid)?.session_id
 }
 
 /**
@@ -384,11 +428,13 @@ export async function runAction(action, sessionID) {
       return await startBridge(sessionID)
     case "stop": {
       const out = await runBridge(["stop", "--relay", relayUrl(), ...idArgs])
-      // The share is down, so the URL + access code in the log are spent:
-      // scrub them here rather than leaving them in the home directory until
-      // some later start truncates the file. Only on success — a stop that
-      // failed may have left the share (and that code) live.
-      clearLog()
+      // A stopped share's URL + access code in the log are spent: scrub them
+      // here rather than leaving them in the home directory until some later
+      // start replaces the file. Only on success — a stop that failed may have
+      // left the share (and that code) live. And not when the log belongs to a
+      // share that is still recorded here: this stop may have ended another
+      // one, or nothing at all ("not shared from this machine").
+      clearSpentLog()
       return out || "Remote control stopped."
     }
     case "status":

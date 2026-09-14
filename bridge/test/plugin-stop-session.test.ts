@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type { AddressInfo } from 'node:net'
@@ -33,6 +33,20 @@ function stateFile(id: string): string {
   return path.join(home, ...STATE_DIR, `${id}.json`)
 }
 
+/** A made-up access code per fixture share, so a log can be told apart by the code it holds. */
+function codeOf(id: string): string {
+  return `CODE${id.slice(-1).toUpperCase()}${id.slice(-1).toUpperCase()}`
+}
+
+function logFile(): string {
+  return path.join(home, ...STATE_DIR, 'bridge.log')
+}
+
+/** bridge.log the way the plugin leaves it once `id`'s share came up: its URL and its code. */
+function logOf(id: string): string {
+  return `http://relay.invalid/${id}\nCODE: ${codeOf(id)}\n`
+}
+
 beforeEach(async () => {
   home = mkdtempSync(path.join(tmpdir(), 'rc-stop-session-'))
   mkdirSync(path.join(home, ...STATE_DIR), { recursive: true, mode: 0o700 })
@@ -41,7 +55,7 @@ beforeEach(async () => {
   const share = (id: string, started_at: number) =>
     writeFileSync(
       stateFile(id),
-      JSON.stringify({ session_id: id, access_code: 'X', bridge_token: `tok-${id}`, relay: '', started_at }),
+      JSON.stringify({ session_id: id, access_code: codeOf(id), bridge_token: `tok-${id}`, relay: '', started_at }),
       { mode: 0o600 },
     )
   share('ses_A', Date.now() - 60_000)
@@ -164,6 +178,33 @@ test('stop in a session that is not shared stops nothing and does not claim it d
   expect(existsSync(stateFile('ses_B'))).toBe(true)
   expect(text).not.toContain('Remote control stopped.')
   expect(text).toContain('ses_C is not shared from this machine')
+}, 30_000)
+
+test('stop in a session that is not shared leaves the log of the share that is up', async () => {
+  // bridge.log holds the URL and code of the share that came up last (B), and
+  // B's bridge writes why its share ended into it later. A stop in C ended
+  // nothing, yet the plugin deleted the log after it all the same.
+  writeFileSync(logFile(), logOf('ses_B'), { mode: 0o600 })
+
+  const text = await serverCommand('remote-control/stop', 'ses_C')
+
+  expect(text).toContain('ses_C is not shared from this machine')
+  expect(existsSync(logFile())).toBe(true)
+  expect(readFileSync(logFile(), 'utf8')).toBe(logOf('ses_B'))
+}, 30_000)
+
+test('stopping one share keeps the log of another that is up, and scrubs its own', async () => {
+  // B came up after A, so bridge.log is B's. Stopping A must not take B's URL
+  // and code out of it; stopping B must, since that code is spent.
+  writeFileSync(logFile(), logOf('ses_B'), { mode: 0o600 })
+
+  expect(await serverCommand('remote-control/stop', 'ses_A')).toBe('Remote control stopped.')
+  expect(existsSync(stateFile('ses_A'))).toBe(false)
+  expect(existsSync(logFile())).toBe(true)
+  expect(readFileSync(logFile(), 'utf8')).toBe(logOf('ses_B'))
+
+  expect(await serverCommand('remote-control/stop', 'ses_B')).toBe('Remote control stopped.')
+  expect(existsSync(logFile())).toBe(false)
 }, 30_000)
 
 test('stop while the relay cannot be told still ends the share, scrubs the code and says what happened', async () => {
