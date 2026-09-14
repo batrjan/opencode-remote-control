@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -155,6 +155,37 @@ test('a run typed into a terminal OpenCode opened still shows the result', () =>
     expect(stdout).toBe('')
   }
 })
+
+/**
+ * A caller that closed the stderr pipe must still get the real exit status.
+ *
+ * Scripts run `opencode run --format json … --command remote-control/stop` and
+ * read only stdout; one that closes (or never drains) the stderr pipe made the
+ * plugin's write fail with EPIPE. The failure arrives as an asynchronous
+ * 'error' event on process.stderr, past the try/catch around the write, and the
+ * process exited 1 — after the share had been stopped, so a `&& echo stopped`
+ * concluded the stop failed.
+ */
+test('a closed stderr pipe does not turn a finished command into a failure', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rc-run-epipe-'))
+  try {
+    const child = spawn(
+      process.execPath,
+      ['--input-type=module', '-e', FAKE_OPENCODE, OPENCODE_ENTRY, 'run', '--format', 'json', '--command', 'remote-control/stop'],
+      {
+        env: { PATH: process.env.PATH ?? '', HOME: home, RC_OUTCOME: JSON.stringify({ text: 'Remote control stopped.' }) },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    )
+    // The reader goes away before the plugin gets to write.
+    child.stderr!.destroy()
+    child.stdout!.resume()
+    const code = await new Promise<number | null>((resolve) => child.on('close', (c) => resolve(c)))
+    expect(code).toBe(0)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+}, 30_000)
 
 test('processes that draw a screen or serve other clients write nothing to the terminal', () => {
   const quiet: Array<[string[], Record<string, string>]> = [

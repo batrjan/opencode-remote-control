@@ -12,7 +12,7 @@
 // A module may export EITHER server() or tui(), never both — the two live in
 // separate files and share plugin/bridge-runner.js.
 
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, readFileSync, writeSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 
@@ -62,8 +62,23 @@ const NON_TUI_SUBCOMMANDS = new Set([
   "completion", "debug",
 ])
 
-/** Whether this process is going to render the terminal UI. */
-export function runsTui(argv = process.argv.slice(2), env = process.env) {
+/**
+ * The script the terminal UI runs its server side in. opencode starts it as a
+ * worker, so there process.argv is ["bun", "/$bunfs/root/src/cli/tui/worker.js"]
+ * and carries none of the command line.
+ */
+const TUI_WORKER_RE = /[\\/]cli[\\/]tui[\\/]worker\.js$/
+
+/**
+ * Whether this process is going to render the terminal UI.
+ *
+ * The TUI worker is recognised first, by its entry script: OPENCODE_CLIENT is
+ * inherited, so a TUI started from a terminal inside the desktop app carries
+ * OPENCODE_CLIENT=desktop and would otherwise be taken for the desktop sidecar
+ * (which also has no subcommand), and its commands registered twice.
+ */
+export function runsTui(argv = process.argv.slice(2), env = process.env, entry = process.argv[1]) {
+  if (typeof entry === "string" && TUI_WORKER_RE.test(entry)) return true
   const client = env.OPENCODE_CLIENT
   if (client && client !== "cli") return false
   return !argv.some((arg) => NON_TUI_SUBCOMMANDS.has(arg))
@@ -99,7 +114,12 @@ export function runPrintsReplyOnly(argv = process.argv.slice(2)) {
 export function showInRunTerminal(text) {
   if (!runPrintsReplyOnly()) return
   try {
-    process.stderr.write(`${text}\n`)
+    // Synchronously, on the descriptor: process.stderr.write reports a closed
+    // pipe (EPIPE) as an asynchronous 'error' event that no try/catch sees, and
+    // it turned `opencode run` into exit 1 after the command had already done
+    // its work — a script whose `&& echo stopped` then read a stopped share as
+    // a failed stop.
+    writeSync(2, `${text}\n`)
   } catch {
     // Best effort: a closed stderr must not cost the session its message.
   }

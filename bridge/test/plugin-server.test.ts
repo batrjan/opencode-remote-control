@@ -136,6 +136,23 @@ test('runsTui recognises a terminal-UI launch', () => {
   expect(runsTui([], { OPENCODE_CLIENT: 'cli' })).toBe(true)
 })
 
+/**
+ * The terminal UI's server side runs in its own worker (opencode 1.18.30:
+ * process.argv is ["bun", "/$bunfs/root/src/cli/tui/worker.js"]), and it
+ * inherits OPENCODE_CLIENT. A TUI started from a terminal inside the desktop
+ * app therefore saw OPENCODE_CLIENT=desktop, was taken for the desktop
+ * sidecar, and registered the config commands next to the TUI entry's own:
+ * every /remote-control command showed up twice. The worker entry settles it.
+ */
+test('runsTui recognises the terminal UI worker whatever OPENCODE_CLIENT it inherited', () => {
+  const worker = '/$bunfs/root/src/cli/tui/worker.js'
+  expect(runsTui([], { OPENCODE_CLIENT: 'desktop' }, worker)).toBe(true)
+  expect(runsTui([], {}, worker)).toBe(true)
+  // Anything else with no subcommand and a non-cli client is still not a TUI.
+  expect(runsTui([], { OPENCODE_CLIENT: 'desktop' }, '/$bunfs/root/src/index.js')).toBe(false)
+  expect(runsTui([], { OPENCODE_CLIENT: 'desktop' }, undefined)).toBe(false)
+})
+
 test('runsTui rejects clients that never render a TUI', () => {
   for (const argv of [['serve'], ['run', 'hello'], ['web'], ['acp'], ['attach', 'url']]) {
     expect(runsTui(argv, {})).toBe(false)
