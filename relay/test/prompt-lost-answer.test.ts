@@ -131,6 +131,45 @@ test('a prompt whose answer is lost to a reconnect is reported accepted once ope
   second.ws.terminate()
 }, 15_000)
 
+test('a prompt caught by a socket the bridge replaced is checked on the new socket at once', async () => {
+  // The bridge can notice a dead link before the relay does and re-dial, so
+  // the relay replaces a socket it still counts as open instead of seeing it
+  // close. Nothing ever answers what was sent into that socket, and the viewer
+  // used to wait out the whole prompt timeout (two minutes in production)
+  // before the check that finds the prompt even started.
+  const savedPromptTimeout = process.env.RELAY_PROMPT_TIMEOUT_MS
+  process.env.RELAY_PROMPT_TIMEOUT_MS = '30000'
+  try {
+    const { bridgeToken, viewerToken } = await share('ses_lost_replaced')
+    const first = await bridgeSocket('ses_lost_replaced', bridgeToken)
+    const view = request(relay)
+      .post('/session/ses_lost_replaced/prompt_async')
+      .set('x-viewer-token', viewerToken)
+      .send(prompt('msg_0a1b2c3d4e5fAbCdEf01234567'))
+      .then((r) => r)
+
+    expect((await first.next())?.method).toBe('POST')
+    // opencode took it; the bridge gives up on the link and dials again while
+    // the relay still holds the old socket open.
+    const replacedAt = Date.now()
+    const second = await bridgeSocket('ses_lost_replaced', bridgeToken)
+    const check = await second.next(3000)
+    expect(check?.method).toBe('GET')
+    expect(check?.path.split('?')[0]).toBe('/session/ses_lost_replaced/message/msg_0a1b2c3d4e5fAbCdEf01234567')
+    second.answer(check!, 200, stored('ses_lost_replaced', 'msg_0a1b2c3d4e5fAbCdEf01234567'))
+
+    expect((await view).status).toBe(204)
+    expect(Date.now() - replacedAt).toBeLessThan(5000)
+    // Never re-posted, on either socket.
+    expect(await second.next(800)).toBeUndefined()
+    expect(await first.next(0)).toBeUndefined()
+    second.ws.terminate()
+  } finally {
+    if (savedPromptTimeout === undefined) delete process.env.RELAY_PROMPT_TIMEOUT_MS
+    else process.env.RELAY_PROMPT_TIMEOUT_MS = savedPromptTimeout
+  }
+}, 15_000)
+
 test('the same prompt still fails when opencode has no such message', async () => {
   const { bridgeToken, viewerToken } = await share('ses_lost_none')
   const first = await bridgeSocket('ses_lost_none', bridgeToken)

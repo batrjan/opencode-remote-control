@@ -73,6 +73,13 @@ function nextCursorOf(value: unknown): string | undefined {
 
 interface PendingRequest {
   session_id: string
+  /**
+   * The socket the request was sent on: when that socket goes, so does any
+   * chance of an answer to what it had not yet delivered. Only failure is
+   * bound to it — a bridge answers on whichever socket is current, so a
+   * response is still matched by request_id and session alone.
+   */
+  ws: WebSocket
   resolve: (value: ProxyResponse) => void
   reject: (err: Error) => void
   timer: NodeJS.Timeout
@@ -133,6 +140,9 @@ export class BridgeClient {
       // still here, dead, because the bridge noticed before the relay did.
       // Either way the bridge read opencode's events into the void meanwhile.
       const redial = replaced !== undefined || this.droppedAt.has(session_id)
+      // Its 'close' fails what was still waiting on it (see below) once this
+      // socket is current, so a GET caught in it is repeated on this one at
+      // once and a lost prompt is looked for here.
       replaced?.terminate()
       this.clients.set(session_id, ws)
       this.droppedAt.delete(session_id)
@@ -176,22 +186,27 @@ export class BridgeClient {
       // ANY authenticated bridge killed the relay and every other live share
       // with it. Registration is public, so that was a remote DoS for the
       // price of one session. Confine the protocol violation to its own
-      // socket: terminate it, and let the 'close' handler above fail that
-      // session's pending requests the way any other disconnect does.
+      // socket: terminate it, and let the 'close' handler below fail that
+      // socket's pending requests the way any other disconnect does.
       ws.on('error', (err) => {
         console.warn(`[bridge] socket error session=${JSON.stringify(session_id)}: ${err.message}`)
         ws.terminate()
       })
       ws.on('close', (code) => {
         const current = this.clients.get(session_id) === ws
-        let failed = 0
         if (current) {
           this.clients.delete(session_id)
           this.markDropped(session_id)
-          // Fail all pending requests for this session early, instead of
-          // letting viewers wait the full timeout for a 504.
-          failed = this.failPending(session_id, 'bridge closed')
         }
+        // Fail this socket's pending requests early, instead of letting
+        // viewers wait the full timeout for a 504 — also when it was no longer
+        // current. A bridge that notices a dead link before the relay does
+        // re-dials, and its new socket replaces this one (see 'connection'):
+        // nothing ever answers what was sent into the dead one, and a prompt
+        // sat out its whole two-minute timeout before the relay even looked
+        // for it (see the proxy adapter's promptLanded). Requests sent on the
+        // new socket are that socket's own and stay.
+        const failed = this.failPending(session_id, 'bridge closed', ws)
         this.logLifecycle(
           `disconnected session=${JSON.stringify(session_id)} code=${code} ` +
             `after ${Math.round((Date.now() - connectedAt) / 1000)}s` +
@@ -229,7 +244,7 @@ export class BridgeClient {
         // closing handshake. 'close' fires and fails its pending requests.
         this.clients.delete(session_id)
         this.markDropped(session_id)
-        const failed = this.failPending(session_id, 'bridge unreachable')
+        const failed = this.failPending(session_id, 'bridge unreachable', ws)
         this.logLifecycle(
           `no sign of life from session=${JSON.stringify(session_id)} for ${missed} ping rounds — terminating` +
             (failed ? `, failed ${failed} in-flight request(s)` : ''),
@@ -269,11 +284,15 @@ export class BridgeClient {
     )
   }
 
-  /** Reject every in-flight proxy request of one session; returns how many. */
-  private failPending(session_id: string, reason: string): number {
+  /**
+   * Reject every in-flight proxy request of one session — or, given `ws`, only
+   * those sent on that socket; returns how many.
+   */
+  private failPending(session_id: string, reason: string, ws?: WebSocket): number {
     let failed = 0
     for (const [request_id, pending] of this.pending.entries()) {
       if (pending.session_id !== session_id) continue
+      if (ws !== undefined && pending.ws !== ws) continue
       clearTimeout(pending.timer)
       this.pending.delete(request_id)
       pending.reject(new Error(reason))
@@ -338,7 +357,11 @@ export class BridgeClient {
     } catch (err) {
       const reason = err instanceof Error ? err.message : ''
       const linkDropped = reason === 'bridge not connected' || reason === 'bridge closed' || reason === 'bridge unreachable'
-      if (req.method !== 'GET' || !linkDropped || !this.recentlyDropped(session_id)) throw err
+      // Re-dialling, or already back: a socket the bridge replaced with a new
+      // one fails its requests after that one connected, and the connection
+      // cleared the drop mark.
+      const reconnecting = this.recentlyDropped(session_id) || this.isConnected(session_id)
+      if (req.method !== 'GET' || !linkDropped || !reconnecting) throw err
       if (!(await this.waitForConnection(session_id, bridgeReconnectWaitMs()))) throw err
       if (!this.sameRegistration(session_id, registration)) throw new Error('session closed')
       return this.requestOnce(session_id, req, timeoutMs)
@@ -439,7 +462,7 @@ export class BridgeClient {
         )
         reject(new Error('proxy timeout'))
       }, timeoutMs)
-      this.pending.set(request_id, { session_id, resolve, reject, timer })
+      this.pending.set(request_id, { session_id, ws, resolve, reject, timer })
       ws.send(JSON.stringify({ type: 'proxy', request_id, ...req }))
     })
   }

@@ -93,6 +93,49 @@ test('a GET caught by a reconnect is answered on the new socket', async () => {
   second.ws.terminate()
 }, 15_000)
 
+test('a GET caught by a socket the bridge replaced is answered on the new socket at once', async () => {
+  // The bridge noticed the dead link first and re-dialled, so the relay
+  // replaces a socket it still counts as open instead of seeing it close. The
+  // request in that socket used to sit out the whole proxy timeout (30 s) and
+  // then end in a 504, never repeated.
+  const { bridgeToken, viewerToken } = await share('ses_retry_replaced')
+  const first = await bridgeSocket('ses_retry_replaced', bridgeToken)
+  const view = request(relay).get('/session/ses_retry_replaced/message').set('x-viewer-token', viewerToken).then((r) => r)
+
+  const caught = await first.next()
+  expect(caught?.method).toBe('GET')
+  const replacedAt = Date.now()
+  const second = await bridgeSocket('ses_retry_replaced', bridgeToken)
+  const again = await second.next(3000)
+  expect(again?.path).toBe(caught?.path)
+  second.answer(again!, [{ id: 'm1' }])
+
+  const res = await view
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual([{ id: 'm1' }])
+  expect(Date.now() - replacedAt).toBeLessThan(5000)
+  second.ws.terminate()
+}, 15_000)
+
+test('a POST caught by a socket the bridge replaced fails at once and is never sent again', async () => {
+  const { bridgeToken, viewerToken } = await share('ses_retry_replaced_post')
+  const first = await bridgeSocket('ses_retry_replaced_post', bridgeToken)
+  const started = Date.now()
+  const view = request(relay)
+    .post('/session/ses_retry_replaced_post/abort')
+    .set('x-viewer-token', viewerToken)
+    .send({})
+    .then((r) => r)
+
+  expect((await first.next())?.method).toBe('POST')
+  const second = await bridgeSocket('ses_retry_replaced_post', bridgeToken)
+  const res = await Promise.race([view, new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 5000))])
+  expect(res?.status).toBe(502)
+  expect(Date.now() - started).toBeLessThan(5000)
+  expect(await second.next(800)).toBeUndefined()
+  second.ws.terminate()
+}, 15_000)
+
 test('a POST caught by a reconnect fails and is never sent again', async () => {
   const { bridgeToken, viewerToken } = await share('ses_retry_post')
   const first = await bridgeSocket('ses_retry_post', bridgeToken)
