@@ -196,6 +196,35 @@ test('the key a bridge sent to another relay does not take over, or reserve, its
   }
 })
 
+/**
+ * The relay keeps an ended share's id for the install that shared it, and the
+ * bridge explained every 409 the same way: "already registered ... by a share
+ * this machine has no record of — end it with /remote-control/stop where it
+ * was started". For a reserved id there is nothing to stop anywhere; the owner
+ * started the conversation from another install (another machine or HOME, a
+ * lost owner.key) and needed to hear that only the install that shared it can,
+ * for 30 days.
+ */
+test('a session another install shared and stopped is refused as reserved, not as a share to stop', async () => {
+  const first = await start('ses_ownerOtherInstall1')
+  await first.stop()
+
+  const home = process.env.HOME
+  process.env.HOME = path.join(root, 'other-home')
+  mkdirSync(process.env.HOME)
+  try {
+    const refused = start('ses_ownerOtherInstall1')
+    await expect(refused).rejects.toThrow(
+      /session ses_ownerOtherInstall1 is reserved on the relay \(409\) for the install that shared it last.*30 days/,
+    )
+    await expect(refused).rejects.not.toThrow(/already registered|\/remote-control\/stop/)
+  } finally {
+    process.env.HOME = home
+  }
+  // The install that shared it still can.
+  expect((await start('ses_ownerOtherInstall1')).access_code).toBeTruthy()
+})
+
 test('a start that picks a session this machine is sharing is refused, not a takeover of that share', async () => {
   const live = await start(PICKED)
   await expect(start()).rejects.toThrow(/already shared from this machine/)

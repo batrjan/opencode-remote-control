@@ -101,6 +101,12 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
       if (err instanceof Error && err.message === 'session exists') {
         return res.status(409).json({ error: 'session exists' })
       }
+      // The same status, so every bridge — including ones that read nothing
+      // but the status — handles it as before; the error says there is no
+      // live share to stop (see Store.createSession).
+      if (err instanceof Error && err.message === 'session reserved') {
+        return res.status(409).json({ error: 'session reserved' })
+      }
       throw err
     }
   })

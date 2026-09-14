@@ -182,7 +182,7 @@ test("an evicted share ends like a reaped one: viewers revoked, streams told, th
   expect(store.getSession('ses_quiet')).toBeDefined()
   expect(store.getSessionByViewerToken(viewer_token)).toBeUndefined()
   // Anyone holding the old link cannot take the id the owner will share again.
-  expect(() => store.createSession('ses_gone', '/work', 't', '203.0.113.66')).toThrow('session exists')
+  expect(() => store.createSession('ses_gone', '/work', 't', '203.0.113.66')).toThrow('session reserved')
 })
 
 test('after a restart a restored share gets the time to re-dial before a full relay may take its slot', () => {

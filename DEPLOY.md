@@ -272,3 +272,11 @@ curl -fsS http://127.0.0.1:8080/health
 
 Put `RELAY_IMAGE` in `.env` to make a rollback survive the next
 `docker compose up`; remove it to return to the freshly built image.
+
+This rolls back the relay only; owners install the plugin from `main` on their own
+machines. A relay with owner keys keeps an ended share's id for the install that shared
+it for 30 days, so a plugin rolled back past owner keys (it sends none) is refused a
+conversation a newer plugin shared, with a bare `relay createSession failed: 409`, until
+then. There is nothing to clear on the relay for it: that conversation is shared from the
+newer plugin again, or another one is shared (see
+[README.md](README.md#what-sharing-grants)).

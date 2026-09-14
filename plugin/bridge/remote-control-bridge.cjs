@@ -7472,12 +7472,21 @@ var wrapper_default = import_websocket.default;
 
 // src/relay.ts
 var RelayHttpError = class extends Error {
-  constructor(status, message) {
+  constructor(status, message, relayError) {
     super(message);
     this.status = status;
+    this.relayError = relayError;
     this.name = "RelayHttpError";
   }
 };
+async function relayErrorOf(res) {
+  try {
+    const body = await res.json();
+    return typeof body?.error === "string" ? body.error : void 0;
+  } catch {
+    return void 0;
+  }
+}
 var RelayClient = class {
   constructor(url, apiKey) {
     this.url = url;
@@ -7513,7 +7522,7 @@ var RelayClient = class {
         }),
         signal: AbortSignal.timeout(timeoutMs)
       });
-      if (!res.ok) throw new RelayHttpError(res.status, `relay createSession failed: ${res.status}`);
+      if (!res.ok) throw new RelayHttpError(res.status, `relay createSession failed: ${res.status}`, await relayErrorOf(res));
       return await res.json();
     } catch (err) {
       if (err instanceof Error && err.name === "TimeoutError") {
@@ -8458,20 +8467,28 @@ async function registerShare(relay, sessionId, directory, title, endLeftoverServ
   const isConflict = (err) => err instanceof RelayHttpError && err.status === 409;
   const key = ownerKey(relay.url, sessionId);
   if (settleFirst) await settleEarlierShare(relay, sessionId, endLeftoverServer);
+  let conflict;
   try {
     return await relay.createSession(sessionId, directory, title, key);
   } catch (err) {
     if (!isConflict(err)) throw err;
+    conflict = err;
   }
   if (await settleEarlierShare(relay, sessionId, endLeftoverServer)) {
     try {
       return await relay.createSession(sessionId, directory, title, key);
     } catch (err) {
       if (!isConflict(err)) throw err;
+      conflict = err;
     }
   }
+  if (conflict.relayError === "session reserved") {
+    throw new Error(
+      `session ${sessionId} is reserved on the relay (409) for the install that shared it last, for 30 days after that share ended \u2014 no share of it is running to stop; share it again from that install (the one whose ~/.agents/skills/remote-control/state/owner.key registered it), or share another session`
+    );
+  }
   throw new Error(
-    `session ${sessionId} is already registered on the relay (409) by a share this machine has no record of \u2014 end it with /remote-control/stop where it was started, or wait for the relay to expire it (by default after a day without activity; an id shared from another install stays reserved for it for 30 days after that share ended)`
+    `session ${sessionId} is already registered on the relay (409) by a share this machine has no record of \u2014 end it with /remote-control/stop where it was started, or wait for the relay to expire it (by default after a day without activity)`
   );
 }
 async function settleEarlierShare(relay, sessionId, endLeftoverServer) {

@@ -48,14 +48,30 @@ export interface SessionStatus {
  * A relay answer that is not a success, with its status kept. The message
  * alone ("relay createSession failed: 409") left callers nothing to branch on,
  * and a 409 needs a different story than a 429 or a 502.
+ *
+ * `relayError` is the `error` of the relay's JSON body, when it sent one: one
+ * status can mean more than one thing — a 409 is a live share holding the id
+ * ('session exists') or an ended one reserving it for its owner_key ('session
+ * reserved', which a relay from before that distinction never sends).
  */
 export class RelayHttpError extends Error {
   constructor(
     public readonly status: number,
     message: string,
+    public readonly relayError?: string,
   ) {
     super(message)
     this.name = 'RelayHttpError'
+  }
+}
+
+/** The `error` string of a refusal's JSON body; undefined for any other body, or one that cannot be read. */
+async function relayErrorOf(res: Response): Promise<string | undefined> {
+  try {
+    const body = (await res.json()) as { error?: unknown } | null
+    return typeof body?.error === 'string' ? body.error : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -105,7 +121,8 @@ export class RelayClient {
         }),
         signal: AbortSignal.timeout(timeoutMs),
       })
-      if (!res.ok) throw new RelayHttpError(res.status, `relay createSession failed: ${res.status}`)
+      // Read under the same timeout as the answer itself (the signal above).
+      if (!res.ok) throw new RelayHttpError(res.status, `relay createSession failed: ${res.status}`, await relayErrorOf(res))
       return (await res.json()) as RelaySession
     } catch (err) {
       if (err instanceof Error && err.name === 'TimeoutError') {

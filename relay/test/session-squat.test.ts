@@ -245,6 +245,34 @@ test('an id registered without a key behaves as before, and a claim expires', as
   expect((await register('ses_expire1', ATTACKER_IP)).status).toBe(201)
 })
 
+/**
+ * A refusal because the id is reserved and one because a share holds it used
+ * to be the same `409 {"error":"session exists"}`. They need different words:
+ * a live share can be stopped where it runs, a reservation has nothing left to
+ * stop and opens only to the install that made it. An owner who shared with a
+ * current plugin and then started that conversation from another install —
+ * another machine or HOME, or an older plugin that sends no key after a
+ * rollback — got a bare 409 with nothing telling it apart from a live share,
+ * for 30 days. The status stays 409, which every bridge already handles.
+ */
+test('a refusal says whether a live share holds the id or an ended one reserved it', async () => {
+  const K = ownerKey()
+  const first = await register('ses_reserved1', OWNER_IP, K)
+  expect(first.status).toBe(201)
+  await connect('ses_reserved1', first.body.bridge_token!)
+
+  // Live: the answer it always was, to a keyless and a keyed registration.
+  expect(await register('ses_reserved1', OWNER_IP)).toEqual({ status: 409, body: { error: 'session exists' } })
+  expect(await register('ses_reserved1', ATTACKER_IP, ownerKey())).toEqual({ status: 409, body: { error: 'session exists' } })
+
+  expect(await remove('ses_reserved1', first.body.bridge_token!)).toBe(204)
+  // Ended: the owner's older plugin (no key), another install's key, anyone.
+  expect(await register('ses_reserved1', OWNER_IP)).toEqual({ status: 409, body: { error: 'session reserved' } })
+  expect(await register('ses_reserved1', OWNER_IP, ownerKey())).toEqual({ status: 409, body: { error: 'session reserved' } })
+  expect(await register('ses_reserved1', ATTACKER_IP)).toEqual({ status: 409, body: { error: 'session reserved' } })
+  expect((await register('ses_reserved1', OWNER_IP, K)).status).toBe(201)
+})
+
 /** Date.now, moved forward by whatever the test adds to the returned offset. */
 function clock(): { advance(ms: number): void } {
   const real = Date.now.bind(Date)

@@ -85,6 +85,15 @@ the link stays the same, since the id stays reserved for your install, and the c
 new. Every share ended to make room is logged, so the operator can raise the cap (see
 [DEPLOY.md](DEPLOY.md#session-cap-relay_max_sessions)).
 
+That reservation opens only to the install that made it (its `owner.key`). Starting the
+same conversation from another install — another machine or `HOME`, or this one after
+`owner.key` was deleted — is refused for 30 days after the share ended with
+`session … is reserved on the relay (409) for the install that shared it last`; there is
+no share to stop, so share it from that install again, or share another session. A plugin
+from before owner keys sends no key and is refused the same way, but says only
+`relay createSession failed: 409`: after rolling the plugin back past owner keys, share a
+conversation the current version shared from the current version, or share another session.
+
 ## Quick start
 
 Prerequisites: Node.js ≥ 22 and OpenCode (TUI or CLI). No API keys, no build step.
@@ -228,7 +237,7 @@ instance. Driving a session from the browser works fully either way.
 | Endpoint                  | Auth                          | Purpose                                          |
 | ------------------------- | ----------------------------- | ------------------------------------------------ |
 | `GET /health`             | none                          | Liveness: `{ ok, healthy, sessions, version }`. Probed by the Docker HEALTHCHECK, compose, and `bridge status`. |
-| `POST /api/sessions`      | public (rate-limited)      | Create a session; returns the access code + bridge token exactly once. |
+| `POST /api/sessions`      | public (rate-limited)      | Create a session; returns the access code + bridge token exactly once. An id already taken gets `409`: `{"error":"session exists"}` while a share holds it, `{"error":"session reserved"}` while an ended share reserves it for another owner key. |
 | `GET /api/sessions/:id`   | public                        | Session presence check (bridge `status`).        |
 | `DELETE /api/sessions/:id`| `x-bridge-token` (owner only)    | End a session; disconnects its bridge, revokes code + tokens. |
 | `POST /api/activate`      | access code (rate-limited)    | Exchange a code for a viewer token, sent only as an HttpOnly, SameSite=Strict cookie; the body is `{ session_id }`. |

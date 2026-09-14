@@ -185,7 +185,7 @@ export class Store {
       throw new Error('rate limited')
     }
     if (full()) {
-      // Refused as 'session exists' by createSession, whatever room it got.
+      // Refused as 'session reserved' by createSession, whatever room it got.
       if (session_id !== undefined) {
         const claim = this.liveClaim(session_id, now)
         if (claim && !ownerKeyMatches(claim.hash, claim.salt, owner_key)) return
@@ -235,7 +235,8 @@ export class Store {
   /**
    * Register a new session. Returns the secrets exactly once; only salted
    * hashes are stored. Throws 'session exists' on a duplicate id — a second
-   * registration must never silently overwrite (and hijack) a live session.
+   * registration must never silently overwrite (and hijack) a live session —
+   * and 'session reserved' on an id an ended share keeps for its owner_key.
    *
    * Who may register an id. It is not a secret: it is in the share link, and
    * the owner registers that same id again whenever they share the
@@ -271,7 +272,14 @@ export class Store {
       this.recordClaim(existing, now)
     } else {
       const claim = this.liveClaim(session_id, now)
-      if (claim && !ownerKeyMatches(claim.hash, claim.salt, owner_key)) throw new Error('session exists')
+      // Not 'session exists': no share holds the id, so there is nothing to
+      // stop, and only the install that shared it can take it for the rest of
+      // the claim. That is what a refused bridge has to tell its owner — who
+      // is typically that same person on another install, or on an older
+      // plugin that sends no key after a rollback. All it adds for a caller is
+      // that a keyed share of the id ended within the claim — no news to
+      // anyone holding the link, which is where the id comes from.
+      if (claim && !ownerKeyMatches(claim.hash, claim.salt, owner_key)) throw new Error('session reserved')
       // Kept, not consumed: it holds the same key as this registration, and it
       // is what still reserves the id if no bridge takes this one up (see
       // recordClaim). Nothing reads a claim while a live session holds its id.

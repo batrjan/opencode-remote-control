@@ -345,28 +345,43 @@ async function registerShare(
   endLeftoverServer: boolean,
   settleFirst: boolean,
 ): Promise<RelaySession> {
-  const isConflict = (err: unknown) => err instanceof RelayHttpError && err.status === 409
+  const isConflict = (err: unknown): err is RelayHttpError => err instanceof RelayHttpError && err.status === 409
   // Bound to this relay: the key is sent in the clear, and must prove nothing
   // on any other one (see ownerKey).
   const key = ownerKey(relay.url, sessionId)
   if (settleFirst) await settleEarlierShare(relay, sessionId, endLeftoverServer)
+  let conflict: RelayHttpError
   try {
     return await relay.createSession(sessionId, directory, title, key)
   } catch (err) {
     if (!isConflict(err)) throw err
+    conflict = err
   }
   if (await settleEarlierShare(relay, sessionId, endLeftoverServer)) {
     try {
       return await relay.createSession(sessionId, directory, title, key)
     } catch (err) {
       if (!isConflict(err)) throw err
+      conflict = err
     }
+  }
+  // An ended share of another install reserved the id: no share holds it, so
+  // "stop it where it was started" sent the owner looking for one that does
+  // not exist. The install whose owner.key registered it is the one that can
+  // (this key did not match it) — another machine or HOME, or this one before
+  // its owner.key was lost.
+  if (conflict.relayError === 'session reserved') {
+    throw new Error(
+      `session ${sessionId} is reserved on the relay (409) for the install that shared it last, ` +
+        'for 30 days after that share ended — no share of it is running to stop; share it again from that install ' +
+        '(the one whose ~/.agents/skills/remote-control/state/owner.key registered it), or share another session',
+    )
   }
   // Nothing here can end it: the token belongs to whoever registered it.
   throw new Error(
     `session ${sessionId} is already registered on the relay (409) by a share this machine has no record of — ` +
       'end it with /remote-control/stop where it was started, or wait for the relay to expire it ' +
-      '(by default after a day without activity; an id shared from another install stays reserved for it for 30 days after that share ended)',
+      '(by default after a day without activity)',
   )
 }
 
