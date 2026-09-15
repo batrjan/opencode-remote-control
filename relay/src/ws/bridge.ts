@@ -130,14 +130,14 @@ export class BridgeClient {
     this.wss = new WebSocketServer({
       server,
       path: '/bridge',
-      // Cap the largest frame a bridge may send. Registration is public, so a
-      // "bridge" can be anyone: without this, ws accepts frames up to its
-      // 100 MiB default and a proxy_response (or event) body that large is
-      // buffered whole in the relay heap — the DoS a slow GET socket used to
-      // exhaust the relay with. An over-sized frame raises an 'error' on the
-      // socket, which the per-connection handler below confines to that socket
-      // (terminate + fail its pending requests), never the whole process. See
-      // bridgeMaxPayloadBytes for the sizing.
+      // Cap the largest frame a bridge may send — explicitly, so the number is
+      // this protocol's and not whatever ws happens to default to. An
+      // over-sized frame raises an 'error' on the socket, which the
+      // per-connection handler below confines to that socket (terminate + fail
+      // its pending requests), never the whole process; that also means the cap
+      // costs the owner the link rather than the request, which is why
+      // bridgeMaxPayloadBytes sits at the ceiling deployed bridges were built
+      // against and the aggregate budgets do the bounding. See it for the why.
       maxPayload: bridgeMaxPayloadBytes(),
       // Reject bad credentials during the upgrade (HTTP 401) so no socket
       // is ever established; the store lookup is synchronous.

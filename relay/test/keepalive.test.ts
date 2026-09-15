@@ -157,8 +157,8 @@ test('an empty or garbage keep-alive env var falls back to the default, never 0'
     ['RELAY_SSE_HEARTBEAT_MS', sseHeartbeatMs, 15_000],
     // 0 here would drop every viewer on its first event.
     ['RELAY_SSE_MAX_BUFFER_BYTES', sseMaxBufferBytes, 2 * 1024 * 1024],
-    // Derived from the frame cap, not a number of its own — see config.
-    ['RELAY_SSE_MAX_EXEMPT_BYTES', sseMaxExemptBytes, bridgeMaxPayloadBytes()],
+    // A number of its own, but never more than one frame — see config.
+    ['RELAY_SSE_MAX_EXEMPT_BYTES', sseMaxExemptBytes, Math.min(32 * 1024 * 1024, bridgeMaxPayloadBytes())],
     // 0 here would drop every viewer that an event takes over the cap, and so
     // would anything under one frame's worth — floored, not honoured, see config.
     ['RELAY_SSE_MAX_PARKED_BYTES', sseMaxParkedBytes, 128 * 1024 * 1024, 200 * 1024 * 1024],

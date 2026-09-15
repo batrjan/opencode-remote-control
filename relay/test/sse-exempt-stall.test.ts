@@ -42,6 +42,7 @@ let relayUrl: string
 let savedHeartbeat: string | undefined
 let savedExempt: string | undefined
 let savedParked: string | undefined
+let savedFrameCap: string | undefined
 /** Relay-side responses of every viewer event stream, in arrival order. */
 let streams: { res: http.ServerResponse; peak: number; writes: number }[]
 /** Largest backlog all live streams held together, sampled after every write. */
@@ -55,6 +56,7 @@ beforeEach(async () => {
   process.env.RELAY_SSE_HEARTBEAT_MS = '120'
   savedExempt = process.env.RELAY_SSE_MAX_EXEMPT_BYTES
   savedParked = process.env.RELAY_SSE_MAX_PARKED_BYTES
+  savedFrameCap = process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES
   const store = new Store()
   relay = http.createServer()
   const bridge = new BridgeClient(relay, store)
@@ -91,6 +93,8 @@ afterEach(async () => {
   else process.env.RELAY_SSE_MAX_EXEMPT_BYTES = savedExempt
   if (savedParked === undefined) delete process.env.RELAY_SSE_MAX_PARKED_BYTES
   else process.env.RELAY_SSE_MAX_PARKED_BYTES = savedParked
+  if (savedFrameCap === undefined) delete process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES
+  else process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES = savedFrameCap
 })
 
 /** Register a share, join it once, and connect its bridge. */
@@ -209,6 +213,10 @@ test('one large event fanned out to many non-reading viewers parks at most the s
   // relay from 30 MB to 780 MB of heap at once, and an OOM under a 512 MB
   // limit; an anonymous owner may hold 64 streams, and a frame may be 100 MiB.
   // With 8 stuck streams and one 12 MiB event that is ~96 MiB here.
+  // The budget is floored at one whole frame over the per-stream cap, so an
+  // install wanting a small one runs a small frame cap: set both, or the 16 MiB
+  // below is silently raised to the default frame cap and nothing is measured.
+  process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES = String(16 * MiB)
   process.env.RELAY_SSE_MAX_PARKED_BYTES = String(16 * MiB)
   const STREAMS = 8
   const id = 'ses_exempt_fanout'

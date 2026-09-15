@@ -14,18 +14,19 @@ import { bridgeMaxPayloadBytes, proxyMaxBufferedBytes, sseMaxBufferBytes, sseMax
 
 /**
  * The frame cap and the byte budgets around it were two independent numbers.
- * maxPayload on the bridge socket (bridgeMaxPayloadBytes, 16 MiB) bounds ONE
- * frame; the SSE fan-out's one-frame exemption (sseMaxExemptBytes) defaulted to
- * 32 MiB, i.e. it promised to carry an event twice as large as any frame the
- * socket accepts. It never could: ws answers an over-maxPayload frame with a
- * protocol error on the socket, the relay terminates it (see the 'error'
- * handler in ws/bridge.ts), and the owner's bridge loses its link mid-share —
- * so the headroom between the two numbers was not "a huge event handled
- * gently", it was "the share drops". The first test below pins that mechanism;
- * the rest pin the relationship, so the numbers cannot drift apart again:
+ * maxPayload on the bridge socket (bridgeMaxPayloadBytes) bounds ONE frame; the
+ * SSE fan-out's one-frame exemption (sseMaxExemptBytes) was a flat 32 MiB, so
+ * against a frame cap briefly set to 16 MiB it promised to carry an event twice
+ * as large as any frame the socket accepts. It never could: ws answers an
+ * over-maxPayload frame with a protocol error on the socket, the relay
+ * terminates it (see the 'error' handler in ws/bridge.ts), and the owner's
+ * bridge loses its link mid-share — so the headroom between the two numbers was
+ * not "a huge event handled gently", it was "the share drops". The first test
+ * below pins that mechanism; the rest pin the relationship, so the numbers
+ * cannot drift apart again:
  *
  *  - nothing may claim to discount more of a frame than a frame can be, so the
- *    exemption is derived from, and clamped to, maxPayload;
+ *    exemption is clamped to maxPayload;
  *  - a cap that admits a whole body (the proxy path's aggregate ceiling, the
  *    gunzip output limit) must leave room for one maximal frame, or a body the
  *    socket accepted is refused by the relay's own budget instead.
@@ -133,20 +134,24 @@ test('an event frame over maxPayload kills the bridge socket, so no SSE budget a
 }, 30_000)
 
 test('the SSE one-frame exemption never exceeds one frame, by default or by env', () => {
-  // Defaults: on HEAD the exemption was 32 MiB against a 16 MiB frame cap.
+  // Defaults: the exemption was once 32 MiB against a 16 MiB frame cap.
   for (const key of ENV) if (key !== 'ACTIVATE_FAIL_DELAY_MS') delete process.env[key]
   expect(sseMaxExemptBytes()).toBeLessThanOrEqual(bridgeMaxPayloadBytes())
 
-  // An install that pastes larger media raises the frame cap; the exemption
-  // follows it, so the knob keeps meaning what it says.
+  // A frame cap raised (or, as by default, left at the protocol ceiling) does
+  // NOT drag the exemption up with it: what one stuck stream may hold unread is
+  // a memory bound in its own right, not a restatement of the frame cap.
   process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES = String(64 * MiB)
-  expect(sseMaxExemptBytes()).toBe(64 * MiB)
+  expect(sseMaxExemptBytes()).toBe(32 * MiB)
 
   // An exemption asked to exceed the frame cap is clamped to it, whichever way
   // round the two are set.
   process.env.RELAY_SSE_MAX_EXEMPT_BYTES = String(256 * MiB)
   expect(sseMaxExemptBytes()).toBe(64 * MiB)
   process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES = String(8 * MiB)
+  expect(sseMaxExemptBytes()).toBe(8 * MiB)
+  // ...including the default, which is above a frame cap lowered this far.
+  delete process.env.RELAY_SSE_MAX_EXEMPT_BYTES
   expect(sseMaxExemptBytes()).toBe(8 * MiB)
 
   // A smaller exemption is still honoured: bounding it below one frame is the
