@@ -159,3 +159,21 @@ test('OPTIONS on a proxy route no longer lists Allow', async () => {
   expect(res2.headers.allow).toBeUndefined()
   expect(res2.status).toBe(404)
 })
+
+test('OPTIONS on the public API no longer lists Allow either', async () => {
+  // The proxy adapter's own interceptor covered only the proxy router, so
+  // these unauthenticated mounts kept enumerating themselves: `Allow: POST`
+  // for the registration endpoint, `Allow: GET,HEAD,DELETE` for a session.
+  for (const path of ['/api/sessions', `/api/sessions/${SES}`, '/api/activate', '/health']) {
+    const res = await request(relay).options(path)
+    expect(res.headers.allow, path).toBeUndefined()
+    expect(res.status, path).toBe(404)
+  }
+})
+
+test('refusing OPTIONS leaves the real methods of those routes working', async () => {
+  const res = await request(relay).get(`/api/sessions/${SES}`)
+  expect(res.status).toBe(200)
+  expect(res.body.session_id).toBe(SES)
+  expect((await request(relay).get('/health')).status).toBe(200)
+})

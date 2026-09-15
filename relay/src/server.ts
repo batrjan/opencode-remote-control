@@ -413,6 +413,19 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin')
     next()
   })
+  // Nothing here ever needs an OPTIONS: the web UI is same-origin (no CORS
+  // preflight) and the bridge speaks WebSocket. Left to express, EVERY mounted
+  // router auto-answers one with 200 + `Allow:`, handing an unauthenticated
+  // caller the method table of the public API — OPTIONS /api/sessions returned
+  // `Allow: POST`, /api/sessions/<any id> `Allow: GET,HEAD,DELETE`. The proxy
+  // adapter grew its own interceptor for this; it only ever covered the proxy
+  // router, so the public API kept answering. Refuse it once, app-wide, with
+  // the same JSON 404 any unknown method already gets (the adapter's copy is
+  // then harmlessly redundant).
+  app.use((req, res, next) => {
+    if (req.method !== 'OPTIONS') return next()
+    res.status(404).json({ error: 'not found' })
+  })
   // NO global express.json(): a single parser cannot serve both sides of this
   // app. Its 100 KB default is far too loose for the UNAUTHENTICATED public
   // endpoints (anyone may POST a registration or an activation attempt) and
