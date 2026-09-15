@@ -597,13 +597,30 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // cannot leak the wrong workspace through.
     params.set('directory', session.directory)
     params.set('location[directory]', session.directory)
-    // Strip params that take routing PRECEDENCE over directory upstream:
-    // `workspace` can re-target the request to another local project (or even
-    // a remote workspace with the owner's credentials), and `scope` widens
-    // list endpoints. The viewer is bound to one session/directory — these
-    // must never come from the client.
-    params.delete('workspace')
-    params.delete('scope')
+    // Whitelist the project-targeting surface: keep ONLY the two directory
+    // params set just above, and drop every other client-supplied spelling of
+    // a directory/location/workspace/scope key so no variant reaches opencode.
+    // Setting only `directory` / `location[directory]` was not enough — the
+    // opencode server also reads other spellings (`directory[]`, `DIRECTORY`,
+    // `location[worktree]`) that survived a plain set, and `workspace` /
+    // `scope` take routing PRECEDENCE: `workspace` can re-target the request to
+    // another local project (or a remote workspace with the owner's
+    // credentials) and `scope` widens list endpoints. The viewer is bound to
+    // one session/directory, so these must never come from the client.
+    // Pagination and other benign params (limit/before/cursor/…) are untouched.
+    const forced = new Set(['directory', 'location[directory]'])
+    for (const key of new Set(params.keys())) {
+      if (forced.has(key)) continue
+      const lower = key.toLowerCase()
+      if (
+        lower.startsWith('directory') ||
+        lower.startsWith('location') ||
+        lower.startsWith('workspace') ||
+        lower.startsWith('scope')
+      ) {
+        params.delete(key)
+      }
+    }
     const qs = params.toString()
     return qs ? `?${qs}` : ''
   }
