@@ -10,8 +10,10 @@ import { Store } from '../src/store'
  * draftsReset, join's __OC_SESSION_ID__ — beside the upstream index.html's
  * theme preload. With RELAY_SHELL_CSP on, each shell gets a Content-Security-
  * Policy whose script-src lists a sha256 hash of every inline script it carries
- * (so a tampered or injected inline script is refused) plus 'self' for the SPA
- * bundle, and locks object-src/base-uri/frame-ancestors down. The flag defaults
+ * (so the header never drifts from the scripts the shell carries) plus 'self'
+ * for the SPA bundle, and locks object-src/base-uri/frame-ancestors down. The
+ * hashes cover the response's own bytes, so they pin the header to the body —
+ * they are not a guard against script injected into the shell. The flag defaults
  * OFF: the upstream SPA's full runtime needs must be browser-verified on prod
  * before it is turned on, and a rolling deploy must not add a CSP unasked.
  */
@@ -76,8 +78,8 @@ test('the UI shell CSP hashes every injected inline script and locks the rest do
   const bodies = inlineScriptBodies(res.text)
   expect(bodies.length).toBeGreaterThanOrEqual(4)
   for (const body of bodies) expect(scriptSrc).toContain(hashOf(body))
-  // A tampered inline script — even one extra byte — is not covered by any
-  // hash, so the browser would block it.
+  // The list is exactly the scripts served and nothing more: a body differing
+  // by even one byte has no hash, so the browser would block it.
   for (const body of bodies) expect(scriptSrc).not.toContain(hashOf(`${body} `))
 })
 

@@ -319,9 +319,19 @@ const PERMISSIONS_POLICY = [
  * the join page's form handler, and the ones the relay injects (SERVER_URL_RESET,
  * authGuard, draftsReset, and join's __OC_SESSION_ID__). Rather than permit all
  * inline script with 'unsafe-inline', cspForShell lists a sha256 hash of every
- * inline <script> actually present in the response, so a tampered or newly
- * injected inline script — one whose bytes differ by even a character — is
- * refused by the browser, while the upstream SPA bundle still loads from 'self'.
+ * inline <script> actually present in the response, so the header can never
+ * drift from what the shell carries, while the upstream SPA bundle still loads
+ * from 'self'.
+ *
+ * Be precise about what that buys. Dropping 'unsafe-inline' blocks inline event
+ * handlers (onclick=...), javascript: URLs and eval (only 'wasm-unsafe-eval' is
+ * allowed), and 'self' keeps third-party script origins out. It does NOT stop a
+ * <script> injected INTO a shell: the hashes are computed over the very bytes
+ * being served, so an injected script is hashed along with the rest and allowed.
+ * The shells' substitutions must therefore be safe on their own — every one of
+ * them is JSON.stringify of a session id constrained to /^ses_[A-Za-z0-9_]+$/,
+ * with '<' escaped in draftsReset. Never interpolate unvalidated data into these
+ * scripts expecting the CSP to catch it.
  *
  * These other directives are what the upstream opencode SPA needs and no more,
  * measured against its build: 'wasm-unsafe-eval' for its WebAssembly, inline
