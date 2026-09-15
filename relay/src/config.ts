@@ -412,11 +412,27 @@ function envInt(name: string, def: number): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : def
 }
 
-/** Parse a boolean env var: 1/true/yes/on are true, everything else `def`. */
+/** Values accepted as true / false; anything else warns and keeps `def`. */
+const ENV_TRUE = new Set(['1', 'true', 'yes', 'on'])
+const ENV_FALSE = new Set(['0', 'false', 'no', 'off'])
+
+/**
+ * Parse a boolean env var: 1/true/yes/on are true, 0/false/no/off are false.
+ * An unrecognised non-empty value is NOT silently taken as false — it keeps
+ * `def` and says so. The flag that reads this exists to be switched on by hand
+ * at rollout, so a typo at that moment (RELAY_SHELL_CSP=enabled) would
+ * otherwise leave the relay in its old state with nothing at all to notice.
+ */
 function envBool(name: string, def: boolean): boolean {
   const raw = (process.env[name] ?? '').trim().toLowerCase()
   if (raw === '') return def
-  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
+  if (ENV_TRUE.has(raw)) return true
+  if (ENV_FALSE.has(raw)) return false
+  // Name the variable and the state actually applied, never its value.
+  console.warn(
+    `[relay] ${name}: unrecognised value, expected 1/true/yes/on or 0/false/no/off — using ${def}`,
+  )
+  return def
 }
 
 /**

@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'vitest'
+import { afterEach, expect, test, vi } from 'vitest'
 import request from 'supertest'
 import { createHash } from 'node:crypto'
 import { createApp } from '../src/server'
@@ -111,5 +111,24 @@ test('no CSP is added to the shells by default (opt-in, backward compatible)', a
   for (const url of ['/terminal', '/join']) {
     const res = await request(app).get(url)
     expect(res.headers['content-security-policy'], url).toBeUndefined()
+  }
+})
+
+// The flag exists to be switched on by hand at rollout, so a typo there is the
+// one moment that matters: the shells stay as they were (fail-closed), but the
+// relay has to say so rather than let the coordinator believe CSP is live.
+test('an unrecognised RELAY_SHELL_CSP keeps the default and warns', async () => {
+  process.env.RELAY_SHELL_CSP = 'enabled'
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  try {
+    const res = await request(createApp(new Store())).get('/join')
+    expect(res.headers['content-security-policy']).toBeUndefined()
+    expect(warn).toHaveBeenCalled()
+    const said = warn.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(said).toContain('RELAY_SHELL_CSP')
+    // The name and the state actually applied, never the offending value.
+    expect(said).not.toContain('enabled')
+  } finally {
+    warn.mockRestore()
   }
 })
