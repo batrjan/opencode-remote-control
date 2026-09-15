@@ -383,6 +383,30 @@ function envInt(name: string, def: number): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : def
 }
 
+/** Parse a boolean env var: 1/true/yes/on are true, everything else `def`. */
+function envBool(name: string, def: boolean): boolean {
+  const raw = (process.env[name] ?? '').trim().toLowerCase()
+  if (raw === '') return def
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
+}
+
+/**
+ * Whether the relay's OWN HTML shells (the UI shell, the join page, the ended
+ * page) carry a Content-Security-Policy — see sendShell in server.ts. Only the
+ * shells: the proxied opencode API and the SPA bundle are not touched.
+ *
+ * Defaults OFF. The CSP hashes every inline <script> the shell carries and
+ * allowlists exactly what the upstream opencode SPA needs (its 'self' bundle,
+ * 'wasm-unsafe-eval', inline styles, blob:/data: for workers/images/fonts, and
+ * same-origin fetch/SSE) and no more. That "no more" can only be confirmed in a
+ * real browser against the live SPA, so the flag keeps a rolling deploy safe:
+ * production stays as it is until the coordinator has browser-verified the
+ * policy, then turns it on with RELAY_SHELL_CSP=1.
+ */
+export function shellCspEnabled(): boolean {
+  return envBool('RELAY_SHELL_CSP', false)
+}
+
 export function relayApiKey(): string {
   return process.env.RELAY_API_KEY ?? ''
 }

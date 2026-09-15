@@ -2,6 +2,7 @@ import express from 'express'
 import type { Express } from 'express'
 import http from 'node:http'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { Store } from './store.js'
@@ -12,7 +13,7 @@ import { healthRouter } from './api/health.js'
 import { skillRouter } from './api/skill.js'
 import { BridgeClient } from './ws/bridge.js'
 import { proxyAdapter, VIEWER_AUTH_HEADER, VIEWER_AUTH_INVALID } from './proxy/adapter.js'
-import { config, stateFile, trustProxy } from './config.js'
+import { config, stateFile, trustProxy, shellCspEnabled } from './config.js'
 import { FileStateStore } from './persist.js'
 
 /**
@@ -310,6 +311,70 @@ const PERMISSIONS_POLICY = [
 ].join(', ')
 
 /**
+ * Content-Security-Policy for the relay's OWN HTML shells only (the UI shell,
+ * the join page, the ended page) — not the proxied opencode API and not the
+ * SPA bundle, which are served untouched.
+ *
+ * These shells carry inline <script>s: the upstream index.html's theme preload,
+ * the join page's form handler, and the ones the relay injects (SERVER_URL_RESET,
+ * authGuard, draftsReset, and join's __OC_SESSION_ID__). Rather than permit all
+ * inline script with 'unsafe-inline', cspForShell lists a sha256 hash of every
+ * inline <script> actually present in the response, so a tampered or newly
+ * injected inline script — one whose bytes differ by even a character — is
+ * refused by the browser, while the upstream SPA bundle still loads from 'self'.
+ *
+ * These other directives are what the upstream opencode SPA needs and no more,
+ * measured against its build: 'wasm-unsafe-eval' for its WebAssembly, inline
+ * styles (the theme preload builds a <style>; the shells use <style>/style=),
+ * blob:/data: for its workers, images and fonts, and same-origin fetch/SSE.
+ * object-src, base-uri and frame-ancestors are locked down. Gated behind
+ * shellCspEnabled() (RELAY_SHELL_CSP, default OFF) until browser-verified — see
+ * that flag and sendShell.
+ */
+const SHELL_CSP_TAIL = [
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "font-src 'self' data: blob:",
+  "connect-src 'self'",
+  "worker-src 'self' blob:",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "frame-ancestors 'none'",
+]
+
+/** Matches every <script ...>...</script> block; group 1 is the attributes. */
+const INLINE_SCRIPT_RE = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi
+
+/**
+ * The CSP for one fully assembled shell. script-src is derived from the
+ * response's own bytes: a sha256 hash for each INLINE <script> (one carrying no
+ * `src`), so the header can never drift out of sync with the scripts injected —
+ * whichever ones a given page happens to carry. External scripts (the SPA
+ * bundle, which has `src`) are covered by 'self'.
+ */
+function cspForShell(html: string): string {
+  const hashes: string[] = []
+  for (const m of html.matchAll(INLINE_SCRIPT_RE)) {
+    if (/\bsrc\s*=/i.test(m[1])) continue
+    // The hash is over the element's exact child text — the bytes between the
+    // opening tag's '>' and '</script>' — which is what a browser hashes too.
+    hashes.push(`'sha256-${createHash('sha256').update(m[2], 'utf8').digest('base64')}'`)
+  }
+  const scriptSrc = ["'self'", "'wasm-unsafe-eval'", ...hashes].join(' ')
+  return ["default-src 'self'", `script-src ${scriptSrc}`, ...SHELL_CSP_TAIL].join('; ')
+}
+
+/**
+ * Send one of the relay's own HTML shells, attaching the shell CSP when
+ * RELAY_SHELL_CSP is on (see shellCspEnabled). Read lazily per response so the
+ * flag can be flipped without a rebuild and so tests can toggle it.
+ */
+function sendShell(res: express.Response, html: string, status = 200): void {
+  if (shellCspEnabled()) res.setHeader('Content-Security-Policy', cspForShell(html))
+  res.status(status).type('html').send(html)
+}
+
+/**
  * App factory: injects the Store so tests and the entrypoint can share one
  * instance per app. The optional BridgeClient lets the session API disconnect
  * a bridge when its session is deleted (startServer always passes it).
@@ -428,9 +493,9 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
   app.get('/join', (req, res) => {
     const home = viewerHome(req)
     if (home) return res.redirect(home)
-    return res.type('html').send(joinHtml(undefined))
+    return sendShell(res, joinHtml(undefined))
   })
-  app.get('/terminal', (_req, res) => res.type('html').send(terminalHtml()))
+  app.get('/terminal', (_req, res) => sendShell(res, terminalHtml()))
   // Session-bound viewer entry: /<session_id>. Without a valid viewer cookie
   // it serves the code-entry page (with the session id embedded); with one it
   // serves the opencode UI. The :id must look like an opencode session id
@@ -448,7 +513,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
   // a v5 upgrade must first rewrite them (e.g. match inside the handler).
   app.get('/:id(ses_[A-Za-z0-9_]+)', (req, res) => {
     const session = store.getSession(req.params.id)
-    if (!session) return res.status(404).type('html').send(endedHtml())
+    if (!session) return sendShell(res, endedHtml(), 404)
     const token = cookieViewerToken(req)
     if (token && store.verifyViewer(session.id, token)) {
       // verifyViewer slid the token's idle window: send the cookie again so it
@@ -457,7 +522,7 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
       setViewerCookie(res, token)
       return res.redirect(sessionUiUrl(session))
     }
-    return res.type('html').send(joinHtml(session.id))
+    return sendShell(res, joinHtml(session.id))
   })
   /**
    * A UI session page loaded as a page (a reload, a new tab, a pasted link):
@@ -502,21 +567,21 @@ export function createApp(store: Store, bridge?: BridgeClient): Express & { endE
       if (token && store.verifyViewer(session.id, token)) {
         // verifyViewer slid the token's idle window: slide the cookie too.
         setViewerCookie(res, token)
-        return res.type('html').send(terminalHtml(session.id))
+        return sendShell(res, terminalHtml(session.id))
       }
       return res.redirect(`/${session.id}`)
     }
     const share = token ? store.getSessionByViewerToken(token) : undefined
-    if (!token || !share) return res.status(404).type('html').send(endedHtml())
+    if (!token || !share) return sendShell(res, endedHtml(), 404)
     void shareAncestry(share, req.params.id)
       .then((inShare) => {
         // The walk may have waited out a bridge re-dial: the viewer's access
         // or the share can have ended meanwhile.
         if (inShare === false || store.getSessionByViewerToken(token) !== share) {
-          return res.status(404).type('html').send(endedHtml())
+          return sendShell(res, endedHtml(), 404)
         }
         setViewerCookie(res, token)
-        return res.type('html').send(terminalHtml(share.id))
+        return sendShell(res, terminalHtml(share.id))
       })
       .catch(next)
   }
