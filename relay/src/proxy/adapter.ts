@@ -306,6 +306,49 @@ interface ViewerStream {
   end(): void
 }
 
+/**
+ * Content types the relay will label a PROXIED body with. The bridge — which
+ * the sharer controls — sets the upstream Content-Type and body verbatim, so
+ * without this allow-list a share could serve text/html or image/svg+xml on
+ * the relay origin (https://opencode.b4tr.net) and run script there against a
+ * viewer's session: a service worker, IndexedDB, or a same-origin fetch that
+ * rides the viewer's cookie. The web UI only ever consumes JSON (and the odd
+ * text/plain / octet-stream) from these endpoints, so anything else is
+ * relabelled application/octet-stream, which the browser downloads instead of
+ * rendering or executing.
+ */
+const PROXY_ALLOWED_CONTENT_TYPES = new Set(['application/json', 'text/plain', 'application/octet-stream'])
+
+/**
+ * The Content-Type the proxy will actually send for a bridge-supplied one: the
+ * value itself when its media type (the part before any ';charset=…') is
+ * allow-listed, otherwise application/octet-stream. A missing type defaults to
+ * application/json, exactly as the send paths did before.
+ */
+function safeProxyContentType(contentType: string | undefined): string {
+  const value = contentType ?? 'application/json'
+  const media = value.split(';', 1)[0]?.trim().toLowerCase() ?? ''
+  return PROXY_ALLOWED_CONTENT_TYPES.has(media) ? value : 'application/octet-stream'
+}
+
+/**
+ * Lock a proxied response down so a bridge-controlled body is inert on the
+ * relay origin. Two headers, on every proxied response:
+ *  - Cache-Control: private, no-store — a proxied body is per-viewer and must
+ *    never be cached by the browser or an intermediary (also the no-store
+ *    hardening tracked separately).
+ *  - Content-Security-Policy: default-src 'none'; sandbox — belt and braces on
+ *    top of the content-type allow-list: even a body that reached the browser
+ *    labelled as a document could not execute script, register a service
+ *    worker, or fetch anything with the viewer's cookie.
+ * The web UI reads these endpoints with fetch/XHR (JSON), which neither header
+ * constrains, so this is transparent to it.
+ */
+function setProxyGuardHeaders(res: Response): void {
+  res.setHeader('Cache-Control', 'private, no-store')
+  res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox")
+}
+
 export function proxyAdapter(store: Store, bridge: BridgeClient) {
   const router = express.Router()
 
@@ -395,9 +438,12 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // forwarded (the bridge keeps it: it names the owner's local opencode URL
     // and project directory).
     if (nextCursor) res.set('X-Next-Cursor', nextCursor)
+    // Harden the bridge-controlled body: never trust its Content-Type, never
+    // cache it, and forbid it from executing on the relay origin.
+    setProxyGuardHeaders(res)
     res
       .status(status)
-      .type(contentType ?? 'application/json')
+      .type(safeProxyContentType(contentType))
       .send(payload)
     res.once('finish', release)
     res.once('close', release)
@@ -481,9 +527,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       const out = await bridge.request(session.id, { method: 'POST', path: path + query, body }, promptTimeoutMs(), {
         checksLostAnswer: messageID !== undefined,
       })
+      setProxyGuardHeaders(res)
       res
         .status(out.status)
-        .type(out.contentType ?? 'application/json')
+        .type(safeProxyContentType(out.contentType))
         .send(out.body)
     } catch (err) {
       const lostAnswer = err instanceof Error && LOST_ANSWER_ERRORS.has(err.message)
@@ -591,11 +638,13 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
             config.proxyTimeoutMs,
           )
           if (current.status === 200 && current.body.trim().startsWith('{')) {
+            setProxyGuardHeaders(res)
             res.status(200).type('application/json').send(`[${current.body}]`)
             return
           }
         }
-        res.status(out.status).type(out.contentType ?? 'application/json').send(filtered)
+        setProxyGuardHeaders(res)
+        res.status(out.status).type(safeProxyContentType(out.contentType)).send(filtered)
       } catch (err) {
         sendProxyError(res, err)
       }
@@ -615,12 +664,14 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           config.proxyTimeoutMs,
         )
         if (out.status === 404) {
+          setProxyGuardHeaders(res)
           res.status(200).type('application/json').send('[]')
           return
         }
+        setProxyGuardHeaders(res)
         res
           .status(out.status)
-          .type(out.contentType ?? 'application/json')
+          .type(safeProxyContentType(out.contentType))
           .send(`[${out.body}]`)
       } catch (err) {
         sendProxyError(res, err)
@@ -660,7 +711,8 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           const inShare = await sessionsInShare(session, pending.map((p) => p?.sessionID))
           body = JSON.stringify(pending.filter((p) => inShare.has(p?.sessionID as string)))
         }
-        res.status(out.status).type(out.contentType ?? 'application/json').send(body)
+        setProxyGuardHeaders(res)
+        res.status(out.status).type(safeProxyContentType(out.contentType)).send(body)
       } catch (err) {
         sendProxyError(res, err)
       }
@@ -696,7 +748,8 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           const inShare = await sessionsInShare(session, pending.map((q) => q?.sessionID))
           body = JSON.stringify(pending.filter((q) => inShare.has(q?.sessionID as string)))
         }
-        res.status(out.status).type(out.contentType ?? 'application/json').send(body)
+        setProxyGuardHeaders(res)
+        res.status(out.status).type(safeProxyContentType(out.contentType)).send(body)
       } catch (err) {
         sendProxyError(res, err)
       }
@@ -731,7 +784,8 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           const inShare = await sessionsInShare(session, statuses.map(([id]) => id))
           body = JSON.stringify(Object.fromEntries(statuses.filter(([id]) => inShare.has(id))))
         }
-        res.status(out.status).type(out.contentType ?? 'application/json').send(body)
+        setProxyGuardHeaders(res)
+        res.status(out.status).type(safeProxyContentType(out.contentType)).send(body)
       } catch (err) {
         sendProxyError(res, err)
       }

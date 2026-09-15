@@ -109,6 +109,18 @@ beforeAll(async () => {
     }
     if (req.method === 'GET' && url.pathname === '/agent') return json(res, 200, [{ id: 'build' }])
     if (req.method === 'GET' && url.pathname === '/config') return json(res, 200, { model: 'test' })
+    // A malicious or compromised bridge fully controls the upstream Content-Type
+    // and body, so these stand in for a share trying to serve ACTIVE content on
+    // the relay origin (script execution on-origin). The relay must never label
+    // a proxied body text/html or image/svg+xml.
+    if (req.method === 'GET' && url.pathname === '/lsp') {
+      res.writeHead(200, { 'Content-Type': 'text/html' })
+      return res.end('<script>alert(document.cookie)</script>')
+    }
+    if (req.method === 'GET' && url.pathname === '/formatter') {
+      res.writeHead(200, { 'Content-Type': 'image/svg+xml' })
+      return res.end('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
+    }
     if (req.method === 'POST' && url.pathname === '/session/sess1/prompt_async') {
       let raw = ''
       req.on('data', (chunk) => (raw += chunk))
@@ -157,6 +169,57 @@ afterAll(async () => {
   await new Promise((resolve) => relay.close(resolve))
   opencode.closeAllConnections()
   await new Promise((resolve) => opencode.close(resolve))
+})
+
+/**
+ * Response hardening. The bridge (which the sharer controls) sets the upstream
+ * Content-Type and body verbatim, so without an allow-list a share could serve
+ * text/html or image/svg+xml on the relay origin (https://…) and run script
+ * there against a viewer's session — persistence via a service worker,
+ * IndexedDB, or a same-origin fetch carrying the viewer cookie. Anything
+ * outside {application/json, text/plain, application/octet-stream} is relabelled
+ * application/octet-stream, and every proxied response carries no-store plus a
+ * lock-down CSP so even a mislabelled body cannot execute.
+ */
+test('a bridge text/html body is served as octet-stream, never text/html', async () => {
+  const res = await request(relay).get('/lsp').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.headers['content-type']).toMatch(/application\/octet-stream/)
+  expect(res.headers['content-type']).not.toContain('text/html')
+  expect(res.headers['cache-control']).toBe('private, no-store')
+  expect(res.headers['content-security-policy']).toBe("default-src 'none'; sandbox")
+  // The body itself is untouched — only its label and the guard headers change.
+  // supertest buffers an octet-stream body into res.body as a Buffer.
+  const body = Buffer.isBuffer(res.body) ? res.body.toString() : res.text
+  expect(body).toBe('<script>alert(document.cookie)</script>')
+})
+
+test('a bridge image/svg+xml body is served as octet-stream, never svg', async () => {
+  const res = await request(relay).get('/formatter').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.headers['content-type']).toMatch(/application\/octet-stream/)
+  expect(res.headers['content-type']).not.toContain('svg')
+  expect(res.headers['cache-control']).toBe('private, no-store')
+  expect(res.headers['content-security-policy']).toBe("default-src 'none'; sandbox")
+})
+
+test('a JSON proxied response stays JSON, with no-store and the lock-down CSP', async () => {
+  const res = await request(relay).get('/config').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.headers['content-type']).toMatch(/application\/json/)
+  expect(res.body).toEqual({ model: 'test' })
+  expect(res.headers['cache-control']).toBe('private, no-store')
+  expect(res.headers['content-security-policy']).toBe("default-src 'none'; sandbox")
+})
+
+test('a filtered proxied response also carries the guard headers', async () => {
+  // /session/status is served by a dedicated handler (not the generic proxy
+  // funnel), so it must set the same guard headers.
+  const res = await request(relay).get('/session/status').set('x-viewer-token', viewerToken)
+  expect(res.status).toBe(200)
+  expect(res.headers['content-type']).toMatch(/application\/json/)
+  expect(res.headers['cache-control']).toBe('private, no-store')
+  expect(res.headers['content-security-policy']).toBe("default-src 'none'; sandbox")
 })
 
 test('proxy GET /session/:id/message', async () => {
