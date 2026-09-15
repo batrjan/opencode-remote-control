@@ -148,14 +148,15 @@ test('heartbeats on /global/event use the wrapped envelope', async () => {
 }, 10_000)
 
 test('an empty or garbage keep-alive env var falls back to the default, never 0', async () => {
-  const { sseRetryMs, sseHeartbeatMs, sseMaxBufferBytes, sseMaxExemptBytes, sseMaxParkedBytes, wsPingIntervalMs, wsPongGraceRounds } =
+  const { bridgeMaxPayloadBytes, sseRetryMs, sseHeartbeatMs, sseMaxBufferBytes, sseMaxExemptBytes, sseMaxParkedBytes, wsPingIntervalMs, wsPongGraceRounds } =
     await import('../src/config')
   for (const [key, fn, def] of [
     ['RELAY_SSE_RETRY_MS', sseRetryMs, 3000],
     ['RELAY_SSE_HEARTBEAT_MS', sseHeartbeatMs, 15_000],
     // 0 here would drop every viewer on its first event.
     ['RELAY_SSE_MAX_BUFFER_BYTES', sseMaxBufferBytes, 2 * 1024 * 1024],
-    ['RELAY_SSE_MAX_EXEMPT_BYTES', sseMaxExemptBytes, 32 * 1024 * 1024],
+    // Derived from the frame cap, not a number of its own — see config.
+    ['RELAY_SSE_MAX_EXEMPT_BYTES', sseMaxExemptBytes, bridgeMaxPayloadBytes()],
     // 0 here would drop every viewer that an event takes over the cap.
     ['RELAY_SSE_MAX_PARKED_BYTES', sseMaxParkedBytes, 128 * 1024 * 1024],
     ['RELAY_WS_PING_INTERVAL_MS', wsPingIntervalMs, 25_000],

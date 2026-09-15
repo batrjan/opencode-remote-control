@@ -257,9 +257,20 @@ export function sseMaxBufferBytes(): number {
  * next frame, so a non-reading viewer can hold at most about this much beyond
  * the cap. Generous enough for a phone photo pasted as a data URL (a few MiB,
  * ~1.33x base64) or a large diff, so a reading viewer still gets those whole.
+ *
+ * maxPayload is therefore the CEILING here, and this is derived from it rather
+ * than set beside it. A fixed 32 MiB against a 16 MiB frame cap read as "an
+ * event up to 32 MiB is handled gently", and no such event exists: ws answers a
+ * frame past maxPayload with a protocol error, the relay terminates that socket
+ * (see the 'error' handler in ws/bridge.ts) and the owner's bridge drops
+ * mid-share — the fan-out never gets to discount anything. Smaller than one
+ * frame is still meaningful (that is the stuck-viewer bound above), larger
+ * never is, so an env value above the frame cap is clamped to it and raising
+ * the frame cap for an install that pastes bigger media raises this with it.
  */
 export function sseMaxExemptBytes(): number {
-  return envInt('RELAY_SSE_MAX_EXEMPT_BYTES', 32 * 1024 * 1024)
+  const oneFrame = bridgeMaxPayloadBytes()
+  return Math.min(envInt('RELAY_SSE_MAX_EXEMPT_BYTES', oneFrame), oneFrame)
 }
 
 /**
@@ -294,11 +305,18 @@ export function sseMaxParkedBytes(): number {
  * can cost.
  *
  * Sized above the largest LEGITIMATE frame — a live event carrying a pasted
- * image as a data URL, which the SSE fan-out exempts up to sseMaxExemptBytes and
- * the tests exercise at 12 MiB — and below the tens-of-MiB bodies the DoS relied
- * on. Env-tunable for an install that pastes larger media; the aggregate proxy
- * ceiling (proxyMaxBufferedBytes) is what bounds memory when many honest
- * multi-MiB responses are in flight at once.
+ * image as a data URL, which the tests exercise at 12 MiB — and below the
+ * tens-of-MiB bodies the DoS relied on. Env-tunable for an install that pastes
+ * larger media; the aggregate proxy ceiling (proxyMaxBufferedBytes) is what
+ * bounds memory when many honest multi-MiB responses are in flight at once.
+ *
+ * This is the CEILING every other one-frame limit is measured against, because
+ * it is the only one enforced by dropping the bridge: the SSE one-frame
+ * exemption (sseMaxExemptBytes) is clamped to it, the gunzip output limit is
+ * min'd with it, and the aggregate proxy ceiling is floored at it. A number
+ * above it promises something no frame can deliver; anything that must carry a
+ * whole frame has to be at least it. Raise it and those follow — they are
+ * derived here, not repeated.
  */
 export function bridgeMaxPayloadBytes(): number {
   return envInt('RELAY_BRIDGE_MAX_PAYLOAD_BYTES', 16 * 1024 * 1024)
@@ -318,9 +336,15 @@ export function bridgeMaxPayloadBytes(): number {
  * rather than buffered, so memory stays at about this plus one maxPayload
  * however many slow readers pile up. Generous enough for several honest
  * multi-MiB transcripts at once; env-tunable.
+ *
+ * Never below one maxPayload, whatever the env says: a body the bridge socket
+ * accepted must be admissible at least on its own. Below that, every response
+ * of a size the frame cap allows would be answered 503 `relay busy` with the
+ * relay holding nothing at all — the sum cannot be a stricter limit on ONE
+ * response than the frame cap already is.
  */
 export function proxyMaxBufferedBytes(): number {
-  return envInt('RELAY_PROXY_MAX_BUFFERED_BYTES', 64 * 1024 * 1024)
+  return Math.max(envInt('RELAY_PROXY_MAX_BUFFERED_BYTES', 64 * 1024 * 1024), bridgeMaxPayloadBytes())
 }
 
 /**
