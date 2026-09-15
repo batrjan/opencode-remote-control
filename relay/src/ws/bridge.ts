@@ -144,18 +144,22 @@ export class BridgeClient {
       verifyClient: (info, done) => {
         const url = new URL(info.req.url ?? '', 'http://localhost')
         const session_id = url.searchParams.get('session_id') ?? ''
-        // Accept token from header (preferred, avoids nginx access logs) or
-        // legacy query param (deprecated, will be removed).
+        // The token travels in the x-bridge-token header only — never the URL
+        // query, which would land this long-lived control credential in nginx
+        // access logs and any proxy log along the way. Every shipped bridge
+        // already sends the header (bridge/src/relay.ts); the query form only
+        // ever leaked the token, so it is refused.
         const headerToken = info.req.headers['x-bridge-token']
-        const token = (typeof headerToken === 'string' ? headerToken : url.searchParams.get('token')) ?? ''
+        const token = typeof headerToken === 'string' ? headerToken : ''
         done(this.store.verifyBridgeToken(session_id, token))
       },
     })
     this.wss.on('connection', (ws, req) => {
       const url = new URL(req.url ?? '', 'http://localhost')
       const session_id = url.searchParams.get('session_id') ?? ''
+      // Header only, same as verifyClient above — the query token is refused.
       const headerToken = req.headers['x-bridge-token']
-      const token = (typeof headerToken === 'string' ? headerToken : url.searchParams.get('token')) ?? ''
+      const token = typeof headerToken === 'string' ? headerToken : ''
       if (!this.store.verifyBridgeToken(session_id, token)) {
         ws.close(4003, 'invalid bridge token')
         return

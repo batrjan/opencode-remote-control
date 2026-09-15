@@ -207,10 +207,8 @@ test('DELETE /api/sessions/:id disconnects the session bridge', async () => {
     .set('x-api-key', API_KEY)
     .send({ session_id: 'ses_stopAAAAAAAAAAAAAAAAAA', directory: '/p', title: 'stoppable' })
   expect(created.status).toBe(201)
-  const wsUrl =
-    `${relayUrl.replace(/^http/, 'ws')}/bridge` +
-    `?session_id=ses_stopAAAAAAAAAAAAAAAAAA&token=${encodeURIComponent(created.body.bridge_token)}`
-  const ws = new WebSocket(wsUrl)
+  const wsUrl = `${relayUrl.replace(/^http/, 'ws')}/bridge` + `?session_id=ses_stopAAAAAAAAAAAAAAAAAA`
+  const ws = new WebSocket(wsUrl, { headers: { 'x-bridge-token': created.body.bridge_token } })
   await new Promise<void>((resolve, reject) => {
     ws.on('open', () => resolve())
     ws.on('error', reject)
