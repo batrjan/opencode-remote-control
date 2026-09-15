@@ -121,12 +121,12 @@ afterAll(async () => {
 })
 
 test('start records its own pid so another process can stop it', async () => {
-  const handle = await startBridge(relayUrl, API_KEY, { opencodeUrl, sessionId: 'sess-pid' })
+  const handle = await startBridge(relayUrl, API_KEY, { opencodeUrl, sessionId: 'ses_pid' })
   try {
-    expect(loadSessionState('sess-pid')?.pid).toBe(process.pid)
+    expect(loadSessionState('ses_pid')?.pid).toBe(process.pid)
   } finally {
     await handle.stop()
-    clearSessionState('sess-pid')
+    clearSessionState('ses_pid')
   }
 })
 
@@ -134,7 +134,7 @@ test('stop kills the opencode server the bridge spawned', async () => {
   const dummy = spawnDummyServer()
   const port = Number(new URL(opencodeUrl).port)
   const handle = await startBridge(relayUrl, API_KEY, {
-    sessionId: 'sess-spawned',
+    sessionId: 'ses_spawned',
     serverSpawner: async () => ({ port, spawned: dummy }),
   })
   expect(alive(dummy.pid!)).toBe(true)
@@ -152,11 +152,11 @@ test('stop signals the bridge process recorded in the state file', async () => {
   const created = await fetch(`${relayUrl}/api/sessions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-api-key': API_KEY },
-    body: JSON.stringify({ session_id: 'sess-remote', directory: '/path', title: 't' }),
+    body: JSON.stringify({ session_id: 'ses_remote', directory: '/path', title: 't' }),
   })
   const body = (await created.json()) as { access_code: string; bridge_token: string }
   saveSessionState({
-    session_id: 'sess-remote',
+    session_id: 'ses_remote',
     access_code: body.access_code,
     bridge_token: body.bridge_token,
     relay: relayUrl,
@@ -164,11 +164,11 @@ test('stop signals the bridge process recorded in the state file', async () => {
     pid: child.pid,
   })
 
-  await stopBridge(relayUrl, 'sess-remote', API_KEY)
+  await stopBridge(relayUrl, 'ses_remote', API_KEY)
 
   expect(await waitForExit(child)).toBe(true)
   expect(alive(child.pid!)).toBe(false)
-  expect(loadSessionState('sess-remote')).toBeUndefined()
+  expect(loadSessionState('ses_remote')).toBeUndefined()
 })
 
 test('stop tolerates a stale pid and never signals its own process', async () => {
@@ -181,18 +181,18 @@ test('stop tolerates a stale pid and never signals its own process', async () =>
     const created = await fetch(`${relayUrl}/api/sessions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': API_KEY },
-      body: JSON.stringify({ session_id: `sess-stale-${pid}`, directory: '/path', title: 't' }),
+      body: JSON.stringify({ session_id: `ses_stale_${pid}`, directory: '/path', title: 't' }),
     })
     const body = (await created.json()) as { access_code: string; bridge_token: string }
     saveSessionState({
-      session_id: `sess-stale-${pid}`,
+      session_id: `ses_stale_${pid}`,
       access_code: body.access_code,
       bridge_token: body.bridge_token,
       relay: relayUrl,
       started_at: Date.now(),
       pid,
     })
-    await expect(stopBridge(relayUrl, `sess-stale-${pid}`, API_KEY)).resolves.toBeUndefined()
+    await expect(stopBridge(relayUrl, `ses_stale_${pid}`, API_KEY)).resolves.toBeUndefined()
   }
   expect(alive(process.pid)).toBe(true)
 })
@@ -206,11 +206,11 @@ test('stop never signals a live process that is not a bridge (recycled pid)', as
   const created = await fetch(`${relayUrl}/api/sessions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-api-key': API_KEY },
-    body: JSON.stringify({ session_id: 'sess-recycled', directory: '/path', title: 't' }),
+    body: JSON.stringify({ session_id: 'ses_recycled', directory: '/path', title: 't' }),
   })
   const body = (await created.json()) as { access_code: string; bridge_token: string }
   saveSessionState({
-    session_id: 'sess-recycled',
+    session_id: 'ses_recycled',
     access_code: body.access_code,
     bridge_token: body.bridge_token,
     relay: relayUrl,
@@ -218,11 +218,11 @@ test('stop never signals a live process that is not a bridge (recycled pid)', as
     pid: stranger.pid,
   })
 
-  await stopBridge(relayUrl, 'sess-recycled', API_KEY)
+  await stopBridge(relayUrl, 'ses_recycled', API_KEY)
 
   // The relay session and the state file are gone — stop still did its job —
   // but the innocent process is untouched.
-  expect(loadSessionState('sess-recycled')).toBeUndefined()
+  expect(loadSessionState('ses_recycled')).toBeUndefined()
   expect(alive(stranger.pid!)).toBe(true)
   stranger.kill()
   await waitForExit(stranger)
@@ -269,7 +269,7 @@ for (const [outage, kind, reason] of [
     const bridge = spawnDummyBridge()
     const server = spawnDummyOpencodeServe()
     await new Promise((resolve) => setTimeout(resolve, 200))
-    const id = `sess-relay-down-${kind}`
+    const id = `ses_relay_down_${kind}`
     saveSessionState({
       session_id: id,
       access_code: 'XXXXXX',

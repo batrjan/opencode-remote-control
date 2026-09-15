@@ -122,7 +122,7 @@ test('a silent link is detected and re-dialled, then settles once answered', asy
     reconnects += 1
   }
   try {
-    await ws.connect('sess-halfopen', 'token')
+    await ws.connect('ses_halfopen', 'token')
     // First socket never pongs → terminated → re-dialled.
     expect(await waitFor(() => sockets.length >= 2)).toBe(true)
     expect(await waitFor(() => reconnects >= 1)).toBe(true)
@@ -154,7 +154,7 @@ test('close() ends the share for good — no reconnect afterwards', async () => 
   ws.onReconnect = () => {
     reconnects += 1
   }
-  await ws.connect('sess-closed', 'token')
+  await ws.connect('ses_closed', 'token')
   ws.close()
   // Nothing answers the pings here either, but a closed client must not care.
   await new Promise((resolve) => setTimeout(resolve, 600))
@@ -164,7 +164,7 @@ test('close() ends the share for good — no reconnect afterwards', async () => 
 }, 15_000)
 
 test('a relay that closes us on purpose is fatal, not retried', async () => {
-  const token = await register('sess-fatal')
+  const token = await register('ses_fatal')
   const ws = client()
   let fatal: Error | undefined
   let reconnects = 0
@@ -174,9 +174,9 @@ test('a relay that closes us on purpose is fatal, not retried', async () => {
   ws.onReconnect = () => {
     reconnects += 1
   }
-  await ws.connect('sess-fatal', token)
+  await ws.connect('ses_fatal', token)
   // DELETE closes the bridge socket with 4001 (session closed).
-  await fetch(`${relayUrl}/api/sessions/sess-fatal`, { method: 'DELETE', headers: { 'x-bridge-token': token } })
+  await fetch(`${relayUrl}/api/sessions/ses_fatal`, { method: 'DELETE', headers: { 'x-bridge-token': token } })
   expect(await waitFor(() => fatal !== undefined)).toBe(true)
   expect(fatal!.message).toMatch(/4001/)
   await new Promise((resolve) => setTimeout(resolve, 300))
@@ -185,9 +185,9 @@ test('a relay that closes us on purpose is fatal, not retried', async () => {
 }, 15_000)
 
 test('event forwarding re-subscribes when the opencode stream ends', async () => {
-  const token = await register('sess-events')
+  const token = await register('ses_events')
   const ws = client()
-  await ws.connect('sess-events', token)
+  await ws.connect('ses_events', token)
   await ws.startEventForwarding()
   try {
     expect(await waitFor(() => eventSubscriptions === 1)).toBe(true)
@@ -201,9 +201,9 @@ test('event forwarding re-subscribes when the opencode stream ends', async () =>
 }, 15_000)
 
 test('a stopped client does not resubscribe to events either', async () => {
-  const token = await register('sess-events-stop')
+  const token = await register('ses_events_stop')
   const ws = client()
-  await ws.connect('sess-events-stop', token)
+  await ws.connect('ses_events_stop', token)
   await ws.startEventForwarding()
   expect(await waitFor(() => eventSubscriptions === 1)).toBe(true)
   ws.close()
@@ -234,7 +234,7 @@ test('an upgrade rejected with 401 is fatal — the share ends instead of loopin
   ws.onReconnect = () => {
     reconnects += 1
   }
-  await expect(ws.connect('sess-refused', 'stale-token')).rejects.toThrow()
+  await expect(ws.connect('ses_refused', 'stale-token')).rejects.toThrow()
   expect(await waitFor(() => fatal !== undefined)).toBe(true)
   expect(fatal!.message).toMatch(/401/)
   await new Promise((resolve) => setTimeout(resolve, 400))
@@ -258,7 +258,7 @@ test('a relay that is merely unreachable keeps being retried', async () => {
   ws.onFatal = (err) => {
     fatal = err
   }
-  await expect(ws.connect('sess-down', 'token')).rejects.toThrow()
+  await expect(ws.connect('ses_down', 'token')).rejects.toThrow()
   // A refused connection is not fatal — no onFatal, and a later listener on the
   // same port would be picked up by the backoff loop.
   expect(fatal).toBeUndefined()

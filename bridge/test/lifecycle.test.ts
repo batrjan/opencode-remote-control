@@ -47,7 +47,7 @@ async function listenOpencode(): Promise<void> {
     if (url.pathname === '/global/health') return json(res, 200, { healthy: true })
     if (url.pathname === '/session') {
       return json(res, 200, [
-        { id: 'sess-lc', directory: '/path', title: 'mock session', time: { created: 1 } },
+        { id: 'ses_lc', directory: '/path', title: 'mock session', time: { created: 1 } },
       ])
     }
     if (url.pathname === '/event') {
@@ -92,20 +92,20 @@ afterAll(async () => {
 test('start and stop bridge', async () => {
   const handle = await startBridge(relayUrl, API_KEY, {
     opencodeUrl,
-    sessionId: 'sess-lc',
+    sessionId: 'ses_lc',
   })
   try {
-    expect(handle.session_id).toBe('sess-lc')
+    expect(handle.session_id).toBe('ses_lc')
     expect(handle.access_code).toMatch(/^[A-Z0-9]{6}$/)
-    expect(handle.viewer_url).toBe('/sess-lc')
+    expect(handle.viewer_url).toBe('/ses_lc')
     // The session is registered on the relay.
     const relayClient = new RelayClient(relayUrl, API_KEY)
-    expect((await relayClient.getSession('sess-lc')).status).toBe(200)
+    expect((await relayClient.getSession('ses_lc')).status).toBe(200)
   } finally {
     await stopBridge(relayUrl, handle.session_id, API_KEY)
   }
   // stopBridge deleted the relay session.
-  expect((await new RelayClient(relayUrl, API_KEY).getSession('sess-lc')).status).toBe(404)
+  expect((await new RelayClient(relayUrl, API_KEY).getSession('ses_lc')).status).toBe(404)
   // Idempotent: deleting an already-deleted session is not an error.
   await stopBridge(relayUrl, handle.session_id, API_KEY)
   await handle.stop() // releases the WS connection and timers
@@ -115,19 +115,19 @@ test('start and stop bridge', async () => {
 test('watchdog stops the bridge and notifies the relay when opencode dies', async () => {
   const handle = await startBridge(relayUrl, API_KEY, {
     opencodeUrl,
-    sessionId: 'sess-wd',
+    sessionId: 'ses_wd',
     healthIntervalMs: 100,
   })
-  expect((await new RelayClient(relayUrl, API_KEY).getSession('sess-wd')).status).toBe(200)
+  expect((await new RelayClient(relayUrl, API_KEY).getSession('ses_wd')).status).toBe(200)
   await closeOpencode()
   await handle.closed // resolves once a health tick fails
-  expect((await new RelayClient(relayUrl, API_KEY).getSession('sess-wd')).status).toBe(404)
+  expect((await new RelayClient(relayUrl, API_KEY).getSession('ses_wd')).status).toBe(404)
   await listenOpencode() // restore for any later tests / clean teardown
 })
 
 test('stopBridge without a saved state is a no-op (idempotent, owner-only delete)', async () => {
   // Registration is public, but DELETE requires the session's own
   // bridge_token from the local state file. With no state, stop does nothing.
-  clearSessionState('sess-nostate')
-  await expect(stopBridge(relayUrl, 'sess-nostate', API_KEY)).resolves.toBeUndefined()
+  clearSessionState('ses_nostate')
+  await expect(stopBridge(relayUrl, 'ses_nostate', API_KEY)).resolves.toBeUndefined()
 })

@@ -67,12 +67,16 @@ test('POST /api/sessions rejects a session_id that is not a real opencode id (op
 
 test('POST /api/sessions still accepts a valid ses_ id', async () => {
   const app = createApp(new Store())
-  const res = await request(app)
-    .post('/api/sessions')
-    .send({ session_id: 'ses_7aBcD_0', directory: '/path', title: 't' })
-  expect(res.status).toBe(201)
-  expect(res.body.session_id).toBe('ses_7aBcD_0')
-  expect(res.body.viewer_url).toBe('/ses_7aBcD_0')
+  // The second id is the shape opencode actually mints (Identifier.descending):
+  // 'ses_' + 12 hex digits of the counter-tagged timestamp + 14 base62
+  // characters. It is here so a future tightening of the id check has to stay
+  // compatible with a real registration, not just with a synthetic short id.
+  for (const id of ['ses_7aBcD_0', 'ses_ffb2d1c0a4e7Ab3kQ9mZxT7Wn2']) {
+    const res = await request(app).post('/api/sessions').send({ session_id: id, directory: '/path', title: 't' })
+    expect(res.status, `id ${JSON.stringify(id)} should be accepted`).toBe(201)
+    expect(res.body.session_id).toBe(id)
+    expect(res.body.viewer_url).toBe(`/${id}`)
+  }
 })
 
 test('DELETE /api/sessions/:id without a bridge token is 404 (owner-only delete)', async () => {

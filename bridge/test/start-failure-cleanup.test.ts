@@ -155,7 +155,7 @@ test('a relay that cannot be reached kills the opencode server start spawned', a
   const exitListeners = process.listenerCount('exit')
   await expect(
     startBridge(await closedUrl(), API_KEY, {
-      sessionId: 'sess-fail-unreachable',
+      sessionId: 'ses_fail_unreachable',
       serverSpawner: async () => ({ port: opencodePort, spawned: server }),
     }),
   ).rejects.toThrow()
@@ -166,11 +166,11 @@ test('a relay that cannot be reached kills the opencode server start spawned', a
 })
 
 test('a relay that refuses the registration (409, a stale share holds the id) kills the spawned server', async () => {
-  await new RelayClient(relayUrl, API_KEY).createSession('sess-fail-409', '/path', 'stale share')
+  await new RelayClient(relayUrl, API_KEY).createSession('ses_fail_409', '/path', 'stale share')
   const server = spawnServerLikeChild()
   await expect(
     startBridge(relayUrl, API_KEY, {
-      sessionId: 'sess-fail-409',
+      sessionId: 'ses_fail_409',
       serverSpawner: async () => ({ port: opencodePort, spawned: server }),
     }),
   ).rejects.toThrow(/409/)
@@ -191,13 +191,13 @@ test('a refused bridge WebSocket kills the spawned server and still removes the 
   try {
     await expect(
       startBridge(refusing.url, API_KEY, {
-        sessionId: 'sess-fail-ws',
+        sessionId: 'ses_fail_ws',
         serverSpawner: async () => ({ port: opencodePort, spawned: server }),
       }),
     ).rejects.toThrow(/HTTP 404/)
     expect(await waitForExit(server)).toBe(true)
-    expect(refusing.deletes).toEqual(['/api/sessions/sess-fail-ws'])
-    expect(loadSessionState('sess-fail-ws')).toBeUndefined()
+    expect(refusing.deletes).toEqual(['/api/sessions/ses_fail_ws'])
+    expect(loadSessionState('ses_fail_ws')).toBeUndefined()
   } finally {
     await refusing.close()
   }
@@ -233,7 +233,7 @@ const server = http.createServer((req, res) => {
   if (req.headers.authorization !== expected) return send(401, { error: 'unauthorized' })
   const url = new URL(req.url, 'http://x')
   if (url.pathname === '/global/health') return send(200, { healthy: true })
-  if (url.pathname === '/session/sess-fail-cli') return send(200, { id: 'sess-fail-cli', directory: process.cwd(), title: 't' })
+  if (url.pathname === '/session/ses_fail_cli') return send(200, { id: 'ses_fail_cli', directory: process.cwd(), title: 't' })
   send(404, { error: 'not found' })
 })
 server.listen(0, '127.0.0.1', () => console.log('opencode server listening on http://127.0.0.1:' + server.address().port))
@@ -250,7 +250,7 @@ server.listen(0, '127.0.0.1', () => console.log('opencode server listening on ht
 
     const bridge = spawn(
       process.execPath,
-      [bundle, 'start', '--relay', await closedUrl(), '--session-id', 'sess-fail-cli'],
+      [bundle, 'start', '--relay', await closedUrl(), '--session-id', 'ses_fail_cli'],
       {
         cwd: root,
         env: {

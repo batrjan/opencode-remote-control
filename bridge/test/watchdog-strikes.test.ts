@@ -151,7 +151,7 @@ afterAll(async () => {
 test('a single health probe that times out neither ends the share nor kills the server it spawned', async () => {
   const server = spawnDummyServer()
   const handle = await startBridge(relayUrl, API_KEY, {
-    sessionId: 'sess-wd-once',
+    sessionId: 'ses_wd_once',
     healthIntervalMs: 100,
     serverSpawner: async () => ({ port: opencodePort, spawned: server }),
   })
@@ -161,7 +161,7 @@ test('a single health probe that times out neither ends the share nor kills the 
     expect(await settleWithin(handle.closed, SLOW_MS + 800)).toBe('pending')
     expect(slowNext).toBe(0) // the stall really was probed…
     expect(healthProbes).toBeGreaterThan(3) // …and the probes after it were answered
-    expect((await new RelayClient(relayUrl, API_KEY).getSession('sess-wd-once')).status).toBe(200)
+    expect((await new RelayClient(relayUrl, API_KEY).getSession('ses_wd_once')).status).toBe(200)
     expect(server.exitCode).toBeNull()
     expect(server.signalCode).toBeNull()
   } finally {
@@ -175,7 +175,7 @@ test('a server that keeps failing its probes ends the share after the strike lim
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
   const server = spawnDummyServer()
   const handle = await startBridge(relayUrl, API_KEY, {
-    sessionId: 'sess-wd-dead',
+    sessionId: 'ses_wd_dead',
     healthIntervalMs: 100,
     serverSpawner: async () => ({ port: opencodePort, spawned: server }),
   })
@@ -189,7 +189,7 @@ test('a server that keeps failing its probes ends the share after the strike lim
     expect(healthProbes).toBeGreaterThanOrEqual(3)
     const warned = warn.mock.calls.map((args) => args.join(' ')).join('\n')
     expect(warned).toContain(`failed 3 health probes in a row (no answer within ${PROBE_TIMEOUT_MS} ms)`)
-    expect((await new RelayClient(relayUrl, API_KEY).getSession('sess-wd-dead')).status).toBe(404)
+    expect((await new RelayClient(relayUrl, API_KEY).getSession('ses_wd_dead')).status).toBe(404)
     // The share's lifetime owns the server it spawned.
     expect(await waitForExit(server)).toBe(true)
   } finally {
@@ -207,7 +207,7 @@ test('the CLI names the cause when the watchdog ends the share', async () => {
   const home = mkdtempSync(path.join(tmpdir(), 'rc-watchdog-'))
   const bridge = spawn(
     process.execPath,
-    [BUNDLE, 'start', '--relay', relayUrl, '--port', String(opencodePort), '--session-id', 'sess-wd-cli'],
+    [BUNDLE, 'start', '--relay', relayUrl, '--port', String(opencodePort), '--session-id', 'ses_wd_cli'],
     {
       env: {
         ...process.env,
@@ -233,7 +233,7 @@ test('the CLI names the cause when the watchdog ends the share', async () => {
       'Remote control stopped: the local opencode server stopped responding (3 health probes in a row failed: HTTP 503).',
     )
     expect(stderr).toContain('failed 3 health probes in a row (HTTP 503)')
-    expect((await new RelayClient(relayUrl, API_KEY).getSession('sess-wd-cli')).status).toBe(404)
+    expect((await new RelayClient(relayUrl, API_KEY).getSession('ses_wd_cli')).status).toBe(404)
   } finally {
     if (bridge.exitCode === null && bridge.signalCode === null) bridge.kill('SIGKILL')
     rmSync(home, { recursive: true, force: true })

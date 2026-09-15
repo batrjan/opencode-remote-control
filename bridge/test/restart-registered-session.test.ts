@@ -223,23 +223,23 @@ afterAll(async () => {
 
 // POSIX only: whose process a pid is comes from `ps`.
 test.skipIf(process.platform === 'win32')('a share whose bridge died is taken back: start registers the session again with a new code', async () => {
-  const earlier = await register('sess-crashed')
+  const earlier = await register('ses_crashed')
   // The `opencode serve` the dead bridge spawned, re-parented and still running.
   const leftoverServer = lookalike('leftover', 'opencode', ['serve'])
-  earlierState('sess-crashed', earlier, { pid: await exitedPid(), server_pid: leftoverServer.pid })
+  earlierState('ses_crashed', earlier, { pid: await exitedPid(), server_pid: leftoverServer.pid })
   // The server comes from detection (stood in for), as on the plugin path. A
   // start that names its server itself keeps the leftover: it may be that server.
   const serverSpawner = vi.fn(async () => ({ port: opencodePort }))
 
-  const handle = await startBridge(relayUrl, API_KEY, { sessionId: 'sess-crashed', serverSpawner })
+  const handle = await startBridge(relayUrl, API_KEY, { sessionId: 'ses_crashed', serverSpawner })
   try {
     expect(handle.access_code).toBeTruthy()
     expect(handle.access_code).not.toBe(earlier.access_code)
-    const state = loadSessionState('sess-crashed')
+    const state = loadSessionState('ses_crashed')
     expect(state?.pid).toBe(process.pid)
     expect(state?.bridge_token).not.toBe(earlier.bridge_token)
     // The earlier registration is gone: its token no longer owns the session.
-    expect(await new RelayClient(relayUrl).deleteSession('sess-crashed', earlier.bridge_token)).toBe(404)
+    expect(await new RelayClient(relayUrl).deleteSession('ses_crashed', earlier.bridge_token)).toBe(404)
     // So is the server that share left behind; the state holding its pid is overwritten.
     expect(await until(() => leftoverServer.exitCode !== null || leftoverServer.signalCode !== null, 5000)).toBe(true)
   } finally {
@@ -248,26 +248,26 @@ test.skipIf(process.platform === 'win32')('a share whose bridge died is taken ba
 })
 
 test.skipIf(process.platform === 'win32')('a share that is still running is left alone: start refuses before spawning anything and says how to end it', async () => {
-  const earlier = await register('sess-live')
+  const earlier = await register('ses_live')
   const runningBridge = lookalike('running', 'remote-control-bridge.cjs', ['start'])
-  const state = earlierState('sess-live', earlier, { pid: runningBridge.pid })
+  const state = earlierState('ses_live', earlier, { pid: runningBridge.pid })
   const serverSpawner = vi.fn(async () => ({ port: opencodePort }))
 
-  await expect(startBridge(relayUrl, API_KEY, { sessionId: 'sess-live', serverSpawner })).rejects.toThrow(
+  await expect(startBridge(relayUrl, API_KEY, { sessionId: 'ses_live', serverSpawner })).rejects.toThrow(
     new RegExp(`already shared from this machine \\(bridge pid ${runningBridge.pid}\\).*stop`),
   )
   expect(serverSpawner).not.toHaveBeenCalled()
-  expect(loadSessionState('sess-live')).toEqual(state)
-  expect(await relayStatus('sess-live')).toBe(200)
+  expect(loadSessionState('ses_live')).toEqual(state)
+  expect(await relayStatus('ses_live')).toBe(200)
   expect(alive(runningBridge.pid)).toBe(true)
 })
 
 test('a session registered by a share this machine has no record of is explained, not a bare 409', async () => {
-  await register('sess-foreign')
-  await expect(startBridge(relayUrl, API_KEY, { opencodeUrl, sessionId: 'sess-foreign' })).rejects.toThrow(
+  await register('ses_foreign')
+  await expect(startBridge(relayUrl, API_KEY, { opencodeUrl, sessionId: 'ses_foreign' })).rejects.toThrow(
     /already registered on the relay \(409\) by a share this machine has no record of/,
   )
-  expect(await relayStatus('sess-foreign')).toBe(200)
+  expect(await relayStatus('ses_foreign')).toBe(200)
 })
 
 test.skipIf(process.platform === 'win32')(
@@ -317,15 +317,15 @@ test.skipIf(process.platform === 'win32')(
 test.skipIf(process.platform === 'win32')(
   'status: a share whose bridge is gone is named stale and exits non-zero',
   async () => {
-    const earlier = await register('sess-stale')
-    earlierState('sess-stale', earlier, { pid: await exitedPid() })
+    const earlier = await register('ses_stale')
+    earlierState('ses_stale', earlier, { pid: await exitedPid() })
 
-    const { code, stdout } = await runCli(['status', '--relay', relayUrl, '--session-id', 'sess-stale'], {
+    const { code, stdout } = await runCli(['status', '--relay', relayUrl, '--session-id', 'ses_stale'], {
       // opencode is detected, the relay is up and holds the session: only the bridge is missing.
       FAKE_LSOF_LINE: `node ${process.pid} user 20u IPv4 0x0 0t0 TCP 127.0.0.1:${opencodePort} (LISTEN)`,
     })
     expect(stdout).toContain(`opencode: detected on port ${opencodePort}`)
-    expect(stdout).toContain('session sess-stale: active')
+    expect(stdout).toContain('session ses_stale: active')
     expect(stdout).toMatch(/bridge process: not running/)
     expect(code).toBe(1)
   },

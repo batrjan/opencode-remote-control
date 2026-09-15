@@ -74,7 +74,7 @@ test('a backed-up relay socket pauses event forwarding, and every event still ar
   )
   const socket = () => (ws as unknown as { ws: import('ws').WebSocket }).ws
   try {
-    await ws.connect('sess-backpressure', 'token')
+    await ws.connect('ses_backpressure', 'token')
     await ws.startEventForwarding()
 
     // ~12.8 MB of events on offer, far beyond what the OS buffers absorb.

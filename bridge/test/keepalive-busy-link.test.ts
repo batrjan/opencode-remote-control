@@ -110,7 +110,7 @@ test('a link that keeps delivering data is not killed for a missing pong', async
   })
   const ws = bridge(relay.url)
   try {
-    await ws.connect('sess-busy-inbound', 'token')
+    await ws.connect('ses_busy_inbound', 'token')
     await settle(60 * 12) // a dozen keep-alive intervals
     expect(relay.sockets.length).toBe(1)
     expect(relay.sockets[0]!.readyState).toBe(1)
@@ -128,7 +128,7 @@ test("the relay's own pings count as proof the link is alive", async () => {
   })
   const ws = bridge(relay.url)
   try {
-    await ws.connect('sess-relay-pings', 'token')
+    await ws.connect('ses_relay_pings', 'token')
     await settle(60 * 12)
     expect(relay.sockets.length).toBe(1)
   } finally {
@@ -175,7 +175,7 @@ test('a link whose outbound queue is still draining is not killed', async () => 
   const ws = bridge(relay.url)
   const client = ws as unknown as { send(data: unknown): void; ws: import('ws').WebSocket }
   try {
-    await ws.connect('sess-draining', 'token')
+    await ws.connect('ses_draining', 'token')
     const first = client.ws
     const blob = 'x'.repeat(1024 * 1024)
     const BACKLOG = 16 * 1024 * 1024
@@ -223,7 +223,7 @@ test('a genuinely dead link is still detected and re-dialled', async () => {
     reconnects += 1
   }
   try {
-    await ws.connect('sess-dead', 'token')
+    await ws.connect('ses_dead', 'token')
     const deadline = Date.now() + 3000
     while (relay.sockets.length < 2 && Date.now() < deadline) await settle(20)
     expect(relay.sockets.length).toBeGreaterThanOrEqual(2)
@@ -244,7 +244,7 @@ test("frames the relay sends right after accepting are not lost to the liveness 
   })
   const ws = bridge(relay.url)
   try {
-    await ws.connect('sess-first-frames', 'token')
+    await ws.connect('ses_first_frames', 'token')
     const deadline = Date.now() + 2000
     const accepts = () => (ws as unknown as { relayAcceptsGzip: boolean }).relayAcceptsGzip
     while (!accepts() && Date.now() < deadline) await settle(10)
@@ -285,7 +285,7 @@ test('a reconnect while opencode is down does not crash the bridge, and events r
   )
   let opencodeBack: Server | undefined
   try {
-    await ws.connect('sess-reconnect-opencode-down', 'token')
+    await ws.connect('ses_reconnect_opencode_down', 'token')
     const deadline = Date.now() + 3000
     while (connections < 2 && Date.now() < deadline) await settle(10)
     expect(connections).toBeGreaterThanOrEqual(2)
@@ -333,18 +333,18 @@ test('a malformed proxy request from the relay is refused, not a crash', async (
       if (msg.type === 'proxy_response') answers.set(msg.request_id!, msg.status!)
     })
     for (const [request_id, method, path] of [
-      ['bad-method', 7, '/session/sess-malformed/message'],
+      ['bad-method', 7, '/session/ses_malformed/message'],
       ['bad-path', 'GET', { toString: null }],
       ['null-both', null, null],
       ['array-path', 'GET', ['/session']],
     ] as const) {
       socket.send(JSON.stringify({ type: 'proxy', request_id, method, path }))
     }
-    socket.send(JSON.stringify({ type: 'proxy', request_id: 'good', method: 'GET', path: '/session/sess-malformed/message' }))
+    socket.send(JSON.stringify({ type: 'proxy', request_id: 'good', method: 'GET', path: '/session/ses_malformed/message' }))
   })
   const ws = bridge(`http://127.0.0.1:${(wss.address() as AddressInfo).port}`)
   try {
-    await ws.connect('sess-malformed', 'token')
+    await ws.connect('ses_malformed', 'token')
     const deadline = Date.now() + 3000
     while (answers.size < 5 && Date.now() < deadline) await settle(10)
     expect(Object.fromEntries(answers)).toEqual({ 'bad-method': 403, 'bad-path': 403, 'null-both': 403, 'array-path': 403, good: 200 })

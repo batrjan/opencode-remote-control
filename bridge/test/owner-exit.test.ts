@@ -128,17 +128,17 @@ test('the bridge stops and revokes the share when its owner process exits, even 
   const owner = spawnOwner()
   const handle = await startBridge(relayUrl, API_KEY, {
     opencodeUrl,
-    sessionId: 'sess-owner',
+    sessionId: 'ses_owner',
     healthIntervalMs: 100,
     ownerPid: owner.pid,
   })
   try {
-    expect((await new RelayClient(relayUrl, API_KEY).getSession('sess-owner')).status).toBe(200)
+    expect((await new RelayClient(relayUrl, API_KEY).getSession('ses_owner')).status).toBe(200)
     owner.kill('SIGKILL')
     expect(await waitForExit(owner)).toBe(true)
     // The mock opencode is still perfectly healthy: only the owner is gone.
     expect(await within(handle.closed, 2000)).toBe(true)
-    expect((await new RelayClient(relayUrl, API_KEY).getSession('sess-owner')).status).toBe(404)
+    expect((await new RelayClient(relayUrl, API_KEY).getSession('ses_owner')).status).toBe(404)
   } finally {
     await handle.stop()
     if (alive(owner.pid)) owner.kill('SIGKILL')
@@ -149,14 +149,14 @@ test('a live owner and a healthy opencode keep the share up', async () => {
   const owner = spawnOwner()
   const handle = await startBridge(relayUrl, API_KEY, {
     opencodeUrl,
-    sessionId: 'sess-owner-alive',
+    sessionId: 'ses_owner_alive',
     healthIntervalMs: 100,
     ownerPid: owner.pid,
   })
   try {
     // Five watchdog ticks and then some.
     expect(await within(handle.closed, 600)).toBe(false)
-    expect((await new RelayClient(relayUrl, API_KEY).getSession('sess-owner-alive')).status).toBe(200)
+    expect((await new RelayClient(relayUrl, API_KEY).getSession('ses_owner_alive')).status).toBe(200)
   } finally {
     await handle.stop()
     owner.kill('SIGKILL')
@@ -175,7 +175,7 @@ test('a live owner and a healthy opencode keep the share up', async () => {
 test.skipIf(process.platform === 'win32')(
   'quitting the TUI ends a share started from its plugin (bridge, its opencode serve and the relay session)',
   async () => {
-    const SESSION = 'sess-owner-tui'
+    const SESSION = 'ses_owner_tui'
     const root = mkdtempSync(path.join(tmpdir(), 'rc-owner-exit-'))
     const home = path.join(root, 'home')
     const bin = path.join(root, 'bin')
