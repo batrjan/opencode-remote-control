@@ -4,7 +4,7 @@ import type { Request, Response } from 'express'
 import type { Store, Session } from '../store.js'
 import type { BridgeClient } from '../ws/bridge.js'
 import { setViewerCookie } from '../api/viewerCookie.js'
-import { bridgeMaxPayloadBytes, bridgeReconnectWaitMs, config, promptTimeoutMs, proxyMaxBufferedBytes, sseHeartbeatMs, sseMaxBufferBytes, sseMaxExemptBytes, sseMaxParkedBytes, sseRetryMs } from '../config.js'
+import { bridgeMaxPayloadBytes, bridgeReconnectWaitMs, config, promptTimeoutMs, proxyMaxBufferedBytes, proxyStallCheckMs, proxyStallStrikes, sseHeartbeatMs, sseMaxBufferBytes, sseMaxExemptBytes, sseMaxParkedBytes, sseRetryMs } from '../config.js'
 
 /**
  * HTTP → WS → opencode proxy adapter, mounted at the server ROOT.
@@ -209,24 +209,6 @@ const LOST_ANSWER_ERRORS = new Set(['proxy timeout', 'bridge closed', 'bridge un
  */
 const PROXY_BODY_LIMIT = '25mb'
 
-/**
- * How often a buffered proxy response's drain is checked, and how many
- * consecutive no-progress checks are tolerated before a stalled one is cut so it
- * stops pinning the shared buffered-bytes budget (see sendBounded). A reader on
- * a slow uplink makes progress every check and is never cut — only a socket that
- * takes nothing at all is.
- *
- * This window is how long a non-reading socket keeps its bytes charged, so it is
- * also how wide an outage one share can inflict on the rest. At ~10 s of dead
- * silence (two 5 s strikes) an attacker re-opening a handful of sockets every few
- * seconds held the budget full continuously, with no gap for anyone else's
- * request to land in. One 2.5 s strike is still far more than a client that reads
- * at all needs — either progress signal, the whole-write backlog or libuv's
- * in-flight queue, moves long before it — and a response cut by mistake costs the
- * viewer one re-fetch.
- */
-const PROXY_STALL_CHECK_MS = 2_500
-const PROXY_STALL_STRIKES = 1
 
 /**
  * Max concurrent SSE streams one session may hold open. Each stream costs a
@@ -439,7 +421,7 @@ const crossOriginWarned = new Set<string>()
  * grep.
  */
 function warnCrossOrigin(origin: string, host: string): false {
-  const key = `${origin} ${host}`
+  const key = `${origin}\u0000${host}`
   if (crossOriginWarned.has(key) || crossOriginWarned.size >= MAX_CROSS_ORIGIN_WARNINGS) return false
   crossOriginWarned.add(key)
   console.warn(`[proxy] cross-origin POST refused: origin=${JSON.stringify(origin)} host=${JSON.stringify(host)}`)
@@ -641,10 +623,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
         return
       }
       // No byte moved since the previous check; a client that keeps reading
-      // would have. Cut it after a couple of these so the budget frees ('close'
-      // releases it) — the viewer's own reconnect fetches it again.
-      if (++strikes >= PROXY_STALL_STRIKES) res.destroy()
-    }, PROXY_STALL_CHECK_MS)
+      // would have. Cut it once the whole tolerance is gone so the budget frees
+      // ('close' releases it) — the viewer's own reconnect fetches it again.
+      if (++strikes >= proxyStallStrikes()) res.destroy()
+    }, proxyStallCheckMs())
     stall.unref?.()
   }
 

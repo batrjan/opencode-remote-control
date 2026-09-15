@@ -391,6 +391,31 @@ export function proxyMaxBufferedBytes(): number {
 }
 
 /**
+ * How often a buffered proxy response's drain is checked, and how many
+ * consecutive no-progress checks are tolerated before it is cut (see
+ * sendBounded). Their product is the whole tolerance: a socket that takes no
+ * byte at all for that long loses its response and gives its bytes back to the
+ * budget.
+ *
+ * The tolerance is generous on purpose. A share that parks dead sockets can
+ * only fill its OWN slice of the ceiling (proxySessionShareBytes), so holding
+ * those bytes for ten seconds costs nobody else their turn — the tenant split,
+ * not a quick cut, is what bounds the blast radius. Cutting quickly does have a
+ * cost: the viewers this project is for read over an owner uplink measured at
+ * 0.74 Mbit/s, on phones and tablets that go quiet for seconds together on a
+ * cell handover, in a tunnel, or with the screen off. Every one of those
+ * silences under the tolerance is invisible; each one over it is a failed
+ * request the viewer has to retry.
+ */
+export function proxyStallCheckMs(): number {
+  return envInt('RELAY_PROXY_STALL_CHECK_MS', 2_500)
+}
+
+export function proxyStallStrikes(): number {
+  return envInt('RELAY_PROXY_STALL_STRIKES', 4)
+}
+
+/**
  * Most sessions the relay holds at once, whoever registered them.
  *
  * Registration is public and the other caps are per client address, so on
