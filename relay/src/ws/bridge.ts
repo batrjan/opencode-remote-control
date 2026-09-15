@@ -15,7 +15,10 @@ import { bridgeMaxPayloadBytes, bridgeReconnectWaitMs, wsPingIntervalMs, wsPongG
  *   bridge → relay: { type: 'proxy_response', request_id, status, contentType, nextCursor?, body }
  *   bridge → relay: { type: 'event', data }   (opencode SSE event, re-emitted
  *                                            to viewers by the SSE endpoint)
- *   relay → bridge: { type: 'hello', features: ['gzip-body'] }   (first frame)
+ *   relay → bridge: { type: 'hello', features: ['gzip-body',
+ *                     'max-frame-bytes=<n>'] }   (first frame; the second
+ *                     names this relay's maxPayload, so the bridge does not
+ *                     have to carry a copy of it — see below)
  *   bridge → relay: binary [u32 header length][header JSON][gzip body], header
  *                   { type: 'proxy_response', request_id, status, contentType,
  *                     nextCursor?, encoding: 'gzip' }   — only after the hello;
@@ -206,7 +209,17 @@ export class BridgeClient {
       req.socket.on('data', alive)
       // First frame, before any proxy request can be sent on this socket: what
       // this relay understands. Bridges that predate it ignore unknown types.
-      ws.send(JSON.stringify({ type: 'hello', features: ['gzip-body'] }))
+      //
+      // The frame cap travels with it because it is the one limit enforced by
+      // dropping the link, not by failing a request: a bridge that guesses it
+      // too high spends the owner's socket on a frame ws refuses, taking every
+      // other request in flight and every viewer's event stream with it — and
+      // the relay repeats the GET when the bridge is back, so one heavy
+      // session costs the link again. A bridge that is told degrades instead
+      // (413 for a response, drop for an event). It is a feature string rather
+      // than a new field so that older bridges, which only look for
+      // 'gzip-body' in this list, go on ignoring it.
+      ws.send(JSON.stringify({ type: 'hello', features: ['gzip-body', `max-frame-bytes=${bridgeMaxPayloadBytes()}`] }))
       ws.on('message', (raw, isBinary) => {
         if (isBinary) void this.onCompressedResponse(session_id, raw)
         else this.onMessage(session_id, raw)

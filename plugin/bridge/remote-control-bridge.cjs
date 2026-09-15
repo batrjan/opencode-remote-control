@@ -7739,6 +7739,23 @@ function warnRejectedProxyRequest(method, path3) {
 var GZIP_MIN_BYTES = 8 * 1024;
 var GZIP_MAX_RATIO = 32;
 var GZIP_MAX_OUTPUT_BYTES = 100 * 1024 * 1024;
+function announcedFrameCap(features) {
+  if (!Array.isArray(features)) return void 0;
+  for (const feature of features) {
+    if (typeof feature !== "string" || !feature.startsWith("max-frame-bytes=")) continue;
+    const value = Number(feature.slice("max-frame-bytes=".length));
+    if (Number.isFinite(value) && value > 0) return Math.min(value, GZIP_MAX_OUTPUT_BYTES);
+  }
+  return void 0;
+}
+var warnedOversizedFrame = false;
+function warnOversizedFrame(kind, bytes, cap) {
+  if (warnedOversizedFrame) return;
+  warnedOversizedFrame = true;
+  console.warn(
+    `bridge: a ${kind} of ${bytes} bytes exceeds the relay's ${cap}-byte frame limit and was not sent (sending it would drop the link and every request on it)`
+  );
+}
 var KEEPALIVE_STRIKES = 2;
 function linkMadeProgress(s) {
   if (s.pongReceived || s.inboundActivity) return true;
@@ -7778,6 +7795,15 @@ var RelayWSClient = class {
   forwardingEvents = false;
   /** The relay on the CURRENT socket said it accepts gzipped response bodies. */
   relayAcceptsGzip = false;
+  /**
+   * The largest frame the relay on the CURRENT socket accepts, from its hello.
+   * A frame past it is not a failed request: ws answers it with a protocol
+   * error and the relay terminates the link, failing everything else in flight
+   * and leaving every viewer a gap. Knowing the number lets send() degrade
+   * instead. GZIP_MAX_OUTPUT_BYTES until a relay says otherwise, which is the
+   * ceiling relays that announce nothing were built around.
+   */
+  relayMaxFrameBytes = GZIP_MAX_OUTPUT_BYTES;
   /** Called when the relay rejects our credentials — the share is gone. */
   onFatal = null;
   /** Test/diagnostic hook: fired after every successful (re)connection. */
@@ -7814,6 +7840,7 @@ var RelayWSClient = class {
       });
       this.ws = ws;
       this.relayAcceptsGzip = false;
+      this.relayMaxFrameBytes = GZIP_MAX_OUTPUT_BYTES;
       let opened = false;
       ws.on("open", () => {
         opened = true;
@@ -8020,6 +8047,7 @@ var RelayWSClient = class {
     if (msg.type === "hello") {
       const features = msg.features;
       this.relayAcceptsGzip = Array.isArray(features) && features.includes("gzip-body");
+      this.relayMaxFrameBytes = announcedFrameCap(features) ?? GZIP_MAX_OUTPUT_BYTES;
       return;
     }
     if (msg.type !== "proxy" || typeof msg.request_id !== "string") return;
@@ -8079,7 +8107,11 @@ var RelayWSClient = class {
       const compressed = await new Promise(
         (resolve) => (0, import_node_zlib.gzip)(raw, (err, result) => resolve(err ? null : result))
       );
-      const worthIt = compressed !== null && compressed.length < raw.length * 0.9 && raw.length <= compressed.length * GZIP_MAX_RATIO && raw.length <= GZIP_MAX_OUTPUT_BYTES;
+      const worthIt = compressed !== null && compressed.length < raw.length * 0.9 && raw.length <= compressed.length * GZIP_MAX_RATIO && // The relay inflates to at most min(ratio, its frame cap), so a body
+      // over the cap is refused however small it was on the wire — and the
+      // owner's uplink has already carried it by then. Fall through to the
+      // 413 below instead of paying for a 502.
+      raw.length <= this.relayMaxFrameBytes;
       if (worthIt && this.relayAcceptsGzip && this.ws?.readyState === wrapper_default.OPEN) {
         const header = Buffer.from(
           JSON.stringify({
@@ -8093,14 +8125,47 @@ var RelayWSClient = class {
         );
         const prefix = Buffer.alloc(4);
         prefix.writeUInt32BE(header.length, 0);
-        this.ws.send(Buffer.concat([prefix, header, compressed]), { binary: true });
-        return;
+        const frame = Buffer.concat([prefix, header, compressed]);
+        if (frame.length <= this.relayMaxFrameBytes) {
+          this.ws.send(frame, { binary: true });
+          return;
+        }
       }
     }
-    this.send({ type: "proxy_response", request_id, ...out });
+    if (this.send({ type: "proxy_response", request_id, ...out })) return;
+    this.send({
+      type: "proxy_response",
+      request_id,
+      status: 413,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "response too large for the relay link" })
+    });
   }
+  /**
+   * Put one text frame on the relay socket, unless it is bigger than the relay
+   * said it accepts. Returns whether it went.
+   *
+   * The check lives here, in the single place every text frame passes through,
+   * because getting it wrong is not a failed request: the relay answers a frame
+   * past its maxPayload with a protocol error and terminates the socket, which
+   * fails every other request in flight for this share and leaves every viewer
+   * a gap in the event stream — and the relay repeats the GET that caused it as
+   * soon as the bridge is back, so the same body takes the link down twice.
+   * Dropping the frame costs whoever asked for it one answer; sending it costs
+   * everyone the share. Callers that can say something smaller instead (see
+   * sendProxyResponse) act on the `false`.
+   */
   send(data) {
-    if (this.ws?.readyState === wrapper_default.OPEN) this.ws.send(JSON.stringify(data));
+    if (this.ws?.readyState !== wrapper_default.OPEN) return false;
+    const frame = JSON.stringify(data);
+    const bytes = Buffer.byteLength(frame);
+    if (bytes > this.relayMaxFrameBytes) {
+      const type = data?.type;
+      warnOversizedFrame(typeof type === "string" ? type : "frame", bytes, this.relayMaxFrameBytes);
+      return false;
+    }
+    this.ws.send(frame);
+    return true;
   }
   /**
    * Cross-session guard. The relay force-binds the URL :id to the viewer's

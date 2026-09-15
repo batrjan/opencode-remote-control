@@ -460,8 +460,46 @@ const GZIP_MIN_BYTES = 8 * 1024
  * its compressed size, so a body that compresses better goes uncompressed.
  */
 const GZIP_MAX_RATIO = 32
-/** Nor past what an uncompressed frame could carry. */
+/**
+ * Fallback frame cap for a relay that does not announce its own.
+ *
+ * The real ceiling is the relay's maxPayload, and a relay new enough names it
+ * in the hello ('max-frame-bytes=<n>' — see relayMaxFrameBytes). This number
+ * is what the relays that say nothing were built around, so it is what they
+ * still accept; it is not this bridge's to choose, and raising it here would
+ * only mean sending them frames they terminate the link over.
+ */
 const GZIP_MAX_OUTPUT_BYTES = 100 * 1024 * 1024
+
+/**
+ * The frame cap a relay's hello announces, or undefined when it announces
+ * none (an older relay, or a feature list that is not ours to parse).
+ *
+ * Only ever narrows what this bridge sends, and only to a positive finite
+ * number: a relay that names something absurd — or a hostile one, since the
+ * bridge does not trust the relay any more than the other way round — cannot
+ * use this to make the bridge send frames the real relay would refuse.
+ */
+function announcedFrameCap(features: unknown): number | undefined {
+  if (!Array.isArray(features)) return undefined
+  for (const feature of features) {
+    if (typeof feature !== 'string' || !feature.startsWith('max-frame-bytes=')) continue
+    const value = Number(feature.slice('max-frame-bytes='.length))
+    if (Number.isFinite(value) && value > 0) return Math.min(value, GZIP_MAX_OUTPUT_BYTES)
+  }
+  return undefined
+}
+
+/** One line, once, about frames dropped for the relay's cap — see send(). */
+let warnedOversizedFrame = false
+function warnOversizedFrame(kind: string, bytes: number, cap: number): void {
+  if (warnedOversizedFrame) return
+  warnedOversizedFrame = true
+  console.warn(
+    `bridge: a ${kind} of ${bytes} bytes exceeds the relay's ${cap}-byte frame limit and was not sent ` +
+      `(sending it would drop the link and every request on it)`,
+  )
+}
 
 /** Consecutive keep-alive intervals with no progress at all before a link is dead. */
 const KEEPALIVE_STRIKES = 2
@@ -529,7 +567,9 @@ function outboundCounters(socket: Socket | null): { pending: number; flushed: nu
  * WebSocket client for the relay's /bridge endpoint.
  *
  * After connect() the socket carries (see relay/src/ws/bridge.ts):
- *   relay → bridge: { type: 'hello', features }  (first frame; newer relays only)
+ *   relay → bridge: { type: 'hello', features }  (first frame; newer relays only.
+ *                   'gzip-body' and 'max-frame-bytes=<n>' — see
+ *                   sendProxyResponse and relayMaxFrameBytes)
  *   relay → bridge: { type: 'proxy', request_id, method, path, body? }
  *   bridge → relay: { type: 'proxy_response', request_id, status, contentType, nextCursor?, body }
  *                   or, once the hello offered 'gzip-body', a binary frame
@@ -558,6 +598,15 @@ export class RelayWSClient {
   private forwardingEvents = false
   /** The relay on the CURRENT socket said it accepts gzipped response bodies. */
   private relayAcceptsGzip = false
+  /**
+   * The largest frame the relay on the CURRENT socket accepts, from its hello.
+   * A frame past it is not a failed request: ws answers it with a protocol
+   * error and the relay terminates the link, failing everything else in flight
+   * and leaving every viewer a gap. Knowing the number lets send() degrade
+   * instead. GZIP_MAX_OUTPUT_BYTES until a relay says otherwise, which is the
+   * ceiling relays that announce nothing were built around.
+   */
+  private relayMaxFrameBytes = GZIP_MAX_OUTPUT_BYTES
   /** Called when the relay rejects our credentials — the share is gone. */
   onFatal: ((err: Error) => void) | null = null
   /** Test/diagnostic hook: fired after every successful (re)connection. */
@@ -604,6 +653,7 @@ export class RelayWSClient {
       // Per socket: a relay announces what it understands in its first frame,
       // and a reconnect may land on a different (older) relay.
       this.relayAcceptsGzip = false
+      this.relayMaxFrameBytes = GZIP_MAX_OUTPUT_BYTES
       let opened = false
       ws.on('open', () => {
         opened = true
@@ -849,6 +899,7 @@ export class RelayWSClient {
     if (msg.type === 'hello') {
       const features = (msg as { features?: unknown }).features
       this.relayAcceptsGzip = Array.isArray(features) && features.includes('gzip-body')
+      this.relayMaxFrameBytes = announcedFrameCap(features) ?? GZIP_MAX_OUTPUT_BYTES
       return
     }
     if (msg.type !== 'proxy' || typeof msg.request_id !== 'string') return
@@ -920,7 +971,11 @@ export class RelayWSClient {
         compressed !== null &&
         compressed.length < raw.length * 0.9 &&
         raw.length <= compressed.length * GZIP_MAX_RATIO &&
-        raw.length <= GZIP_MAX_OUTPUT_BYTES
+        // The relay inflates to at most min(ratio, its frame cap), so a body
+        // over the cap is refused however small it was on the wire — and the
+        // owner's uplink has already carried it by then. Fall through to the
+        // 413 below instead of paying for a 502.
+        raw.length <= this.relayMaxFrameBytes
       // Re-checked after the await: the socket may have been replaced by one
       // whose relay has not (or not yet) announced support.
       if (worthIt && this.relayAcceptsGzip && this.ws?.readyState === WebSocket.OPEN) {
@@ -936,15 +991,54 @@ export class RelayWSClient {
         )
         const prefix = Buffer.alloc(4)
         prefix.writeUInt32BE(header.length, 0)
-        this.ws.send(Buffer.concat([prefix, header, compressed!]), { binary: true })
-        return
+        const frame = Buffer.concat([prefix, header, compressed!])
+        // A compressed frame is still a frame. It is far below the cap
+        // whenever the body was (the ratio check above saw to that), but the
+        // limit is on what goes on the wire, so measure what goes on the wire.
+        if (frame.length <= this.relayMaxFrameBytes) {
+          this.ws.send(frame, { binary: true })
+          return
+        }
       }
     }
-    this.send({ type: 'proxy_response', request_id, ...out })
+    if (this.send({ type: 'proxy_response', request_id, ...out })) return
+    // Too large for this relay's link. Say so to whoever asked instead of
+    // putting a frame on the socket that would cost the owner the share — and
+    // cost it again on the repeat that follows the reconnect.
+    this.send({
+      type: 'proxy_response',
+      request_id,
+      status: 413,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'response too large for the relay link' }),
+    })
   }
 
-  private send(data: unknown) {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(data))
+  /**
+   * Put one text frame on the relay socket, unless it is bigger than the relay
+   * said it accepts. Returns whether it went.
+   *
+   * The check lives here, in the single place every text frame passes through,
+   * because getting it wrong is not a failed request: the relay answers a frame
+   * past its maxPayload with a protocol error and terminates the socket, which
+   * fails every other request in flight for this share and leaves every viewer
+   * a gap in the event stream — and the relay repeats the GET that caused it as
+   * soon as the bridge is back, so the same body takes the link down twice.
+   * Dropping the frame costs whoever asked for it one answer; sending it costs
+   * everyone the share. Callers that can say something smaller instead (see
+   * sendProxyResponse) act on the `false`.
+   */
+  private send(data: unknown): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false
+    const frame = JSON.stringify(data)
+    const bytes = Buffer.byteLength(frame)
+    if (bytes > this.relayMaxFrameBytes) {
+      const type = (data as { type?: unknown } | null)?.type
+      warnOversizedFrame(typeof type === 'string' ? type : 'frame', bytes, this.relayMaxFrameBytes)
+      return false
+    }
+    this.ws.send(frame)
+    return true
   }
 
   /**

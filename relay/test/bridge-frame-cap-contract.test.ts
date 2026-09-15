@@ -173,6 +173,34 @@ test('a live event carrying a pasted image does not cost the owner the bridge li
   }
 }, 60_000)
 
+test('the hello tells the bridge this relay\'s frame cap, whatever the install set it to', async () => {
+  // The bridge cannot degrade to a 413 for a limit it has to guess, and an
+  // install that lowers the cap (the one direction that is safe to lower) has
+  // no other way to tell the bridges on the owners' machines about it.
+  transcript = '[]'
+  const before = process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES
+  process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES = String(7 * MiB)
+  const { bridgeToken } = await share('ses_hello_cap')
+  let ws: WebSocket | undefined
+  try {
+    ws = new WebSocket(`${relayUrl.replace(/^http/, 'ws')}/bridge?session_id=ses_hello_cap`, {
+      headers: { 'x-bridge-token': bridgeToken },
+    })
+    const socket = ws
+    const hello = await new Promise<{ features?: unknown }>((resolve, reject) => {
+      socket.once('message', (raw) => resolve(JSON.parse(String(raw))))
+      socket.once('error', reject)
+    })
+    expect(hello.features).toContain('gzip-body')
+    expect(hello.features).toContain(`max-frame-bytes=${bridgeMaxPayloadBytes()}`)
+    expect(hello.features).toContain(`max-frame-bytes=${7 * MiB}`)
+  } finally {
+    ws?.terminate()
+    if (before === undefined) delete process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES
+    else process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES = before
+  }
+}, 30_000)
+
 test('the relay frame cap is not narrower than the ceiling deployed bridges were built against', () => {
   // Both sides of the wire carry this number. Narrowing it on the relay alone
   // is the change a rolling deploy cannot survive: the bridges are on owners'

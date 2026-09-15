@@ -171,7 +171,11 @@ test('the relay announces gzip support in its first frame', async () => {
   try {
     const deadline = Date.now() + 2000
     while (frames.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10))
-    expect(frames[0]).toEqual({ type: 'hello', features: ['gzip-body'] })
+    // Containment, not equality: the feature list is the relay's extension
+    // point (it also names the frame cap — see bridge-frame-cap-contract), and
+    // a bridge only ever looks for the features it knows.
+    expect(frames[0]).toMatchObject({ type: 'hello' })
+    expect((frames[0] as { features: string[] }).features).toContain('gzip-body')
   } finally {
     ws.terminate()
   }
