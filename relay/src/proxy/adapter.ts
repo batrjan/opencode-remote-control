@@ -320,13 +320,28 @@ interface ViewerStream {
 const PROXY_ALLOWED_CONTENT_TYPES = new Set(['application/json', 'text/plain', 'application/octet-stream'])
 
 /**
+ * RFC 7231 media type plus parameters, spelled out in token / quoted-string
+ * characters only. The allow-list below matches on the media type but forwards
+ * the WHOLE bridge-supplied value, so the parameters have to be checked too: a
+ * value like 'application/json; charset=utf-8\r\nX-Injected: 1' is allow-listed
+ * on its media type yet is not a header value at all, and handing it to
+ * res.type() throws (Node's ERR_INVALID_CHAR) in the middle of a send.
+ */
+const CONTENT_TYPE_RE =
+  /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\/[!#$%&'*+\-.^_`|~0-9A-Za-z]+(?:[ \t]*;[ \t]*[!#$%&'*+\-.^_`|~0-9A-Za-z]+=(?:[!#$%&'*+\-.^_`|~0-9A-Za-z]+|"[^"\\\x00-\x1f\x7f]*"))*$/
+
+/**
  * The Content-Type the proxy will actually send for a bridge-supplied one: the
- * value itself when its media type (the part before any ';charset=…') is
- * allow-listed, otherwise application/octet-stream. A missing type defaults to
- * application/json, exactly as the send paths did before.
+ * value itself when it parses as a media type and its media type (the part
+ * before any ';charset=…') is allow-listed, otherwise application/octet-stream.
+ * A missing type defaults to application/json, exactly as the send paths did
+ * before. A real bridge copies this out of a fetch response header
+ * (bridge/src/opencode.ts), so honest values — including older bridges' — are
+ * already normalised and pass unchanged.
  */
 function safeProxyContentType(contentType: string | undefined): string {
   const value = contentType ?? 'application/json'
+  if (!CONTENT_TYPE_RE.test(value)) return 'application/octet-stream'
   const media = value.split(';', 1)[0]?.trim().toLowerCase() ?? ''
   return PROXY_ALLOWED_CONTENT_TYPES.has(media) ? value : 'application/octet-stream'
 }
@@ -479,12 +494,25 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     // Harden the bridge-controlled body: never trust its Content-Type, never
     // cache it, and forbid it from executing on the relay origin.
     setProxyGuardHeaders(res)
-    res
-      .status(status)
-      .type(safeProxyContentType(contentType))
-      .send(payload)
+    // Register the refunds BEFORE the send, and refund by hand if the send
+    // throws. The status is bridge-supplied too, so res.send() can still reject
+    // it (ERR_HTTP_INVALID_STATUS_CODE) however well the Content-Type is
+    // sanitised above — and a throw between the charge and these listeners used
+    // to strand the bytes for the life of the process, until the process-wide
+    // ceiling was full and every share's proxied traffic answered 503.
+    // ('finish' never fires synchronously, so registering early changes nothing
+    // on the normal path, and the `released` flag keeps the refund single.)
     res.once('finish', release)
     res.once('close', release)
+    try {
+      res
+        .status(status)
+        .type(safeProxyContentType(contentType))
+        .send(payload)
+    } catch (err) {
+      release()
+      throw err
+    }
     // A body flushed to the kernel synchronously (a fast reader) needs no
     // watching — 'finish' fires almost at once and releases the budget. Only a
     // backlog left in this process can pin it, so watch just those.
