@@ -349,8 +349,46 @@ function setProxyGuardHeaders(res: Response): void {
   res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox")
 }
 
+/**
+ * CSRF guard for the proxy's state-changing POSTs. The viewer cookie is
+ * SameSite=Strict, but that was the ONLY thing standing between a same-site
+ * page and a cross-origin POST (abort/summarize/unrevert/…) riding the ambient
+ * cookie. So when a request DOES carry an Origin, it must be the relay's own
+ * origin; a mismatch is refused.
+ *
+ * Origin is NOT required: a browser omits it on same-origin GET-like requests
+ * and a non-browser client (curl, the skill's own tooling) never sends one, and
+ * both are legitimate — the absence of an Origin is not a cross-site signal.
+ * The relay's own origin is reconstructed from the request the same way the
+ * browser computes Origin: the forwarded scheme (req.protocol honours
+ * X-Forwarded-Proto under the configured `trust proxy`) and the Host header,
+ * which behind nginx is the public host:port a same-origin page was served
+ * from. A browser normalises Origin (lowercased scheme+host, no default port,
+ * no trailing slash); Host matches it for the deployments the relay runs on.
+ */
+function originAllowed(req: Request): boolean {
+  const origin = req.get('origin')
+  if (!origin) return true
+  const host = req.get('host')
+  if (!host) return false
+  return origin === `${req.protocol}://${host}`
+}
+
 export function proxyAdapter(store: Store, bridge: BridgeClient) {
   const router = express.Router()
+
+  // Answer OPTIONS ourselves before any route can. express's Router otherwise
+  // auto-replies to an OPTIONS with a 200 and an `Allow:` header enumerating
+  // the methods each matched path accepts — which handed an unauthenticated
+  // client the relay's opencode route table. There is no CORS preflight to
+  // honour here (the web UI is same-origin), so an OPTIONS is just an unknown
+  // method: give it the same JSON 404 every other unrouted request gets, with
+  // no Allow list. Registered first so it runs before the route layers whose
+  // auto-OPTIONS this replaces. GET/POST/SSE handling is untouched.
+  router.use((req, res, next) => {
+    if (req.method !== 'OPTIONS') return next()
+    res.status(404).json({ error: 'not found' })
+  })
 
   /** Resolve the viewer's session or answer 401. Returns undefined if handled. */
   function requireViewer(req: Request, res: Response): Session | undefined {
@@ -1001,6 +1039,13 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
   const postPaths = ALLOWED_ROUTES.filter(([m]) => m === 'POST').flatMap(([, t]) => mountPaths(t))
   router.post(postPaths, (req, res, next) => {
     if (!requireViewer(req, res)) return
+    // CSRF: a POST that carries a foreign Origin is refused (see originAllowed).
+    // Checked here, before the body is buffered, so every state-changing proxy
+    // POST is covered in one place. No-Origin and same-origin requests pass.
+    if (!originAllowed(req)) {
+      res.status(403).json({ error: 'cross-origin request forbidden' })
+      return
+    }
     parseProxyBody(req, res, next)
   })
 
