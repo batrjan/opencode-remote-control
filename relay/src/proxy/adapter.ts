@@ -547,12 +547,26 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
    * allow-list live in here too — a handler that sends its own body would have
    * to remember all three.
    */
+  /**
+   * When each share was last refused a proxied body for want of budget, and how
+   * long that keeps its stalled responses on the short leash. The window only
+   * has to outlast the retry a refused viewer makes, so a few of its own checks
+   * is plenty; past it the share is idle again and its viewers get the patient
+   * window back.
+   */
+  const refusedAt = new Map<string, number>()
+  const PROXY_SQUEEZE_WINDOW_MS = 30_000
+
   function sendBounded(res: Response, session_id: string, status: number, contentType: string | undefined, payload: string, nextCursor?: string): void {
     const len = Buffer.byteLength(payload)
     const held = proxyBufferedBySession.get(session_id) ?? 0
     if (proxyBufferedBytes + len > proxyMaxBufferedBytes() || held + len > proxySessionShareBytes()) {
       // Refuse rather than OOM. The web UI surfaces this as a failed request the
       // viewer retries once the relay is no longer saturated.
+      // Recorded, because a refusal is the only honest signal that this share's
+      // parked responses are costing it something: "held >= slice" is not it --
+      // a share sits under its slice and still cannot fit the NEXT body.
+      refusedAt.set(session_id, Date.now())
       res.status(503).json({ error: 'relay busy' })
       return
     }
@@ -568,7 +582,12 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       // this one was charged.
       const left = (proxyBufferedBySession.get(session_id) ?? len) - len
       if (left > 0) proxyBufferedBySession.set(session_id, left)
-      else proxyBufferedBySession.delete(session_id)
+      else {
+        proxyBufferedBySession.delete(session_id)
+        // Nothing of this share is parked any more, so nothing of its is being
+        // denied: drop the mark with the bytes, which also bounds the map.
+        refusedAt.delete(session_id)
+      }
       if (stall) clearInterval(stall)
     }
     // A paged transcript names its older page only in this header; without it
@@ -622,10 +641,17 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
         strikes = 0
         return
       }
+      // How long to wait depends on who is paying for the wait. While the share
+      // still has slice left, a frozen socket costs nobody anything, and cutting
+      // it would only punish a phone that went quiet for a moment. Once the
+      // slice is full it is denying that share's OWN viewers, and patience is
+      // what they are waiting on — so reclaim it at the first silent check.
+      const squeezed = Date.now() - (refusedAt.get(session_id) ?? 0) < PROXY_SQUEEZE_WINDOW_MS
+      const limit = squeezed ? 1 : proxyStallStrikes()
       // No byte moved since the previous check; a client that keeps reading
       // would have. Cut it once the whole tolerance is gone so the budget frees
       // ('close' releases it) — the viewer's own reconnect fetches it again.
-      if (++strikes >= proxyStallStrikes()) res.destroy()
+      if (++strikes >= limit) res.destroy()
     }, proxyStallCheckMs())
     stall.unref?.()
   }
