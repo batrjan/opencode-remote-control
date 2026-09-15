@@ -4,7 +4,7 @@ import type { Request, Response } from 'express'
 import type { Store, Session } from '../store.js'
 import type { BridgeClient } from '../ws/bridge.js'
 import { setViewerCookie } from '../api/viewerCookie.js'
-import { bridgeReconnectWaitMs, config, promptTimeoutMs, sseHeartbeatMs, sseMaxBufferBytes, sseMaxExemptBytes, sseMaxParkedBytes, sseRetryMs } from '../config.js'
+import { bridgeReconnectWaitMs, config, promptTimeoutMs, proxyMaxBufferedBytes, sseHeartbeatMs, sseMaxBufferBytes, sseMaxExemptBytes, sseMaxParkedBytes, sseRetryMs } from '../config.js'
 
 /**
  * HTTP → WS → opencode proxy adapter, mounted at the server ROOT.
@@ -210,6 +210,17 @@ const LOST_ANSWER_ERRORS = new Set(['proxy timeout', 'bridge closed', 'bridge un
 const PROXY_BODY_LIMIT = '25mb'
 
 /**
+ * How often a buffered proxy response's drain is checked, and how many
+ * consecutive no-progress checks are tolerated before a stalled one is cut so it
+ * stops pinning the shared buffered-bytes budget (see sendBounded). Generous: a
+ * reader on a slow uplink makes progress every check and is never cut — only a
+ * socket that takes nothing at all is. ~10 s of dead silence, matching the way
+ * the SSE fan-out treats a stuck viewer.
+ */
+const PROXY_STALL_CHECK_MS = 5_000
+const PROXY_STALL_STRIKES = 2
+
+/**
  * Max concurrent SSE streams one session may hold open. Each stream costs a
  * bridge subscription plus a heartbeat timer and lives until the client hangs
  * up, so an authenticated viewer looping fetch('/event') could pin relay
@@ -332,6 +343,95 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     else res.status(502).json({ error: 'proxy failed' })
   }
 
+  /**
+   * Response-body bytes the proxy path is currently holding buffered for
+   * viewers that read slowly or not at all, summed across every in-flight proxy
+   * response (see sendBounded). The SSE fan-out already bounds its own parked
+   * bytes; this is the proxy path's equivalent, and the one process-wide number
+   * every proxied body is admitted against.
+   */
+  let proxyBufferedBytes = 0
+
+  /** libuv's not-yet-sent byte count for a response socket, like the SSE inFlight
+   * helper: it shrinks while one large write is only partly out, where
+   * writableLength (whole-write) does not. Read defensively. */
+  function socketInFlight(res: Response): number | undefined {
+    const handle = (res.socket as unknown as { _handle?: { writeQueueSize?: unknown } | null } | null)?._handle
+    return typeof handle?.writeQueueSize === 'number' ? handle.writeQueueSize : undefined
+  }
+
+  /**
+   * Send one proxied body under the process-wide buffered-bytes ceiling
+   * (proxyMaxBufferedBytes). A body that would push the total over the ceiling
+   * is refused with 503 rather than parked in the heap, so however many slow
+   * readers pile up the relay holds at most the ceiling plus one maxPayload
+   * instead of OOMing (the DoS this closes; see verify-1/dos.mjs). Once
+   * admitted, a response whose backlog stops draining is cut so a non-reading
+   * socket cannot hold its share of the budget for the life of its TCP
+   * connection and starve honest requests — the same no-progress test the SSE
+   * fan-out applies to a stuck viewer (a reading client, however slow, moves
+   * either the flushed count or libuv's in-flight queue between checks).
+   */
+  function sendBounded(res: Response, status: number, contentType: string | undefined, payload: string, nextCursor?: string): void {
+    const len = Buffer.byteLength(payload)
+    if (proxyBufferedBytes + len > proxyMaxBufferedBytes()) {
+      // Refuse rather than OOM. The web UI surfaces this as a failed request the
+      // viewer retries once the relay is no longer saturated.
+      res.status(503).json({ error: 'relay busy' })
+      return
+    }
+    proxyBufferedBytes += len
+    let released = false
+    let stall: NodeJS.Timeout | undefined
+    const release = () => {
+      if (released) return
+      released = true
+      proxyBufferedBytes -= len
+      if (stall) clearInterval(stall)
+    }
+    // A paged transcript names its older page only in this header; without it
+    // the web UI shows the newest page as the whole history and never offers to
+    // load more. Same-origin, so no Access-Control-Expose-Headers. Link is not
+    // forwarded (the bridge keeps it: it names the owner's local opencode URL
+    // and project directory).
+    if (nextCursor) res.set('X-Next-Cursor', nextCursor)
+    res
+      .status(status)
+      .type(contentType ?? 'application/json')
+      .send(payload)
+    res.once('finish', release)
+    res.once('close', release)
+    // A body flushed to the kernel synchronously (a fast reader) needs no
+    // watching — 'finish' fires almost at once and releases the budget. Only a
+    // backlog left in this process can pin it, so watch just those.
+    if (res.writableFinished) return
+    let lastRemaining = res.writableLength
+    let lastInFlight = socketInFlight(res)
+    let strikes = 0
+    stall = setInterval(() => {
+      if (released || res.writableFinished || res.destroyed) {
+        release()
+        return
+      }
+      const remaining = res.writableLength
+      const pending = socketInFlight(res)
+      const progressed =
+        remaining < lastRemaining ||
+        (pending !== undefined && lastInFlight !== undefined && pending < lastInFlight)
+      lastRemaining = remaining
+      lastInFlight = pending
+      if (progressed || remaining === 0) {
+        strikes = 0
+        return
+      }
+      // No byte moved since the previous check; a client that keeps reading
+      // would have. Cut it after a couple of these so the budget frees ('close'
+      // releases it) — the viewer's own reconnect fetches it again.
+      if (++strikes >= PROXY_STALL_STRIKES) res.destroy()
+    }, PROXY_STALL_CHECK_MS)
+    stall.unref?.()
+  }
+
   /** Forward one request through the session's bridge; never throws. */
   async function proxy(
     res: Response,
@@ -347,16 +447,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     try {
       const out = await bridge.request(session_id, { method, path, body }, timeout)
       const payload = transform ? transform(out.body, out.contentType) : out.body
-      // A paged transcript names its older page only in this header; without
-      // it the web UI shows the newest page as the whole history and never
-      // offers to load more. Same-origin, so no Access-Control-Expose-Headers.
-      // Link is not forwarded (the bridge keeps it: it names the owner's local
-      // opencode URL and project directory).
-      if (out.nextCursor) res.set('X-Next-Cursor', out.nextCursor)
-      res
-        .status(out.status)
-        .type(out.contentType ?? 'application/json')
-        .send(payload)
+      sendBounded(res, out.status, out.contentType, payload, out.nextCursor)
     } catch (err) {
       sendProxyError(res, err)
     }
@@ -1016,9 +1107,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     let exemptEnd = 0
     let exemptLength = 0
     // The unsent part of the last large frame — but never more than maxExempt.
-    // A single ws frame is bounded only by the bridge socket's maxPayload (ws
-    // default 100 MiB), so exempting all of it let a non-reading viewer hold
-    // that whole frame indefinitely. Capping the exemption means a frame bigger
+    // A single ws frame is bounded by the bridge socket's maxPayload
+    // (bridgeMaxPayloadBytes), which can still be several MiB, so exempting all
+    // of it let a non-reading viewer hold that whole frame indefinitely.
+    // Capping the exemption means a frame bigger
     // than maxExempt still leaves the excess counted, so the check below trips
     // on the next frame instead of pinning the whole thing against the cap.
     const unsentOfExempt = () =>

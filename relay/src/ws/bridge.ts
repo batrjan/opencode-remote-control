@@ -3,7 +3,7 @@ import type { Server } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { gunzip } from 'node:zlib'
 import type { Session, Store } from '../store.js'
-import { bridgeReconnectWaitMs, wsPingIntervalMs, wsPongGraceRounds } from '../config.js'
+import { bridgeMaxPayloadBytes, bridgeReconnectWaitMs, wsPingIntervalMs, wsPongGraceRounds } from '../config.js'
 
 /**
  * Relay-side hub for bridge WebSocket connections at /bridge.
@@ -36,8 +36,6 @@ import { bridgeReconnectWaitMs, wsPingIntervalMs, wsPongGraceRounds } from '../c
  * bounding what one byte on the wire can cost the relay.
  */
 export const GZIP_MAX_RATIO = 32
-/** Never inflate past what an uncompressed frame could carry (ws default maxPayload). */
-const GZIP_MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 /** Header JSON of a compressed frame is a few hundred bytes; anything larger is not ours. */
 const GZIP_MAX_HEADER_BYTES = 16 * 1024
 
@@ -132,6 +130,15 @@ export class BridgeClient {
     this.wss = new WebSocketServer({
       server,
       path: '/bridge',
+      // Cap the largest frame a bridge may send. Registration is public, so a
+      // "bridge" can be anyone: without this, ws accepts frames up to its
+      // 100 MiB default and a proxy_response (or event) body that large is
+      // buffered whole in the relay heap — the DoS a slow GET socket used to
+      // exhaust the relay with. An over-sized frame raises an 'error' on the
+      // socket, which the per-connection handler below confines to that socket
+      // (terminate + fail its pending requests), never the whole process. See
+      // bridgeMaxPayloadBytes for the sizing.
+      maxPayload: bridgeMaxPayloadBytes(),
       // Reject bad credentials during the upgrade (HTTP 401) so no socket
       // is ever established; the store lookup is synchronous.
       verifyClient: (info, done) => {
@@ -656,7 +663,10 @@ export class BridgeClient {
     this.pending.delete(header.request_id)
     clearTimeout(pending.timer)
     const compressed = raw.subarray(4 + headerLength)
-    const maxOutputLength = Math.min(compressed.length * GZIP_MAX_RATIO, GZIP_MAX_OUTPUT_BYTES)
+    // Never inflate past what an uncompressed frame could carry (maxPayload),
+    // nor past GZIP_MAX_RATIO times the compressed size — so a decompression
+    // bomb costs at most that and then fails only its own request.
+    const maxOutputLength = Math.min(compressed.length * GZIP_MAX_RATIO, bridgeMaxPayloadBytes())
     try {
       const body = await new Promise<Buffer>((resolve, reject) =>
         gunzip(compressed, { maxOutputLength }, (err, out) => (err ? reject(err) : resolve(out))),

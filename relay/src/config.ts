@@ -249,8 +249,8 @@ export function sseMaxBufferBytes(): number {
  *
  * The cap exempts a single large frame so a pasted image or big diff reaches a
  * viewer that keeps reading. Left unbounded, that exemption is only as small
- * as one ws frame — and the relay's bridge socket sets no maxPayload, so ws
- * lets through up to its 100 MiB default. A viewer that took one such frame
+ * as one ws frame — and one ws frame is bounded by the bridge socket's
+ * maxPayload (bridgeMaxPayloadBytes). A viewer that took one such frame
  * and then read nothing kept the whole thing buffered: only heartbeats were
  * counted against the cap and they never reach it. Bounding the exemption
  * means a frame larger than this trips the ordinary per-write check on the
@@ -278,6 +278,49 @@ export function sseMaxExemptBytes(): number {
  */
 export function sseMaxParkedBytes(): number {
   return envInt('RELAY_SSE_MAX_PARKED_BYTES', 128 * 1024 * 1024)
+}
+
+/**
+ * The largest single frame the relay accepts from a bridge — set as the bridge
+ * WebSocketServer's maxPayload (relay/src/ws/bridge.ts) and mirrored as the
+ * gunzip output ceiling (a compressed body is never inflated past what an
+ * uncompressed frame could carry).
+ *
+ * Registration is public, so a "bridge" can be anyone. Without a maxPayload, ws
+ * accepts frames up to its 100 MiB default, and a proxy_response body that large
+ * is buffered whole in the relay heap on its way to a viewer — the DoS a slow or
+ * non-reading GET socket used to exhaust the relay with (see the security run's
+ * verify-1/dos.mjs). Capping the frame bounds what one response, or one gunzip,
+ * can cost.
+ *
+ * Sized above the largest LEGITIMATE frame — a live event carrying a pasted
+ * image as a data URL, which the SSE fan-out exempts up to sseMaxExemptBytes and
+ * the tests exercise at 12 MiB — and below the tens-of-MiB bodies the DoS relied
+ * on. Env-tunable for an install that pastes larger media; the aggregate proxy
+ * ceiling (proxyMaxBufferedBytes) is what bounds memory when many honest
+ * multi-MiB responses are in flight at once.
+ */
+export function bridgeMaxPayloadBytes(): number {
+  return envInt('RELAY_BRIDGE_MAX_PAYLOAD_BYTES', 16 * 1024 * 1024)
+}
+
+/**
+ * Process-wide ceiling on response-body bytes the proxy path holds buffered for
+ * viewers that read slowly or not at all, summed across every in-flight proxy
+ * response (see the proxy adapter's sendBounded).
+ *
+ * Unlike the SSE fan-out — which bounds its own parked bytes (sseMaxParkedBytes)
+ * — the proxy path used to buffer a full response body with no cumulative bound:
+ * a public registrant whose own bridge returned multi-MiB bodies to non-reading
+ * GET sockets grew the heap by the full body per socket until the relay OOM'd,
+ * taking down every share. maxPayload bounds ONE response; this bounds the SUM
+ * in flight. A body that would push the total over the ceiling is answered 503
+ * rather than buffered, so memory stays at about this plus one maxPayload
+ * however many slow readers pile up. Generous enough for several honest
+ * multi-MiB transcripts at once; env-tunable.
+ */
+export function proxyMaxBufferedBytes(): number {
+  return envInt('RELAY_PROXY_MAX_BUFFERED_BYTES', 64 * 1024 * 1024)
 }
 
 /**
