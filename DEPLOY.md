@@ -222,6 +222,23 @@ before writing (the safe fallback: a redeploy then invalidates an unused code).
 The rate-limit counters are never persisted. Leaving `RELAY_STATE_FILE` empty
 restores the old in-memory-only behaviour.
 
+Switching a relay that has been running without a key TO one is only safe with
+no live shares. A keyed relay cannot tell a pre-encryption leftover from a file
+forged by someone who can write the volume but does not know the key, so it
+treats every plaintext file as a forgery, sets it aside and starts empty:
+
+```
+[persist] ignoring /data/state.json: plaintext state file but RELAY_STATE_KEY is set …
+```
+
+Every live share ends at once, exactly as it would on a changed key (below).
+Either wait for a window with no active shares, or convert the file first: read
+the plaintext and write it back as an AES-256-GCM envelope under the new key.
+The recovery below does not apply to this case — the file set aside is
+plaintext, so a keyed relay only sets it aside again; it can be restored only
+with `RELAY_STATE_KEY` removed. Going the other way, taking the key away from a
+relay that has one, is just as destructive and always has been.
+
 Shares survive a redeploy only while `RELAY_STATE_KEY` stays the same. Rotating
 the key (e.g. after exposure) ENDS EVERY LIVE SHARE, and so does a relay started
 with a different key or none by mistake (a lost or hand-edited `.env`, a new
