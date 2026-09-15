@@ -13,9 +13,11 @@ import { RelayWSClient } from '../../bridge/src/relay'
  * The viewer cookie is SameSite=Strict, but that was the ONLY CSRF defence: a
  * same-site page could still drive a simple cross-origin POST (abort/summarize/
  * unrevert) with the ambient cookie. So a state-changing proxy POST that
- * carries an Origin header must have it equal the relay's own origin, else 403
- * — while a request with NO Origin (a non-browser client, a same-origin GET)
- * still works. And an OPTIONS must no longer be auto-answered by express with
+ * carries an Origin header must have it name the relay's own host, else 403 —
+ * while a request with NO Origin (a non-browser client, a same-origin GET)
+ * still works. The scheme is deliberately not compared: behind someone else's
+ * TLS terminator the relay cannot know it, and guessing it refused every POST
+ * on deployments without X-Forwarded-Proto. And an OPTIONS must no longer be auto-answered by express with
  * an `Allow:` header that hands an unauthenticated client the route table.
  *
  * Real relay + real bridge client + mock opencode.
@@ -94,6 +96,51 @@ test('a state-changing POST carrying the relay origin is accepted', async () => 
     .set('Origin', relayUrl)
     .send({})
   expect(res.status).toBe(200)
+})
+
+test('behind a TLS-terminating proxy the https Origin is accepted without X-Forwarded-Proto', async () => {
+  // nginx does not set X-Forwarded-Proto unless told to, and a gateway outside
+  // `trust proxy` has its XFP ignored anyway — so the relay sees req.protocol
+  // 'http' while the browser sends https. Matching on the authority alone is
+  // what keeps such a deployment working.
+  const res = await request(relay)
+    .post(`/session/${SES}/abort`)
+    .set('Cookie', viewerCookie)
+    .set('Host', 'relay.example')
+    .set('Origin', 'https://relay.example')
+    .send({})
+  expect(res.status).toBe(200)
+})
+
+test('a forwarded Host carrying the default port still matches the browser Origin', async () => {
+  // A browser never writes :443 into Origin; a proxy may well forward it.
+  const res = await request(relay)
+    .post(`/session/${SES}/abort`)
+    .set('Cookie', viewerCookie)
+    .set('Host', 'relay.example:443')
+    .set('Origin', 'https://relay.example')
+    .send({})
+  expect(res.status).toBe(200)
+})
+
+test('a foreign Origin is still refused when the Host is the public one', async () => {
+  const res = await request(relay)
+    .post(`/session/${SES}/abort`)
+    .set('Cookie', viewerCookie)
+    .set('Host', 'relay.example')
+    .set('Origin', 'https://evil.example')
+    .send({})
+  expect(res.status).toBe(403)
+})
+
+test('an opaque Origin ("null", from a sandboxed iframe) is refused', async () => {
+  const res = await request(relay)
+    .post(`/session/${SES}/abort`)
+    .set('Cookie', viewerCookie)
+    .set('Host', 'relay.example')
+    .set('Origin', 'null')
+    .send({})
+  expect(res.status).toBe(403)
 })
 
 test('a state-changing POST with no Origin (non-browser client) is accepted', async () => {

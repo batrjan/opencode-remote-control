@@ -147,6 +147,15 @@ The deploy workflow also copies `relay/docker-compose.yml` to
 `/opt/opencode-remote-control/` on every run, so the host compose file can
 no longer drift from the repository.
 
+This setting does **not** affect the CSRF guard on state-changing proxy POSTs.
+That guard compares the Origin's host with the `Host` header and ignores the
+scheme, so `X-Forwarded-Proto` is not required for it and a proxy that
+forwards `Host: relay.example:443` is fine. If a share's GETs work but sending
+a prompt, aborting or answering a permission returns 403, the relay logs one
+`[proxy] cross-origin POST refused` line naming both the Origin and the `Host`
+it was compared against — usually a proxy rewriting `Host` to something the
+browser never saw.
+
 ## Session cap (`RELAY_MAX_SESSIONS`)
 
 The relay holds at most `RELAY_MAX_SESSIONS` shares at once, 2,000 by default,

@@ -382,19 +382,68 @@ function setProxyGuardHeaders(res: Response): void {
  * Origin is NOT required: a browser omits it on same-origin GET-like requests
  * and a non-browser client (curl, the skill's own tooling) never sends one, and
  * both are legitimate — the absence of an Origin is not a cross-site signal.
- * The relay's own origin is reconstructed from the request the same way the
- * browser computes Origin: the forwarded scheme (req.protocol honours
- * X-Forwarded-Proto under the configured `trust proxy`) and the Host header,
- * which behind nginx is the public host:port a same-origin page was served
- * from. A browser normalises Origin (lowercased scheme+host, no default port,
- * no trailing slash); Host matches it for the deployments the relay runs on.
+ *
+ * What is compared is the AUTHORITY (host:port) only, never the scheme. The
+ * first cut reconstructed `${req.protocol}://${host}`, and req.protocol is a
+ * guess the relay cannot make behind someone else's proxy: it reads https only
+ * when the TLS hop both sets X-Forwarded-Proto (nginx does NOT by default —
+ * it needs an explicit proxy_set_header) and falls inside `trust proxy`
+ * (default 'loopback', so a gateway in a neighbouring container never does).
+ * Either miss left req.protocol 'http' against a browser Origin of
+ * https://… and refused EVERY state-changing POST — prompt, abort, permission
+ * answers — while GET and SSE kept working, with nothing in the log. The
+ * scheme adds nothing here anyway: a same-host attacker on the other scheme is
+ * not a threat this guard can close, and the viewer cookie is secure:true, so
+ * the page is on https regardless of what the relay can see.
+ *
+ * Both authorities are normalised the way a browser writes Origin — lowercased
+ * and without the default port — because a proxy that forwards `Host:
+ * relay.example:443` is talking to a browser that wrote `https://relay.example`.
  */
+function normalizeAuthority(value: string): string {
+  const lower = value.trim().toLowerCase()
+  return lower.endsWith(':80') || lower.endsWith(':443') ? lower.slice(0, lower.lastIndexOf(':')) : lower
+}
+
 function originAllowed(req: Request): boolean {
   const origin = req.get('origin')
   if (!origin) return true
   const host = req.get('host')
-  if (!host) return false
-  return origin === `${req.protocol}://${host}`
+  if (!host) return warnCrossOrigin(origin, '')
+  let url: URL
+  try {
+    url = new URL(origin)
+  } catch {
+    // An opaque origin ("null", from a sandboxed iframe) or junk: not ours.
+    return warnCrossOrigin(origin, host)
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return warnCrossOrigin(origin, host)
+  if (normalizeAuthority(url.host) === normalizeAuthority(host)) return true
+  return warnCrossOrigin(origin, host)
+}
+
+const MAX_CROSS_ORIGIN_WARNINGS = 32
+const crossOriginWarned = new Set<string>()
+
+/**
+ * Report a refused POST once per (origin, host) pair; always returns false, so
+ * originAllowed can `return warnCrossOrigin(...)` on every refusing path.
+ *
+ * Silence is what made the scheme bug above so expensive to diagnose: the
+ * owner saw sending, abort and permission answers stop while GET and SSE were
+ * fine, and the relay logged nothing at all. One line names both sides, which
+ * is the whole diagnosis. Budgeted and deduplicated like the bridge's
+ * cross-session warning: the Origin is attacker-chosen, so a loop of forged
+ * POSTs must not be able to write into the log at socket speed, and the values
+ * are JSON-escaped so they cannot inject newlines into the stream operators
+ * grep.
+ */
+function warnCrossOrigin(origin: string, host: string): false {
+  const key = `${origin} ${host}`
+  if (crossOriginWarned.has(key) || crossOriginWarned.size >= MAX_CROSS_ORIGIN_WARNINGS) return false
+  crossOriginWarned.add(key)
+  console.warn(`[proxy] cross-origin POST refused: origin=${JSON.stringify(origin)} host=${JSON.stringify(host)}`)
+  return false
 }
 
 export function proxyAdapter(store: Store, bridge: BridgeClient) {
