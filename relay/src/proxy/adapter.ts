@@ -566,7 +566,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       // Recorded, because a refusal is the only honest signal that this share's
       // parked responses are costing it something: "held >= slice" is not it --
       // a share sits under its slice and still cannot fit the NEXT body.
-      refusedAt.set(session_id, Date.now())
+      // Only while this share holds something: a share refused by the PROCESS
+      // ceiling parks nothing of its own, so there is nothing of its to cut --
+      // and the mark would have no release() to drop it again.
+      if (held > 0) refusedAt.set(session_id, Date.now())
       res.status(503).json({ error: 'relay busy' })
       return
     }
