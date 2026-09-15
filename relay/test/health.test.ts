@@ -47,7 +47,7 @@ test('GET /health reflects the live session count', async () => {
   const created = await request(server)
     .post('/api/sessions')
     .set('x-api-key', API_KEY)
-    .send({ session_id: 'health-sess', directory: '/path', title: 'title' })
+    .send({ session_id: 'ses_health', directory: '/path', title: 'title' })
   expect(created.status).toBe(201)
   const res = await request(server).get('/health')
   expect(res.status).toBe(200)

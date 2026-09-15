@@ -35,7 +35,7 @@ function json(res: http.ServerResponse, status: number, body: unknown) {
 beforeAll(async () => {
   opencode = createServer((req, res) => {
     const url = new URL(req.url ?? '', 'http://localhost')
-    if (req.method === 'POST' && url.pathname === '/session/sess1/message') {
+    if (req.method === 'POST' && url.pathname === '/session/ses_sess1/message') {
       let raw = ''
       req.on('data', (chunk) => (raw += chunk))
       req.on('end', () => {
@@ -57,11 +57,11 @@ beforeAll(async () => {
 
   const created = await request(relay)
     .post('/api/sessions')
-    .send({ session_id: 'sess1', directory: '/path', title: 'title' })
+    .send({ session_id: 'ses_sess1', directory: '/path', title: 'title' })
   expect(created.status).toBe(201)
   const activated = await request(relay)
     .post('/api/activate')
-    .send({ code: created.body.access_code, session_id: 'sess1' })
+    .send({ code: created.body.access_code, session_id: 'ses_sess1' })
   expect(activated.status).toBe(200)
   viewerToken = viewerTokenFrom(activated)
 
@@ -69,7 +69,7 @@ beforeAll(async () => {
     relayUrl,
     new OpencodeClient(`http://127.0.0.1:${opencodePort}`, 'opencode', 'password'),
   )
-  await bridge.connect('sess1', created.body.bridge_token)
+  await bridge.connect('ses_sess1', created.body.bridge_token)
 })
 
 afterAll(async () => {
@@ -99,7 +99,7 @@ test('an oversized POST to the public /api/sessions is rejected with a JSON 413'
 test('an oversized POST to the public /api/activate is rejected with a JSON 413', async () => {
   const res = await request(relay)
     .post('/api/activate')
-    .send({ code: 'A'.repeat(40_000), session_id: 'sess1' })
+    .send({ code: 'A'.repeat(40_000), session_id: 'ses_sess1' })
   expect(res.status).toBe(413)
   expect(res.body).toEqual({ error: 'payload too large' })
 })
@@ -112,7 +112,7 @@ test('an oversized POST to the public /api/activate is rejected with a JSON 413'
 test('a ~200 KB authenticated proxy POST is forwarded, not rejected', async () => {
   const text = 'x'.repeat(200_000)
   const res = await request(relay)
-    .post('/session/sess1/message')
+    .post('/session/ses_sess1/message')
     .set('x-viewer-token', viewerToken)
     .send({ parts: [{ type: 'text', text }] })
   expect(res.status).toBe(200)
@@ -126,7 +126,7 @@ test('a ~200 KB authenticated proxy POST is forwarded, not rejected', async () =
  */
 test('an unauthenticated large POST on a proxy path is refused, not buffered', async () => {
   const res = await request(relay)
-    .post('/session/sess1/message')
+    .post('/session/ses_sess1/message')
     .send({ parts: [{ type: 'text', text: 'x'.repeat(200_000) }] })
   expect(res.status).toBe(401)
   expect(res.body).toEqual({ error: 'invalid viewer token' })

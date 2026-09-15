@@ -60,7 +60,7 @@ async function silentBridge(session_id: string) {
 const settle = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 test('a bridge that keeps sending is not dropped for late pongs', async () => {
-  const { ws, isClosed } = await silentBridge('sess-busy-msgs')
+  const { ws, isClosed } = await silentBridge('ses_busy_msgs')
   const t = setInterval(() => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'event', data: '{}' })), 20)
   try {
     await settle(60 * 10) // ten ping rounds against a grace of one
@@ -75,7 +75,7 @@ test('bytes of a frame still in transit count, before the frame is complete', as
   // One large frame dribbling in over a slow link: no message event can fire
   // until the last byte, and no pong can overtake it — only raw bytes show
   // the bridge is there. Built by hand so it can be sent slowly.
-  const { ws, isClosed } = await silentBridge('sess-busy-frame')
+  const { ws, isClosed } = await silentBridge('ses_busy_frame')
   const raw = (ws as unknown as { _socket: Socket })._socket
   const payload = Buffer.from(JSON.stringify({ type: 'event', data: 'x'.repeat(4000) }))
   const header = Buffer.alloc(2 + 2 + 4) // FIN|text, MASK|126, 16-bit length, zero mask key
@@ -96,7 +96,7 @@ test('bytes of a frame still in transit count, before the frame is complete', as
 }, 10_000)
 
 test('a bridge that goes quiet is still dropped', async () => {
-  const { isClosed, ws } = await silentBridge('sess-quiet')
+  const { isClosed, ws } = await silentBridge('ses_quiet')
   try {
     const deadline = Date.now() + 3000
     while (!isClosed() && Date.now() < deadline) await settle(20)

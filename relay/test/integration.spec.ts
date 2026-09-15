@@ -63,11 +63,11 @@ async function readSseUntil(res: globalThis.Response, marker: string, deadlineMs
 beforeAll(async () => {
   opencode = createServer((req, res) => {
     const url = new URL(req.url ?? '', 'http://localhost')
-    if (req.method === 'GET' && url.pathname === '/session/sess1/message') {
+    if (req.method === 'GET' && url.pathname === '/session/ses_sess1/message') {
       lastMessagePath = url.pathname + url.search
       return json(res, 200, [{ id: 'm1', role: 'user' }])
     }
-    if (req.method === 'POST' && url.pathname === '/session/sess1/prompt_async') {
+    if (req.method === 'POST' && url.pathname === '/session/ses_sess1/prompt_async') {
       let raw = ''
       req.on('data', (chunk) => (raw += chunk))
       req.on('end', () => {
@@ -101,11 +101,11 @@ beforeAll(async () => {
   const created = await request(relay)
     .post('/api/sessions')
     .set('x-api-key', API_KEY)
-    .send({ session_id: 'sess1', directory: '/path', title: 'integration' })
+    .send({ session_id: 'ses_sess1', directory: '/path', title: 'integration' })
   expect(created.status).toBe(201)
   bridgeToken = created.body.bridge_token
 
-  const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'sess1' })
+  const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'ses_sess1' })
   expect(activated.status).toBe(200)
   viewerToken = viewerTokenFrom(activated)
   const setCookie = activated.headers['set-cookie'] as unknown as string[]
@@ -115,7 +115,7 @@ beforeAll(async () => {
     relayUrl,
     new OpencodeClient(`http://127.0.0.1:${opencodePort}`, 'opencode', 'password'),
   )
-  await bridge.connect('sess1', created.body.bridge_token)
+  await bridge.connect('ses_sess1', created.body.bridge_token)
   await bridge.startEventForwarding()
 })
 
@@ -129,16 +129,16 @@ afterAll(async () => {
 
 test('proxy GET /session/:id/message authenticates with the HttpOnly viewer cookie', async () => {
   const res = await request(relay)
-    .get('/session/sess1/message')
+    .get('/session/ses_sess1/message')
     .set('Cookie', viewerCookie)
   expect(res.status).toBe(200)
   expect(res.body).toEqual([{ id: 'm1', role: 'user' }])
-  expect(lastMessagePath).toMatch(/^\/session\/sess1\/message\?directory=/)
+  expect(lastMessagePath).toMatch(/^\/session\/ses_sess1\/message\?directory=/)
 })
 
 test('proxy GET /session/:id/message also accepts the x-viewer-token header', async () => {
   const res = await request(relay)
-    .get('/session/sess1/message')
+    .get('/session/ses_sess1/message')
     .set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
   expect(res.body).toEqual([{ id: 'm1', role: 'user' }])
@@ -147,7 +147,7 @@ test('proxy GET /session/:id/message also accepts the x-viewer-token header', as
 test('proxy POST prompt_async delivers the JSON body to opencode', async () => {
   const prompt = { parts: [{ type: 'text', text: 'hello from the viewer' }] }
   const res = await request(relay)
-    .post('/session/sess1/prompt_async')
+    .post('/session/ses_sess1/prompt_async')
     .set('Cookie', viewerCookie)
     .send(prompt)
   expect(res.status).toBe(200)
@@ -159,7 +159,7 @@ test('proxy forcibly binds the session id from the viewer token', async () => {
     .get('/session/someone-else/message')
     .set('Cookie', viewerCookie)
   expect(res.status).toBe(200)
-  expect(lastMessagePath).toMatch(/^\/session\/sess1\/message\?directory=/)
+  expect(lastMessagePath).toMatch(/^\/session\/ses_sess1\/message\?directory=/)
 })
 
 test(
@@ -225,10 +225,10 @@ test('DELETE /api/sessions/:id disconnects the session bridge', async () => {
 })
 
 test('stop: after session delete the viewer cookie no longer authorizes proxying', async () => {
-  const del = await request(relay).delete('/api/sessions/sess1').set('x-bridge-token', bridgeToken)
+  const del = await request(relay).delete('/api/sessions/ses_sess1').set('x-bridge-token', bridgeToken)
   expect(del.status).toBe(204)
   const res = await request(relay)
-    .get('/session/sess1/message')
+    .get('/session/ses_sess1/message')
     .set('Cookie', viewerCookie)
   expect(res.status).toBe(401)
 })

@@ -38,19 +38,19 @@ beforeAll(async () => {
   opencode = createServer((req, res) => {
     const url = new URL(req.url ?? '', 'http://localhost')
     lastPath = url.pathname
-    if (req.method === 'GET' && url.pathname === '/session/sess1/message') {
+    if (req.method === 'GET' && url.pathname === '/session/ses_sess1/message') {
       return json(res, 200, [{ id: 'm1', limit: url.searchParams.get('limit') }])
     }
-    if (req.method === 'GET' && url.pathname === '/session/sess1/children') {
-      return json(res, 200, [{ id: 'ses_child1', parentID: 'sess1', title: 'subagent' }])
+    if (req.method === 'GET' && url.pathname === '/session/ses_sess1/children') {
+      return json(res, 200, [{ id: 'ses_child1', parentID: 'ses_sess1', title: 'subagent' }])
     }
     if (req.method === 'GET' && url.pathname === '/session/ses_child1/message') {
       return json(res, 200, [{ id: 'child-m1' }])
     }
     // Session-detail replies drive the ancestry walk (readableSessionId).
-    // ses_grand1 descends from sess1 via ses_child1; ses_stranger does not.
+    // ses_grand1 descends from ses_sess1 via ses_child1; ses_stranger does not.
     if (req.method === 'GET' && url.pathname === '/session/ses_child1') {
-      return json(res, 200, { id: 'ses_child1', parentID: 'sess1', title: 'subagent' })
+      return json(res, 200, { id: 'ses_child1', parentID: 'ses_sess1', title: 'subagent' })
     }
     if (req.method === 'GET' && url.pathname === '/session/ses_grand1') {
       return json(res, 200, { id: 'ses_grand1', parentID: 'ses_child1', title: 'nested subagent' })
@@ -92,19 +92,19 @@ beforeAll(async () => {
     if (req.method === 'POST' && /^\/session\/[^/]+\/fork$/.test(url.pathname)) {
       return json(res, 200, { id: 'ses_fork1', title: 'title (fork #1)', directory: '/path' })
     }
-    if (req.method === 'GET' && url.pathname === '/session/sess1/todo') {
+    if (req.method === 'GET' && url.pathname === '/session/ses_sess1/todo') {
       return json(res, 200, [{ id: 'todo1' }])
     }
     if (req.method === 'GET' && url.pathname === '/session/status') {
-      return json(res, 200, { sess1: 'idle-status', other: 'hidden' })
+      return json(res, 200, { ses_sess1: 'idle-status', other: 'hidden' })
     }
     if (req.method === 'GET' && url.pathname === '/permission') {
       return json(res, 200, [
-        { id: 'perm1', sessionID: 'sess1', permission: 'bash' },
+        { id: 'perm1', sessionID: 'ses_sess1', permission: 'bash' },
         { id: 'perm-other', sessionID: 'sess-other', permission: 'bash' },
       ])
     }
-    if (req.method === 'POST' && /^\/session\/sess1\/permissions\//.test(url.pathname)) {
+    if (req.method === 'POST' && /^\/session\/ses_sess1\/permissions\//.test(url.pathname)) {
       return json(res, 200, { ok: true, permissionID: url.pathname.split('/').pop() })
     }
     if (req.method === 'GET' && url.pathname === '/agent') return json(res, 200, [{ id: 'build' }])
@@ -121,7 +121,7 @@ beforeAll(async () => {
       res.writeHead(200, { 'Content-Type': 'image/svg+xml' })
       return res.end('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
     }
-    if (req.method === 'POST' && url.pathname === '/session/sess1/prompt_async') {
+    if (req.method === 'POST' && url.pathname === '/session/ses_sess1/prompt_async') {
       let raw = ''
       req.on('data', (chunk) => (raw += chunk))
       req.on('end', () => {
@@ -142,25 +142,25 @@ beforeAll(async () => {
   const created = await request(relay)
     .post('/api/sessions')
     .set('x-api-key', API_KEY)
-    .send({ session_id: 'sess1', directory: '/path', title: 'title' })
+    .send({ session_id: 'ses_sess1', directory: '/path', title: 'title' })
   expect(created.status).toBe(201)
-  const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'sess1' })
+  const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'ses_sess1' })
   expect(activated.status).toBe(200)
   viewerToken = viewerTokenFrom(activated)
 
-  // sess2 gets a viewer token but no bridge connection (for the 502 case).
+  // ses_sess2 gets a viewer token but no bridge connection (for the 502 case).
   const created2 = await request(relay)
     .post('/api/sessions')
     .set('x-api-key', API_KEY)
-    .send({ session_id: 'sess2', directory: '/path', title: 'title' })
-  const activated2 = await request(relay).post('/api/activate').send({ code: created2.body.access_code, session_id: 'sess2' })
+    .send({ session_id: 'ses_sess2', directory: '/path', title: 'title' })
+  const activated2 = await request(relay).post('/api/activate').send({ code: created2.body.access_code, session_id: 'ses_sess2' })
   sess2ViewerToken = viewerTokenFrom(activated2)
 
   bridge = new RelayWSClient(
     relayUrl,
     new OpencodeClient(`http://127.0.0.1:${opencodePort}`, 'opencode', 'password'),
   )
-  await bridge.connect('sess1', created.body.bridge_token)
+  await bridge.connect('ses_sess1', created.body.bridge_token)
 })
 
 afterAll(async () => {
@@ -223,20 +223,20 @@ test('a filtered proxied response also carries the guard headers', async () => {
 })
 
 test('proxy GET /session/:id/message', async () => {
-  const res = await request(relay).get(`/session/sess1/message`).set('x-viewer-token', viewerToken)
+  const res = await request(relay).get(`/session/ses_sess1/message`).set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
   expect(res.body).toEqual([{ id: 'm1', limit: null }])
 })
 
 test('proxy forwards the limit query param', async () => {
-  const res = await request(relay).get(`/session/sess1/message?limit=5`).set('x-viewer-token', viewerToken)
+  const res = await request(relay).get(`/session/ses_sess1/message?limit=5`).set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
   expect(res.body).toEqual([{ id: 'm1', limit: '5' }])
 })
 
 test('proxy POST prompt_async forwards the JSON body', async () => {
   const res = await request(relay)
-    .post('/session/sess1/prompt_async')
+    .post('/session/ses_sess1/prompt_async')
     .set('x-viewer-token', viewerToken)
     .send({ parts: [{ type: 'text', text: 'hello' }] })
   expect(res.status).toBe(200)
@@ -245,7 +245,7 @@ test('proxy POST prompt_async forwards the JSON body', async () => {
 
 test('proxy allowlisted GET endpoints (todo, agent, config)', async () => {
   for (const [path, expected] of [
-    ['/session/sess1/todo', [{ id: 'todo1' }]],
+    ['/session/ses_sess1/todo', [{ id: 'todo1' }]],
     ['/agent', [{ id: 'build' }]],
     ['/config', { model: 'test' }],
   ] as const) {
@@ -258,17 +258,17 @@ test('proxy allowlisted GET endpoints (todo, agent, config)', async () => {
 test('proxy GET /session/status is filtered to the viewer session only', async () => {
   const res = await request(relay).get('/session/status').set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
-  expect(res.body).toEqual({ sess1: 'idle-status' })
+  expect(res.body).toEqual({ ses_sess1: 'idle-status' })
 })
 
 test('proxy rejects requests without a viewer token', async () => {
-  const res = await request(relay).get('/session/sess1/message')
+  const res = await request(relay).get('/session/ses_sess1/message')
   expect(res.status).toBe(401)
   expect(res.body.error).toBeTruthy()
 })
 
 test('proxy rejects an invalid viewer token', async () => {
-  const res = await request(relay).get('/session/sess1/message').set('x-viewer-token', 'wrong')
+  const res = await request(relay).get('/session/ses_sess1/message').set('x-viewer-token', 'wrong')
   expect(res.status).toBe(401)
   expect(res.body.error).toBeTruthy()
 })
@@ -277,11 +277,11 @@ test('proxy forcibly substitutes the session id from the viewer token', async ()
   const res = await request(relay).get(`/session/evil/message`).set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
   // The bridge must have been asked for the viewer's own session, not "evil".
-  expect(lastPath).toBe('/session/sess1/message')
+  expect(lastPath).toBe('/session/ses_sess1/message')
 })
 
 test('proxy returns 502 when no bridge is connected for the session', async () => {
-  const res = await request(relay).get(`/session/sess2/message`).set('x-viewer-token', sess2ViewerToken)
+  const res = await request(relay).get(`/session/ses_sess2/message`).set('x-viewer-token', sess2ViewerToken)
   expect(res.status).toBe(502)
   expect(res.body.error).toBeTruthy()
 })
@@ -291,7 +291,7 @@ test('bridge WS connection with a bad bridge token is rejected', async () => {
     relayUrl,
     new OpencodeClient('http://127.0.0.1:1', 'opencode', 'password'),
   )
-  await expect(bad.connect('sess1', 'wrong-token')).rejects.toThrow()
+  await expect(bad.connect('ses_sess1', 'wrong-token')).rejects.toThrow()
 })
 
 
@@ -303,7 +303,7 @@ test('bridge WS connection with a bad bridge token is rejected', async () => {
  */
 test('viewer can answer a permission request of its own session', async () => {
   const res = await request(relay)
-    .post('/session/sess1/permissions/perm1')
+    .post('/session/ses_sess1/permissions/perm1')
     .set('x-viewer-token', viewerToken)
     .send({ response: 'once' })
   expect(res.status).toBe(200)
@@ -312,7 +312,7 @@ test('viewer can answer a permission request of its own session', async () => {
 
 test('viewer cannot answer a permission request raised by another session', async () => {
   const res = await request(relay)
-    .post('/session/sess1/permissions/perm-other')
+    .post('/session/ses_sess1/permissions/perm-other')
     .set('x-viewer-token', viewerToken)
     .send({ response: 'once' })
   expect(res.status).toBe(403)
@@ -352,7 +352,7 @@ test('a session that is NOT a child still collapses to the viewer session', asyn
   const res = await request(relay).get('/session/ses_stranger/message').set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
   expect(res.body).toEqual([{ id: 'm1', limit: null }])
-  expect(lastPath).toBe('/session/sess1/message')
+  expect(lastPath).toBe('/session/ses_sess1/message')
 })
 
 test('child reads do not widen the write surface', async () => {
@@ -362,7 +362,7 @@ test('child reads do not widen the write surface', async () => {
     .set('x-viewer-token', viewerToken)
     .send({ parts: [] })
   expect(res.status).toBe(200)
-  expect(lastPath).toBe('/session/sess1/prompt_async')
+  expect(lastPath).toBe('/session/ses_sess1/prompt_async')
 })
 
 /**
@@ -396,56 +396,56 @@ test('filterProjects keeps only the most specific containing project', () => {
 })
 
 /**
- * Cross-user isolation: viewer A holds ONLY sess1's token. Every attempt to
- * name sess2 in a path, query or body must be rewritten back to sess1 — one
+ * Cross-user isolation: viewer A holds ONLY ses_sess1's token. Every attempt to
+ * name ses_sess2 in a path, query or body must be rewritten back to ses_sess1 — one
  * user can never read another user's session, whatever id they supply.
  */
-test('viewer A naming session sess2 still only ever reads sess1', async () => {
+test('viewer A naming session ses_sess2 still only ever reads ses_sess1', async () => {
   for (const attempt of [
-    '/session/sess2',
-    '/session/sess2/message',
-    '/session/sess2/children',
-    '/session/sess1/message?id=sess2',
-    '/session/sess1/message?sessionID=sess2',
-    '/session/sess2%2F..%2Fsess1/message',
+    '/session/ses_sess2',
+    '/session/ses_sess2/message',
+    '/session/ses_sess2/children',
+    '/session/ses_sess1/message?id=ses_sess2',
+    '/session/ses_sess1/message?sessionID=ses_sess2',
+    '/session/ses_sess2%2F..%2Fses_sess1/message',
   ]) {
     lastPath = ''
     const res = await request(relay).get(attempt).set('x-viewer-token', viewerToken)
-    // Never a 5xx, never sess2's upstream path.
+    // Never a 5xx, never ses_sess2's upstream path.
     expect(res.status).toBeLessThan(500)
-    expect(lastPath).not.toContain('sess2')
+    expect(lastPath).not.toContain('ses_sess2')
   }
-  // The session-detail route forwards sess1 upstream, never sess2 (the mock
+  // The session-detail route forwards ses_sess1 upstream, never ses_sess2 (the mock
   // does not implement the bare detail route, so only the rewrite is asserted).
   lastPath = ''
-  await request(relay).get('/session/sess2').set('x-viewer-token', viewerToken)
-  expect(lastPath).toBe('/session/sess1')
+  await request(relay).get('/session/ses_sess2').set('x-viewer-token', viewerToken)
+  expect(lastPath).toBe('/session/ses_sess1')
 })
 
-test("viewer A's /session/sess2/children returns sess1's children, never sess2's", async () => {
+test("viewer A's /session/ses_sess2/children returns ses_sess1's children, never ses_sess2's", async () => {
   lastPath = ''
-  const res = await request(relay).get('/session/sess2/children').set('x-viewer-token', viewerToken)
+  const res = await request(relay).get('/session/ses_sess2/children').set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
-  expect(lastPath).toBe('/session/sess1/children')
-  // The child resolver may have probed children too, but the served path is sess1's.
+  expect(lastPath).toBe('/session/ses_sess1/children')
+  // The child resolver may have probed children too, but the served path is ses_sess1's.
   for (const child of res.body as Array<{ parentID?: string }>) {
-    expect(child.parentID === undefined || child.parentID === 'sess1').toBe(true)
+    expect(child.parentID === undefined || child.parentID === 'ses_sess1').toBe(true)
   }
 })
 
 test('a foreign session id is not accepted as a child of the viewer session', async () => {
-  // sess2 is not a child of sess1, so the child-read path must collapse it.
+  // ses_sess2 is not a child of ses_sess1, so the child-read path must collapse it.
   lastPath = ''
-  const res = await request(relay).get('/session/sess2/message').set('x-viewer-token', viewerToken)
+  const res = await request(relay).get('/session/ses_sess2/message').set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
-  expect(res.body).toEqual([{ id: 'm1', limit: null }]) // sess1's message, not sess2's
-  expect(lastPath).toBe('/session/sess1/message')
+  expect(res.body).toEqual([{ id: 'm1', limit: null }]) // ses_sess1's message, not ses_sess2's
+  expect(lastPath).toBe('/session/ses_sess1/message')
 })
 
-test('viewer A cannot activate against sess2 without sess2’s code', async () => {
-  // A's own code is for sess1; pairing it with sess2 must be rejected, and
-  // pairing a wrong code with sess2 must be rejected the same way.
-  const wrong = await request(relay).post('/api/activate').send({ code: 'ZZZZZZ', session_id: 'sess2' })
+test('viewer A cannot activate against ses_sess2 without ses_sess2’s code', async () => {
+  // A's own code is for ses_sess1; pairing it with ses_sess2 must be rejected, and
+  // pairing a wrong code with ses_sess2 must be rejected the same way.
+  const wrong = await request(relay).post('/api/activate').send({ code: 'ZZZZZZ', session_id: 'ses_sess2' })
   expect(wrong.status).toBe(400)
   expect(wrong.body).toEqual({ error: 'invalid code' })
 })
@@ -459,8 +459,8 @@ test('a foreign session that is not a descendant still collapses', async () => {
   lastPath = ''
   const res = await request(relay).get('/session/ses_stranger/message').set('x-viewer-token', viewerToken)
   expect(res.status).toBe(200)
-  expect(res.body).toEqual([{ id: 'm1', limit: null }]) // sess1's message, not the stranger's
-  expect(lastPath).toBe('/session/sess1/message')
+  expect(res.body).toEqual([{ id: 'm1', limit: null }]) // ses_sess1's message, not the stranger's
+  expect(lastPath).toBe('/session/ses_sess1/message')
 })
 
 test('POST to a subagent session is still pinned to the viewer session (writes never widen)', async () => {
@@ -471,7 +471,7 @@ test('POST to a subagent session is still pinned to the viewer session (writes n
     .set('x-viewer-token', viewerToken)
     .send({ parts: [] })
   expect(res.status).toBe(200)
-  expect(lastPath).toBe('/session/sess1/prompt_async')
+  expect(lastPath).toBe('/session/ses_sess1/prompt_async')
 })
 
 test('a malformed id on a child-readable route collapses instead of reaching upstream raw', async () => {
@@ -480,7 +480,7 @@ test('a malformed id on a child-readable route collapses instead of reaching ups
     const res = await request(relay).get(`/session/${bad}/message`).set('x-viewer-token', viewerToken)
     expect(res.status).toBeLessThan(500)
     // Whatever upstream path was hit, it was the bound session's, never the raw input.
-    if (lastPath) expect(lastPath).toBe('/session/sess1/message')
+    if (lastPath) expect(lastPath).toBe('/session/ses_sess1/message')
   }
 })
 
@@ -512,28 +512,28 @@ test('the /api dialect reaches the same routes as the bare one', async () => {
   expect(apiList.status).toBe(200)
   expect(apiList.body).toEqual(bareList.body)
 
-  const bareMsg = await request(relay).get('/session/sess1/message').set('x-viewer-token', viewerToken)
+  const bareMsg = await request(relay).get('/session/ses_sess1/message').set('x-viewer-token', viewerToken)
   lastPath = ''
-  const apiMsg = await request(relay).get('/api/session/sess1/message').set('x-viewer-token', viewerToken)
+  const apiMsg = await request(relay).get('/api/session/ses_sess1/message').set('x-viewer-token', viewerToken)
   expect(apiMsg.status).toBe(200)
   expect(apiMsg.body).toEqual(bareMsg.body)
   // The /api twin forwards the BARE upstream path — opencode's canonical one.
-  expect(lastPath).toBe('/session/sess1/message')
+  expect(lastPath).toBe('/session/ses_sess1/message')
 })
 
 test('the /api dialect enforces the same isolation as the bare one', async () => {
   // No token at all.
   expect((await request(relay).get('/api/session')).status).toBe(401)
-  expect((await request(relay).get('/api/session/sess1/message')).status).toBe(401)
+  expect((await request(relay).get('/api/session/ses_sess1/message')).status).toBe(401)
 
   // A foreign session id is rewritten to the caller's own, never fetched raw.
   lastPath = ''
-  const foreign = await request(relay).get('/api/session/sess2/message').set('x-viewer-token', viewerToken)
+  const foreign = await request(relay).get('/api/session/ses_sess2/message').set('x-viewer-token', viewerToken)
   expect(foreign.status).toBe(200)
-  expect(lastPath).toBe('/session/sess1/message')
+  expect(lastPath).toBe('/session/ses_sess1/message')
   expect(foreign.body).toEqual([{ id: 'm1', limit: null }])
 
-  // The other viewer's /api list matches their own bare list — not sess1's.
+  // The other viewer's /api list matches their own bare list — not ses_sess1's.
   const otherBare = await request(relay).get('/session').set('x-viewer-token', sess2ViewerToken)
   const otherApi = await request(relay).get('/api/session').set('x-viewer-token', sess2ViewerToken)
   expect(otherApi.body).toEqual(otherBare.body)
@@ -636,7 +636,7 @@ test('the review panel reads the git diff of the shared directory', async () => 
  * and the viewer stays on the share.
  */
 test('a viewer cannot fork the shared session', async () => {
-  for (const path of ['/session/sess1/fork', '/api/session/sess1/fork', '/session/ses_stranger/fork']) {
+  for (const path of ['/session/ses_sess1/fork', '/api/session/ses_sess1/fork', '/session/ses_stranger/fork']) {
     lastPath = ''
     const res = await request(relay).post(path).set('x-viewer-token', viewerToken).send({ messageID: 'm1' })
     expect(res.status).toBe(404)

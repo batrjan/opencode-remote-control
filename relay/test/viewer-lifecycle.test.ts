@@ -284,7 +284,7 @@ test('a duplicate session_id registration (409) does not consume a registration 
   }
   // Free the active-session slot so only the hourly cap is in play.
   const del = await request(app)
-    .delete('/api/sessions/d0')
+    .delete('/api/sessions/ses_d0')
     .set('x-bridge-token', first.body.bridge_token as string)
   expect(del.status).toBe(204)
 
@@ -478,5 +478,8 @@ function skillApp(store: Store) {
 }
 
 function post(app: express.Express, session_id: string) {
-  return request(app).post('/api/sessions').send({ session_id, directory: '/work', title: 't' })
+  // Registration now requires a real opencode id (ses_...); the callers pass
+  // short fixture labels, so prefix them here to keep those cases readable.
+  const id = session_id.startsWith('ses_') ? session_id : `ses_${session_id}`
+  return request(app).post('/api/sessions').send({ session_id: id, directory: '/work', title: 't' })
 }

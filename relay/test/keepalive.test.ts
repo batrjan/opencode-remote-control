@@ -58,8 +58,8 @@ function connectBridge(session_id: string, token: string): Promise<WebSocket> {
 }
 
 test('the relay pings connected bridges', async () => {
-  const { bridgeToken } = await createSession('sess-ping')
-  const ws = await connectBridge('sess-ping', bridgeToken)
+  const { bridgeToken } = await createSession('ses_ping')
+  const ws = await connectBridge('ses_ping', bridgeToken)
   try {
     const pinged = await new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => resolve(false), 3000)
@@ -75,8 +75,8 @@ test('the relay pings connected bridges', async () => {
 })
 
 test('a bridge that stops answering pings is dropped, not left half-open', async () => {
-  const { bridgeToken, viewerToken } = await createSession('sess-silent')
-  const ws = await connectBridge('sess-silent', bridgeToken)
+  const { bridgeToken, viewerToken } = await createSession('ses_silent')
+  const ws = await connectBridge('ses_silent', bridgeToken)
   // Simulate a half-open socket: the client is up but never answers a ping.
   // (`ws` auto-pongs, so silence has to be forced.)
   ws.pong = () => {}
@@ -90,8 +90,8 @@ test('a bridge that stops answering pings is dropped, not left half-open', async
 }, 10_000)
 
 test('a live bridge that answers pings is never dropped', async () => {
-  const { bridgeToken } = await createSession('sess-alive')
-  const ws = await connectBridge('sess-alive', bridgeToken)
+  const { bridgeToken } = await createSession('ses_alive')
+  const ws = await connectBridge('ses_alive', bridgeToken)
   try {
     let closedEarly = false
     ws.once('close', () => {
@@ -106,7 +106,7 @@ test('a live bridge that answers pings is never dropped', async () => {
 }, 10_000)
 
 test('the viewer SSE stream keeps heartbeating with no bridge traffic at all', async () => {
-  const { viewerToken } = await createSession('sess-sse')
+  const { viewerToken } = await createSession('ses_sse')
   const res = await fetch(`${relayUrl}/event`, { headers: { 'x-viewer-token': viewerToken } })
   const reader = res.body!.getReader()
   const decoder = new TextDecoder()
@@ -128,7 +128,7 @@ test('the viewer SSE stream keeps heartbeating with no bridge traffic at all', a
 }, 10_000)
 
 test('heartbeats on /global/event use the wrapped envelope', async () => {
-  const { viewerToken } = await createSession('sess-sse-global')
+  const { viewerToken } = await createSession('ses_sse_global')
   const res = await fetch(`${relayUrl}/global/event`, { headers: { 'x-viewer-token': viewerToken } })
   const reader = res.body!.getReader()
   const decoder = new TextDecoder()

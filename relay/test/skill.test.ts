@@ -14,9 +14,9 @@ test('POST /api/sessions is public (no key) and creates the session', async () =
   const app = createApp(new Store())
   const res = await request(app)
     .post('/api/sessions')
-    .send({ session_id: 'sess1', directory: '/path', title: 'title' })
+    .send({ session_id: 'ses_sess1', directory: '/path', title: 'title' })
   expect(res.status).toBe(201)
-  expect(res.body.session_id).toBe('sess1')
+  expect(res.body.session_id).toBe('ses_sess1')
   expect(res.body.access_code).toMatch(/^[A-Z0-9]{6}$/)
   expect(res.body.bridge_token).toBeTruthy()
 })
@@ -26,15 +26,15 @@ test('POST /api/sessions with a duplicate session_id is 409 and keeps the origin
   const app = createApp(store)
   const first = await request(app)
     .post('/api/sessions')
-    .send({ session_id: 'sess1', directory: '/path', title: 'title' })
+    .send({ session_id: 'ses_sess1', directory: '/path', title: 'title' })
   expect(first.status).toBe(201)
   const res = await request(app)
     .post('/api/sessions')
-    .send({ session_id: 'sess1', directory: '/other', title: 'takeover' })
+    .send({ session_id: 'ses_sess1', directory: '/other', title: 'takeover' })
   expect(res.status).toBe(409)
   expect(res.body.error).toBeTruthy()
   // The original session (and its code) must be untouched.
-  expect(store.getSession('sess1')?.directory).toBe('/path')
+  expect(store.getSession('ses_sess1')?.directory).toBe('/path')
 })
 
 test('POST /api/sessions rate-limits registrations per IP', async () => {
@@ -44,11 +44,35 @@ test('POST /api/sessions rate-limits registrations per IP', async () => {
   for (let i = 0; i < 13; i++) {
     const res = await request(app)
       .post('/api/sessions')
-      .send({ session_id: `sess_rl_${i}`, directory: '/path', title: 't' })
+      .send({ session_id: `ses_rl_${i}`, directory: '/path', title: 't' })
     last = res.status
     if (last === 429) break
   }
   expect(last).toBe(429)
+})
+
+test('POST /api/sessions rejects a session_id that is not a real opencode id (open-redirect guard)', async () => {
+  const store = new Store()
+  const app = createApp(store)
+  // "//evil.example" passed the old typeof/length-only check and became the
+  // viewer_url "/​//evil.example", so a browser redirected to a foreign origin
+  // (open redirect on / and /join). A registration id must be a real opencode
+  // session id (ses_...), the same shape every viewer/proxy route pins to.
+  for (const bad of ['//evil.example', '/join', 'sess1', 'ses_bad/../x', '../etc', 'ses_bad space']) {
+    const res = await request(app).post('/api/sessions').send({ session_id: bad, directory: '/path', title: 't' })
+    expect(res.status, `id ${JSON.stringify(bad)} should be refused`).toBe(400)
+    expect(store.getSession(bad)).toBeUndefined()
+  }
+})
+
+test('POST /api/sessions still accepts a valid ses_ id', async () => {
+  const app = createApp(new Store())
+  const res = await request(app)
+    .post('/api/sessions')
+    .send({ session_id: 'ses_7aBcD_0', directory: '/path', title: 't' })
+  expect(res.status).toBe(201)
+  expect(res.body.session_id).toBe('ses_7aBcD_0')
+  expect(res.body.viewer_url).toBe('/ses_7aBcD_0')
 })
 
 test('DELETE /api/sessions/:id without a bridge token is 404 (owner-only delete)', async () => {

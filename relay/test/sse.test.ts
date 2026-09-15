@@ -52,15 +52,15 @@ beforeAll(async () => {
   const created = await request(relay)
     .post('/api/sessions')
     .set('x-api-key', API_KEY)
-    .send({ session_id: 'sess1', directory: '/path', title: 'title' })
-  const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'sess1' })
+    .send({ session_id: 'ses_sess1', directory: '/path', title: 'title' })
+  const activated = await request(relay).post('/api/activate').send({ code: created.body.access_code, session_id: 'ses_sess1' })
   viewerToken = viewerTokenFrom(activated)
 
   bridge = new RelayWSClient(
     relayUrl,
     new OpencodeClient(`http://127.0.0.1:${opencodePort}`, 'opencode', 'password'),
   )
-  await bridge.connect('sess1', created.body.bridge_token)
+  await bridge.connect('ses_sess1', created.body.bridge_token)
   await bridge.startEventForwarding()
 })
 

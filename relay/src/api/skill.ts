@@ -37,6 +37,17 @@ const MAX_TITLE = 1024
 const MIN_OWNER_KEY = 32
 const MAX_OWNER_KEY = 256
 
+/**
+ * A real opencode session id — the shape every viewer/proxy route already pins
+ * ':id' to (server.ts SHARE_PAGE_ID_RE, adapter.ts SESSION_ID_RE). Registration
+ * used to check only typeof/length, so an id like "//evil.example" was accepted
+ * and became the viewer_url "///evil.example" — an open redirect on / and /join
+ * for anyone viewing that share — while other malformed ids leaked into state.
+ * Pinning it here rejects those before anything is recorded; the bridge only
+ * ever registers a genuine ses_ id, so no legitimate registration is affected.
+ */
+const SESSION_ID_RE = /^ses_[A-Za-z0-9_]+$/
+
 export function skillRouter(store: Store, bridge?: BridgeClient) {
   const router = express.Router()
 
@@ -45,6 +56,13 @@ export function skillRouter(store: Store, bridge?: BridgeClient) {
     const { session_id, directory, title, owner_key } = body
     if (typeof session_id !== 'string' || session_id.length === 0) {
       return res.status(400).json({ error: 'session_id is required' })
+    }
+    // Bound the shape, not just the length: a session_id becomes the viewer_url
+    // (`/${session_id}`) and is echoed into the persisted state, so anything
+    // that is not a real opencode session id is an open-redirect / injection
+    // vector, never a legitimate registration.
+    if (!SESSION_ID_RE.test(session_id)) {
+      return res.status(400).json({ error: 'session_id is malformed' })
     }
     if (typeof directory !== 'string' || directory.length === 0) {
       return res.status(400).json({ error: 'directory is required' })
