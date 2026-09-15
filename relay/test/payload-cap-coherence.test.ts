@@ -180,6 +180,16 @@ test('every budget that must hold a whole frame leaves room for one maximal fram
   expect(proxyMaxBufferedBytes()).toBe(1024 * MiB)
   process.env.RELAY_PROXY_MAX_BUFFERED_BYTES = String(256 * MiB)
   expect(proxyMaxBufferedBytes()).toBe(8 * 96 * MiB)
+
+  // Same for the fan-out budget, which the defaults above cannot prove: the
+  // check runs before the write and weighs the frame on its own, so a cap
+  // raised past the parked budget plus the per-stream cap dropped every viewer
+  // — reading or not — for an event the socket had accepted.
+  process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES = String(160 * MiB)
+  expect(sseMaxParkedBytes()).toBeGreaterThanOrEqual(160 * MiB - sseMaxBufferBytes())
+  // A budget the operator set above that floor is left exactly as it is.
+  process.env.RELAY_SSE_MAX_PARKED_BYTES = String(512 * MiB)
+  expect(sseMaxParkedBytes()).toBe(512 * MiB)
 })
 
 test('config and the gunzip ceiling name maxPayload as the ceiling they derive from', () => {

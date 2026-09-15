@@ -286,9 +286,18 @@ export function sseMaxExemptBytes(): number {
  * once, or a pasted photo reaching a couple of dozen streams; while it is used
  * up, a viewer is dropped for a large event instead of the relay running out
  * of memory. Counted in the same units as the cap.
+ *
+ * Never below one maximal frame minus the per-stream cap, whatever the env
+ * says. The check runs BEFORE the write and measures the frame on its own
+ * (writableLength + frame - maxBuffer), so a budget smaller than that drops
+ * EVERY stream — a viewer reading as fast as it arrives included — for an
+ * event the bridge socket accepted, and the event is gone: the fan-out has no
+ * replay. Raising the frame cap for an install that pastes bigger media raises
+ * this with it, as it does the exemption and the proxy ceiling; the floor only
+ * ever allows the one frame the socket already took.
  */
 export function sseMaxParkedBytes(): number {
-  return envInt('RELAY_SSE_MAX_PARKED_BYTES', 128 * 1024 * 1024)
+  return Math.max(envInt('RELAY_SSE_MAX_PARKED_BYTES', 128 * 1024 * 1024), bridgeMaxPayloadBytes() - sseMaxBufferBytes())
 }
 
 /**
@@ -313,11 +322,12 @@ export function sseMaxParkedBytes(): number {
  * This is the CEILING every other one-frame limit is measured against, because
  * it is the only one enforced by dropping the bridge: the SSE one-frame
  * exemption (sseMaxExemptBytes) is clamped to it, the gunzip output limit is
- * min'd with it, and the aggregate proxy ceiling is floored at eight of it (see
- * proxyMaxBufferedBytes for why eight and not one). A number above it promises
- * something no frame can deliver; anything that must carry a whole frame has to
- * be at least it. Raise it and those follow — they are derived here, not
- * repeated.
+ * min'd with it, the fan-out's parked budget (sseMaxParkedBytes) is floored at
+ * what one frame puts over the per-stream cap, and the aggregate proxy ceiling
+ * is floored at eight of it (see proxyMaxBufferedBytes for why eight and not
+ * one). A number above it promises something no frame can deliver; anything
+ * that must carry a whole frame has to be at least it. Raise it and those
+ * follow — they are derived here, not repeated.
  */
 export function bridgeMaxPayloadBytes(): number {
   return envInt('RELAY_BRIDGE_MAX_PAYLOAD_BYTES', 16 * 1024 * 1024)
