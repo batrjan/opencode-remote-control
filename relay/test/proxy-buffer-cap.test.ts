@@ -174,3 +174,35 @@ test('the aggregate ceiling caps concurrent slow readers and refuses new bodies 
     bridge.ws.terminate()
   }
 }, 20_000)
+
+test('a route that post-processes the body is held to the same ceiling', async () => {
+  const id = 'ses_ceiling_filtered'
+  const { viewerToken, bridgeToken } = await share(id)
+  const bridge = await mockBridge(id, bridgeToken, 6 * MiB)
+  const stalled: net.Socket[] = []
+  try {
+    // Fill the budget the same way, with the plain proxy() route.
+    stalled.push(stalledGet(viewerToken, '/agent'))
+    await until(() => bridge.served() >= 1, 5000)
+    await sleep(200)
+
+    // /session does not go through proxy(): it wraps the upstream body in an
+    // array itself. It used to res.send() that straight out, so it neither paid
+    // into the budget nor was refused when the budget was gone — a hostile
+    // bridge could hand out a near-maxPayload body per socket there forever
+    // while /agent was correctly answering 503. It must be refused too.
+    const busy = await request(relay).get('/session').set('x-viewer-token', viewerToken)
+    expect(busy.status).toBe(503)
+    expect((await request(relay).get('/health')).status).toBe(200)
+
+    // And it is served normally again once the budget frees, wrapping intact.
+    for (const s of stalled) s.destroy()
+    await sleep(300)
+    const ok = await request(relay).get('/session').set('x-viewer-token', viewerToken)
+    expect(ok.status).toBe(200)
+    expect(ok.text.length).toBe(6 * MiB + 2)
+  } finally {
+    for (const s of stalled) s.destroy()
+    bridge.ws.terminate()
+  }
+}, 20_000)

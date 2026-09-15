@@ -467,6 +467,16 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
    * connection and starve honest requests — the same no-progress test the SSE
    * fan-out applies to a stuck viewer (a reading client, however slow, moves
    * either the flushed count or libuv's in-flight queue between checks).
+   *
+   * This is the ONE exit every bridge-controlled body takes. The handlers that
+   * post-process a body before answering (/project, /session, /permission,
+   * /question, /session/status, prompt_async) used to res.send() it themselves,
+   * so they carried the guard headers but paid nothing into the budget and got
+   * no watchdog: the ceiling bounded proxy() alone, and a hostile bridge
+   * answering those routes with a near-maxPayload body was still an OOM one
+   * non-reading socket at a time. Hence the guard headers and the content-type
+   * allow-list live in here too — a handler that sends its own body would have
+   * to remember all three.
    */
   function sendBounded(res: Response, status: number, contentType: string | undefined, payload: string, nextCursor?: string): void {
     const len = Buffer.byteLength(payload)
@@ -593,11 +603,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       const out = await bridge.request(session.id, { method: 'POST', path: path + query, body }, promptTimeoutMs(), {
         checksLostAnswer: messageID !== undefined,
       })
-      setProxyGuardHeaders(res)
-      res
-        .status(out.status)
-        .type(safeProxyContentType(out.contentType))
-        .send(out.body)
+      sendBounded(res, out.status, out.contentType, out.body)
     } catch (err) {
       const lostAnswer = err instanceof Error && LOST_ANSWER_ERRORS.has(err.message)
       if (lostAnswer && messageID !== undefined) {
@@ -721,13 +727,11 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
             config.proxyTimeoutMs,
           )
           if (current.status === 200 && current.body.trim().startsWith('{')) {
-            setProxyGuardHeaders(res)
-            res.status(200).type('application/json').send(`[${current.body}]`)
+            sendBounded(res, 200, 'application/json', `[${current.body}]`)
             return
           }
         }
-        setProxyGuardHeaders(res)
-        res.status(out.status).type(safeProxyContentType(out.contentType)).send(filtered)
+        sendBounded(res, out.status, out.contentType, filtered)
       } catch (err) {
         sendProxyError(res, err)
       }
@@ -747,15 +751,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           config.proxyTimeoutMs,
         )
         if (out.status === 404) {
-          setProxyGuardHeaders(res)
-          res.status(200).type('application/json').send('[]')
+          sendBounded(res, 200, 'application/json', '[]')
           return
         }
-        setProxyGuardHeaders(res)
-        res
-          .status(out.status)
-          .type(safeProxyContentType(out.contentType))
-          .send(`[${out.body}]`)
+        sendBounded(res, out.status, out.contentType, `[${out.body}]`)
       } catch (err) {
         sendProxyError(res, err)
       }
@@ -794,8 +793,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           const inShare = await sessionsInShare(session, pending.map((p) => p?.sessionID))
           body = JSON.stringify(pending.filter((p) => inShare.has(p?.sessionID as string)))
         }
-        setProxyGuardHeaders(res)
-        res.status(out.status).type(safeProxyContentType(out.contentType)).send(body)
+        sendBounded(res, out.status, out.contentType, body)
       } catch (err) {
         sendProxyError(res, err)
       }
@@ -831,8 +829,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           const inShare = await sessionsInShare(session, pending.map((q) => q?.sessionID))
           body = JSON.stringify(pending.filter((q) => inShare.has(q?.sessionID as string)))
         }
-        setProxyGuardHeaders(res)
-        res.status(out.status).type(safeProxyContentType(out.contentType)).send(body)
+        sendBounded(res, out.status, out.contentType, body)
       } catch (err) {
         sendProxyError(res, err)
       }
@@ -867,8 +864,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           const inShare = await sessionsInShare(session, statuses.map(([id]) => id))
           body = JSON.stringify(Object.fromEntries(statuses.filter(([id]) => inShare.has(id))))
         }
-        setProxyGuardHeaders(res)
-        res.status(out.status).type(safeProxyContentType(out.contentType)).send(body)
+        sendBounded(res, out.status, out.contentType, body)
       } catch (err) {
         sendProxyError(res, err)
       }
