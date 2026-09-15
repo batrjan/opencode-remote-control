@@ -33,11 +33,14 @@ const ENV = ['RELAY_BRIDGE_MAX_PAYLOAD_BYTES', 'RELAY_PROXY_MAX_BUFFERED_BYTES',
 beforeEach(async () => {
   for (const key of ENV) saved[key] = process.env[key]
   process.env.ACTIVATE_FAIL_DELAY_MS = '0'
-  // A frame over 8 MiB is rejected; the proxy path holds at most ~8 MiB buffered.
+  // A frame over 8 MiB is rejected; the proxy path holds at most 64 MiB buffered
+  // in total, of which any ONE share may hold an eighth — 8 MiB, the per-share
+  // slice these single-share tests fill (see proxySessionShareBytes; the ceiling
+  // is floored at eight frames, so a smaller value here would just be raised).
   // Bodies are sized in MiB so a paused reader's kernel buffers cannot absorb a
   // whole one — the surplus stays queued in the relay, exactly as under the DoS.
   process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES = String(8 * MiB)
-  process.env.RELAY_PROXY_MAX_BUFFERED_BYTES = String(8 * MiB)
+  process.env.RELAY_PROXY_MAX_BUFFERED_BYTES = String(64 * MiB)
   // A dropped bridge fails its in-flight GETs fast, instead of the 5 s default.
   process.env.RELAY_BRIDGE_RECONNECT_WAIT_MS = '200'
   const store = new Store()
@@ -137,25 +140,25 @@ test('a bridge frame larger than maxPayload is rejected, and the relay stays up'
   }
 }, 20_000)
 
-test('the aggregate ceiling caps concurrent slow readers and refuses new bodies with 503', async () => {
+test('the buffered-bytes budget caps concurrent slow readers and refuses new bodies with 503', async () => {
   const id = 'ses_ceiling'
   const { viewerToken, bridgeToken } = await share(id)
   // Each body is 6 MiB — under maxPayload, so it is delivered, but one parked in
-  // a non-reading socket already holds 6 MiB, and a second would push the total
-  // past the 8 MiB ceiling.
+  // a non-reading socket already holds 6 MiB, and a second would push this
+  // share's held bytes past its 8 MiB slice of the ceiling.
   const bridge = await mockBridge(id, bridgeToken, 6 * MiB)
   const stalled: net.Socket[] = []
   try {
     // Two non-reading GETs: the first parks (6 MiB), the second is already over
-    // the ceiling. The parked body pins the budget for as long as it is unread.
+    // the budget. The parked body pins it for as long as it is unread.
     for (let i = 0; i < 2; i++) stalled.push(stalledGet(viewerToken, '/agent'))
     await until(() => bridge.served() >= 2, 5000)
     expect(bridge.served()).toBeGreaterThanOrEqual(2)
     await sleep(200) // let the relay finish buffering the parked response
 
-    // An honest reader now finds the budget full: its 6 MiB body would push the
-    // total past the ceiling, so it is refused rather than buffered. On HEAD (no
-    // ceiling) this is a 200 carrying the full body.
+    // An honest reader of the same share now finds the budget full: its 6 MiB
+    // body would push the total past it, so it is refused rather than buffered.
+    // On HEAD (no ceiling) this is a 200 carrying the full body.
     const busy = await request(relay).get('/agent').set('x-viewer-token', viewerToken)
     expect(busy.status).toBe(503)
     // The relay is still serving, not crashed.
@@ -175,7 +178,7 @@ test('the aggregate ceiling caps concurrent slow readers and refuses new bodies 
   }
 }, 20_000)
 
-test('a route that post-processes the body is held to the same ceiling', async () => {
+test('a route that post-processes the body is held to the same budget', async () => {
   const id = 'ses_ceiling_filtered'
   const { viewerToken, bridgeToken } = await share(id)
   const bridge = await mockBridge(id, bridgeToken, 6 * MiB)

@@ -4,7 +4,7 @@ import type { Request, Response } from 'express'
 import type { Store, Session } from '../store.js'
 import type { BridgeClient } from '../ws/bridge.js'
 import { setViewerCookie } from '../api/viewerCookie.js'
-import { bridgeReconnectWaitMs, config, promptTimeoutMs, proxyMaxBufferedBytes, sseHeartbeatMs, sseMaxBufferBytes, sseMaxExemptBytes, sseMaxParkedBytes, sseRetryMs } from '../config.js'
+import { bridgeMaxPayloadBytes, bridgeReconnectWaitMs, config, promptTimeoutMs, proxyMaxBufferedBytes, sseHeartbeatMs, sseMaxBufferBytes, sseMaxExemptBytes, sseMaxParkedBytes, sseRetryMs } from '../config.js'
 
 /**
  * HTTP → WS → opencode proxy adapter, mounted at the server ROOT.
@@ -212,13 +212,21 @@ const PROXY_BODY_LIMIT = '25mb'
 /**
  * How often a buffered proxy response's drain is checked, and how many
  * consecutive no-progress checks are tolerated before a stalled one is cut so it
- * stops pinning the shared buffered-bytes budget (see sendBounded). Generous: a
- * reader on a slow uplink makes progress every check and is never cut — only a
- * socket that takes nothing at all is. ~10 s of dead silence, matching the way
- * the SSE fan-out treats a stuck viewer.
+ * stops pinning the shared buffered-bytes budget (see sendBounded). A reader on
+ * a slow uplink makes progress every check and is never cut — only a socket that
+ * takes nothing at all is.
+ *
+ * This window is how long a non-reading socket keeps its bytes charged, so it is
+ * also how wide an outage one share can inflict on the rest. At ~10 s of dead
+ * silence (two 5 s strikes) an attacker re-opening a handful of sockets every few
+ * seconds held the budget full continuously, with no gap for anyone else's
+ * request to land in. One 2.5 s strike is still far more than a client that reads
+ * at all needs — either progress signal, the whole-write backlog or libuv's
+ * in-flight queue, moves long before it — and a response cut by mistake costs the
+ * viewer one re-fetch.
  */
-const PROXY_STALL_CHECK_MS = 5_000
-const PROXY_STALL_STRIKES = 2
+const PROXY_STALL_CHECK_MS = 2_500
+const PROXY_STALL_STRIKES = 1
 
 /**
  * Max concurrent SSE streams one session may hold open. Each stream costs a
@@ -448,6 +456,34 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
    */
   let proxyBufferedBytes = 0
 
+  /**
+   * The same bytes, kept per registration. A process-wide ceiling bounds memory
+   * but says nothing about WHOSE memory: one share parking a few non-reading
+   * sockets against its own bridge's multi-MiB bodies filled the entire ceiling,
+   * and every OTHER share's viewer — UI load, transcript, file reads — was
+   * answered 503 'relay busy' until the watchdog cut them. Nine idle TCP
+   * connections bought a total outage for everyone else, so the OOM this budget
+   * closed had simply become a cheap cross-tenant one. A share now spends only
+   * its own slice of the ceiling (proxySessionShareBytes), so a registrant that
+   * floods the proxy path denies service to itself.
+   *
+   * An entry is removed once the share holds nothing, so the map is as large as
+   * the shares with a body in flight, not as the shares ever served.
+   */
+  const proxyBufferedBySession = new Map<string, number>()
+
+  /**
+   * How much of the ceiling ONE registration may hold buffered at once. An
+   * eighth of it, but never less than one whole frame: a body the bridge socket
+   * accepted (bridgeMaxPayloadBytes) has to be admissible on its own, the same
+   * floor the ceiling itself carries. proxyMaxBufferedBytes keeps the ceiling at
+   * eight frames or more so this stays a real fraction of it — at a smaller
+   * ceiling the slice would round up to the whole thing and bound nothing.
+   */
+  function proxySessionShareBytes(): number {
+    return Math.max(Math.floor(proxyMaxBufferedBytes() / 8), bridgeMaxPayloadBytes())
+  }
+
   /** libuv's not-yet-sent byte count for a response socket, like the SSE inFlight
    * helper: it shrinks while one large write is only partly out, where
    * writableLength (whole-write) does not. Read defensively. */
@@ -458,11 +494,13 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
 
   /**
    * Send one proxied body under the process-wide buffered-bytes ceiling
-   * (proxyMaxBufferedBytes). A body that would push the total over the ceiling
-   * is refused with 503 rather than parked in the heap, so however many slow
+   * (proxyMaxBufferedBytes) AND the sending share's own slice of it
+   * (proxySessionShareBytes). A body that would push either total over is
+   * refused with 503 rather than parked in the heap, so however many slow
    * readers pile up the relay holds at most the ceiling plus one maxPayload
-   * instead of OOMing (the DoS this closes; see verify-1/dos.mjs). Once
-   * admitted, a response whose backlog stops draining is cut so a non-reading
+   * instead of OOMing (the DoS this closes; see verify-1/dos.mjs), and no single
+   * share can spend the room the other shares' viewers need. Once admitted, a
+   * response whose backlog stops draining is cut so a non-reading
    * socket cannot hold its share of the budget for the life of its TCP
    * connection and starve honest requests — the same no-progress test the SSE
    * fan-out applies to a stuck viewer (a reading client, however slow, moves
@@ -478,21 +516,28 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
    * allow-list live in here too — a handler that sends its own body would have
    * to remember all three.
    */
-  function sendBounded(res: Response, status: number, contentType: string | undefined, payload: string, nextCursor?: string): void {
+  function sendBounded(res: Response, session_id: string, status: number, contentType: string | undefined, payload: string, nextCursor?: string): void {
     const len = Buffer.byteLength(payload)
-    if (proxyBufferedBytes + len > proxyMaxBufferedBytes()) {
+    const held = proxyBufferedBySession.get(session_id) ?? 0
+    if (proxyBufferedBytes + len > proxyMaxBufferedBytes() || held + len > proxySessionShareBytes()) {
       // Refuse rather than OOM. The web UI surfaces this as a failed request the
       // viewer retries once the relay is no longer saturated.
       res.status(503).json({ error: 'relay busy' })
       return
     }
     proxyBufferedBytes += len
+    proxyBufferedBySession.set(session_id, held + len)
     let released = false
     let stall: NodeJS.Timeout | undefined
     const release = () => {
       if (released) return
       released = true
       proxyBufferedBytes -= len
+      // Re-read: other responses of the same share may have come and gone since
+      // this one was charged.
+      const left = (proxyBufferedBySession.get(session_id) ?? len) - len
+      if (left > 0) proxyBufferedBySession.set(session_id, left)
+      else proxyBufferedBySession.delete(session_id)
       if (stall) clearInterval(stall)
     }
     // A paged transcript names its older page only in this header; without it
@@ -569,7 +614,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
     try {
       const out = await bridge.request(session_id, { method, path, body }, timeout)
       const payload = transform ? transform(out.body, out.contentType) : out.body
-      sendBounded(res, out.status, out.contentType, payload, out.nextCursor)
+      sendBounded(res, session_id, out.status, out.contentType, payload, out.nextCursor)
     } catch (err) {
       sendProxyError(res, err)
     }
@@ -603,7 +648,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
       const out = await bridge.request(session.id, { method: 'POST', path: path + query, body }, promptTimeoutMs(), {
         checksLostAnswer: messageID !== undefined,
       })
-      sendBounded(res, out.status, out.contentType, out.body)
+      sendBounded(res, session.id, out.status, out.contentType, out.body)
     } catch (err) {
       const lostAnswer = err instanceof Error && LOST_ANSWER_ERRORS.has(err.message)
       if (lostAnswer && messageID !== undefined) {
@@ -727,11 +772,11 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
             config.proxyTimeoutMs,
           )
           if (current.status === 200 && current.body.trim().startsWith('{')) {
-            sendBounded(res, 200, 'application/json', `[${current.body}]`)
+            sendBounded(res, session.id, 200, 'application/json', `[${current.body}]`)
             return
           }
         }
-        sendBounded(res, out.status, out.contentType, filtered)
+        sendBounded(res, session.id, out.status, out.contentType, filtered)
       } catch (err) {
         sendProxyError(res, err)
       }
@@ -751,10 +796,10 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           config.proxyTimeoutMs,
         )
         if (out.status === 404) {
-          sendBounded(res, 200, 'application/json', '[]')
+          sendBounded(res, session.id, 200, 'application/json', '[]')
           return
         }
-        sendBounded(res, out.status, out.contentType, `[${out.body}]`)
+        sendBounded(res, session.id, out.status, out.contentType, `[${out.body}]`)
       } catch (err) {
         sendProxyError(res, err)
       }
@@ -793,7 +838,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           const inShare = await sessionsInShare(session, pending.map((p) => p?.sessionID))
           body = JSON.stringify(pending.filter((p) => inShare.has(p?.sessionID as string)))
         }
-        sendBounded(res, out.status, out.contentType, body)
+        sendBounded(res, session.id, out.status, out.contentType, body)
       } catch (err) {
         sendProxyError(res, err)
       }
@@ -829,7 +874,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           const inShare = await sessionsInShare(session, pending.map((q) => q?.sessionID))
           body = JSON.stringify(pending.filter((q) => inShare.has(q?.sessionID as string)))
         }
-        sendBounded(res, out.status, out.contentType, body)
+        sendBounded(res, session.id, out.status, out.contentType, body)
       } catch (err) {
         sendProxyError(res, err)
       }
@@ -864,7 +909,7 @@ export function proxyAdapter(store: Store, bridge: BridgeClient) {
           const inShare = await sessionsInShare(session, statuses.map(([id]) => id))
           body = JSON.stringify(Object.fromEntries(statuses.filter(([id]) => inShare.has(id))))
         }
-        sendBounded(res, out.status, out.contentType, body)
+        sendBounded(res, session.id, out.status, out.contentType, body)
       } catch (err) {
         sendProxyError(res, err)
       }

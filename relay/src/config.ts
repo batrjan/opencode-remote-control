@@ -313,10 +313,11 @@ export function sseMaxParkedBytes(): number {
  * This is the CEILING every other one-frame limit is measured against, because
  * it is the only one enforced by dropping the bridge: the SSE one-frame
  * exemption (sseMaxExemptBytes) is clamped to it, the gunzip output limit is
- * min'd with it, and the aggregate proxy ceiling is floored at it. A number
- * above it promises something no frame can deliver; anything that must carry a
- * whole frame has to be at least it. Raise it and those follow — they are
- * derived here, not repeated.
+ * min'd with it, and the aggregate proxy ceiling is floored at eight of it (see
+ * proxyMaxBufferedBytes for why eight and not one). A number above it promises
+ * something no frame can deliver; anything that must carry a whole frame has to
+ * be at least it. Raise it and those follow — they are derived here, not
+ * repeated.
  */
 export function bridgeMaxPayloadBytes(): number {
   return envInt('RELAY_BRIDGE_MAX_PAYLOAD_BYTES', 16 * 1024 * 1024)
@@ -337,14 +338,18 @@ export function bridgeMaxPayloadBytes(): number {
  * however many slow readers pile up. Generous enough for several honest
  * multi-MiB transcripts at once; env-tunable.
  *
- * Never below one maxPayload, whatever the env says: a body the bridge socket
- * accepted must be admissible at least on its own. Below that, every response
- * of a size the frame cap allows would be answered 503 `relay busy` with the
- * relay holding nothing at all — the sum cannot be a stricter limit on ONE
- * response than the frame cap already is.
+ * Never below EIGHT maxPayloads, whatever the env says. One, because a body the
+ * bridge socket accepted must be admissible at least on its own: below that,
+ * every response of a size the frame cap allows would be answered 503 `relay
+ * busy` with the relay holding nothing at all — the sum cannot be a stricter
+ * limit on ONE response than the frame cap already is. Eight, because the proxy
+ * adapter hands each registration an eighth of this ceiling and never less than
+ * one frame (proxySessionShareBytes), so that a share flooding the proxy path
+ * can only deny itself; at a ceiling under eight frames that slice rounds up to
+ * the whole ceiling and the split stops separating the shares at all.
  */
 export function proxyMaxBufferedBytes(): number {
-  return Math.max(envInt('RELAY_PROXY_MAX_BUFFERED_BYTES', 64 * 1024 * 1024), bridgeMaxPayloadBytes())
+  return Math.max(envInt('RELAY_PROXY_MAX_BUFFERED_BYTES', 128 * 1024 * 1024), 8 * bridgeMaxPayloadBytes())
 }
 
 /**

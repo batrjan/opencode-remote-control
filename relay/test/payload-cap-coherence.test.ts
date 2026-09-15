@@ -163,14 +163,23 @@ test('every budget that must hold a whole frame leaves room for one maximal fram
   // one maximal frame fits when that much of it is over the cap.
   expect(sseMaxParkedBytes()).toBeGreaterThanOrEqual(bridgeMaxPayloadBytes() - sseMaxBufferBytes())
 
+  // The proxy ceiling holds eight frames, not one: the adapter gives each share
+  // an eighth of it and no less than a whole frame (proxySessionShareBytes), so
+  // below eight that per-share slice IS the ceiling and one hostile share can
+  // still spend every other share's room.
+  expect(proxyMaxBufferedBytes()).toBeGreaterThanOrEqual(8 * bridgeMaxPayloadBytes())
+
   // And a frame cap raised past the aggregate ceiling does not turn every
   // proxied response into 503 `relay busy`: a body the socket accepted is
   // admissible at least on its own.
   process.env.RELAY_BRIDGE_MAX_PAYLOAD_BYTES = String(96 * MiB)
   expect(proxyMaxBufferedBytes()).toBeGreaterThanOrEqual(96 * MiB)
-  // A ceiling above the frame cap is left exactly as the operator set it.
+  // A ceiling that already leaves room for eight frames is left exactly as the
+  // operator set it; a smaller one is raised to that floor, not honoured.
+  process.env.RELAY_PROXY_MAX_BUFFERED_BYTES = String(1024 * MiB)
+  expect(proxyMaxBufferedBytes()).toBe(1024 * MiB)
   process.env.RELAY_PROXY_MAX_BUFFERED_BYTES = String(256 * MiB)
-  expect(proxyMaxBufferedBytes()).toBe(256 * MiB)
+  expect(proxyMaxBufferedBytes()).toBe(8 * 96 * MiB)
 })
 
 test('config and the gunzip ceiling name maxPayload as the ceiling they derive from', () => {
