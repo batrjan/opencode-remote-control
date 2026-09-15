@@ -146,8 +146,15 @@ function encrypt(plaintext: string, key: Buffer): string {
 }
 
 function decrypt(envelope: EncryptedEnvelope, key: Buffer): string {
-  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'))
-  decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'))
+  const tag = Buffer.from(envelope.tag, 'base64')
+  // GCM's integrity guarantee is only as strong as the tag it verifies. Node
+  // otherwise accepts a truncated tag (4/8/12 bytes) and checks only that many
+  // bits, so a forger who can shave the tag needs far less work to slip a
+  // tampered file past. We always write the full 128-bit tag, so pin
+  // authTagLength to 16 AND reject any tag that is not exactly 16 bytes.
+  if (tag.length !== 16) throw new Error('GCM auth tag is not 16 bytes')
+  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'), { authTagLength: 16 })
+  decipher.setAuthTag(tag)
   return Buffer.concat([decipher.update(Buffer.from(envelope.ct, 'base64')), decipher.final()]).toString('utf8')
 }
 
@@ -313,6 +320,16 @@ export class FileStateStore {
       } catch {
         return this.unusable('decrypted, but not valid JSON')
       }
+    } else if (this.key) {
+      // A key is configured, so every state file this relay writes is an
+      // encrypted envelope. A plaintext file here is therefore not one we
+      // wrote with this key: it is either a pre-encryption leftover or, worse,
+      // forged by someone who can write the state volume but does not know the
+      // key. Trusting it would let such an attacker substitute arbitrary
+      // sessions, viewer tokens and code hashes without ever holding the key —
+      // the exact threat the encryption exists to close. Treat it as corrupt:
+      // set aside, start empty, and say why.
+      return this.unusable('plaintext state file but RELAY_STATE_KEY is set (forged or pre-encryption leftover)')
     }
     const version = (state as { version?: unknown } | null)?.version
     if (!state || typeof state !== 'object' || typeof version !== 'number') return this.unusable('invalid shape')

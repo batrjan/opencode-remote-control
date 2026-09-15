@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -105,6 +105,61 @@ test('ENCRYPTED file is unreadable without the key (a stolen volume copy is usel
   expect(new FileStateStore(file, 0, wrong).load()).toBeUndefined()
   // The private title is nowhere in the raw bytes.
   expect(readFileSync(file, 'utf8')).not.toContain('private title')
+})
+
+test('ENCRYPTED file: a truncated GCM auth tag is rejected, not accepted', () => {
+  const key = stateKey({ RELAY_STATE_KEY: KEY } as NodeJS.ProcessEnv)
+  const a = new Store()
+  a.createSession('ses_trunc', '/work', 'title', '1.2.3.4')
+  const write = new FileStateStore(file, 0, key)
+  write.schedule(() => a.snapshot())
+  write.flush()
+
+  // Shave the genuine 128-bit tag down to its first 96 bits. GCM verifies only
+  // the bits it is given, so a truncated genuine tag validates unless the tag
+  // length is pinned — which is exactly the weakness this guards against.
+  const envelope = JSON.parse(readFileSync(file, 'utf8')) as Record<string, string>
+  const fullTag = Buffer.from(envelope.tag!, 'base64')
+  expect(fullTag.length).toBe(16)
+  envelope.tag = fullTag.subarray(0, 12).toString('base64')
+  writeFileSync(file, JSON.stringify(envelope))
+
+  // A truncated tag must be treated as undecryptable → start empty.
+  expect(new FileStateStore(file, 0, key).load()).toBeUndefined()
+  // The untampered file still round-trips, proving the pin is length-specific.
+  write.schedule(() => a.snapshot())
+  write.flush()
+  expect(new FileStateStore(file, 0, key).load()?.sessions.map((s) => s.id)).toEqual(['ses_trunc'])
+})
+
+test('with a key set, a plaintext state file is rejected (a forged volume write cannot substitute state)', () => {
+  const key = stateKey({ RELAY_STATE_KEY: KEY } as NodeJS.ProcessEnv)
+  // Someone who can write the state volume but does not know the key drops a
+  // valid-shaped plaintext state, hoping to substitute forged sessions.
+  mkdirSync(path.dirname(file), { recursive: true })
+  const forged: PersistedState = {
+    version: 1,
+    saved_at: Date.now(),
+    sessions: [
+      {
+        id: 'ses_forged',
+        directory: '/work',
+        title: 't',
+        bridge_token_hash: 'x',
+        bridge_token_salt: 'y',
+        created_at: Date.now(),
+        last_seen: Date.now(),
+        status: 'active',
+        viewers: [],
+      },
+    ],
+  }
+  writeFileSync(file, JSON.stringify(forged))
+
+  // With a key configured every write is encrypted, so a plaintext file is
+  // never one we wrote: refuse it and start empty rather than trust the forgery.
+  expect(new FileStateStore(file, 0, key).load()).toBeUndefined()
+  expect(new Store().restore(new FileStateStore(file, 0, key).load())).toBe(0)
 })
 
 test('PLAINTEXT file (no key): stores no code hash, code salt or owner IP', () => {
