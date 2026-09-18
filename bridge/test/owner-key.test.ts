@@ -1,0 +1,233 @@
+import { afterAll, afterEach, beforeAll, expect, test } from 'vitest'
+import { createServer, type Server } from 'node:http'
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import type { AddressInfo } from 'node:net'
+import { startServer } from '../../relay/src/server'
+import { opencodeAuthHeader } from '../src/config'
+import { startBridge, type BridgeHandle } from '../src/index'
+import { RelayClient } from '../src/relay'
+import { clearSessionState, latestSessionState, loadSessionState, ownerKey } from '../src/state'
+
+/**
+ * A share link names the opencode session id, and the owner registers that
+ * same id again each time they share the conversation. The relay used to hand
+ * a freed id to whoever asked first: anyone holding an old link could register
+ * it the moment the owner stopped, keep it alive with a connected socket, and
+ * the owner's next start failed with "relay createSession failed: 409" and no
+ * token to clear it. A start after a bridge died without its state file (the
+ * one place its token lived) hit the same wall for a day.
+ *
+ * The bridge now sends an owner_key with every registration: an HMAC of the
+ * relay's origin and the session id under a secret created once per install
+ * (owner.key, 0600, beside the state files). The relay reserves the id for that
+ * key after the share ends and lets the same key replace its own registration,
+ * so a key one relay was sent must prove nothing on another. A live share this
+ * machine still records is still refused locally, before the relay is asked —
+ * the relay would otherwise take it over under its viewers.
+ *
+ * Stand-ins: an in-process relay built from source and an opencode server over
+ * node:http. HOME is a temp dir, so no real state or key is ever touched.
+ */
+
+const API_KEY = 'test-relay-key'
+process.env.RELAY_API_KEY = API_KEY
+const PICKED = 'ses_ownerPicked1'
+
+let relay: Server
+let relayUrl: string
+let opencode: Server
+let opencodeUrl: string
+let root: string
+let savedHome: string | undefined
+const handles: BridgeHandle[] = []
+
+function json(res: import('node:http').ServerResponse, status: number, body: unknown) {
+  res.writeHead(status, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify(body))
+}
+
+beforeAll(async () => {
+  savedHome = process.env.HOME
+  root = mkdtempSync(path.join(tmpdir(), 'rc-owner-key-'))
+  mkdirSync(path.join(root, 'home'))
+  process.env.HOME = path.join(root, 'home')
+  opencode = createServer((req, res) => {
+    const url = new URL(req.url ?? '', 'http://localhost')
+    if (req.headers.authorization !== opencodeAuthHeader()) return json(res, 401, { error: 'unauthorized' })
+    if (url.pathname === '/global/health') return json(res, 200, { healthy: true })
+    if (url.pathname === '/event') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+      res.write(': connected\n\n')
+      return
+    }
+    if (url.pathname === '/session') return json(res, 200, [{ id: PICKED, directory: root, title: 'picked', time: { created: 1 } }])
+    const m = /^\/session\/([^/]+)$/.exec(url.pathname)
+    if (m) return json(res, 200, { id: decodeURIComponent(m[1]!), directory: root, title: 'owner key' })
+    json(res, 404, { error: 'not found' })
+  })
+  await new Promise<void>((resolve) => opencode.listen(0, '127.0.0.1', resolve))
+  opencodeUrl = `http://127.0.0.1:${(opencode.address() as AddressInfo).port}`
+  relay = await startServer(0)
+  relayUrl = `http://127.0.0.1:${(relay.address() as AddressInfo).port}`
+})
+
+afterEach(async () => {
+  for (const handle of handles.splice(0)) await handle.stop()
+})
+
+afterAll(async () => {
+  relay.closeAllConnections()
+  await new Promise((resolve) => relay.close(resolve))
+  opencode.closeAllConnections()
+  await new Promise((resolve) => opencode.close(resolve))
+  if (savedHome === undefined) delete process.env.HOME
+  else process.env.HOME = savedHome
+  rmSync(root, { recursive: true, force: true })
+})
+
+async function start(sessionId?: string, relayBase = relayUrl): Promise<BridgeHandle> {
+  const handle = await startBridge(relayBase, API_KEY, { opencodeUrl, ...(sessionId ? { sessionId } : {}) })
+  handles.push(handle)
+  return handle
+}
+
+test('the owner key is one install secret, stable per relay and session id and different between them', () => {
+  const relayA = 'https://relay-a.example'
+  const a = ownerKey(relayA, 'ses_keyA')
+  expect(a).toMatch(/^[A-Za-z0-9_-]{43}$/)
+  expect(ownerKey(relayA, 'ses_keyA')).toBe(a)
+  expect(ownerKey(relayA, 'ses_keyB')).not.toBe(a)
+  // Another relay, including the same host over another scheme or port.
+  expect(ownerKey('https://relay-b.example', 'ses_keyA')).not.toBe(a)
+  expect(ownerKey('http://relay-a.example', 'ses_keyA')).not.toBe(a)
+  expect(ownerKey('https://relay-a.example:8443', 'ses_keyA')).not.toBe(a)
+  // The same relay written differently keeps its key (and its reservations).
+  expect(ownerKey('https://relay-a.example/', 'ses_keyA')).toBe(a)
+  expect(ownerKey('https://RELAY-A.example:443', 'ses_keyA')).toBe(a)
+  expect(ownerKey('https://user:pass@relay-a.example', 'ses_keyA')).toBe(a)
+  // Not a relay URL: refused rather than keyed on a scope other URLs share.
+  expect(() => ownerKey('relay-a.example', 'ses_keyA')).toThrow(/http:\/\/ or https:\/\//)
+  expect(() => ownerKey('data:text/plain,x', 'ses_keyA')).toThrow(/http:\/\/ or https:\/\//)
+
+  const stateDir = path.join(root, 'home', '.agents', 'skills', 'remote-control', 'state')
+  const file = path.join(stateDir, 'owner.key')
+  expect(readFileSync(file).length).toBe(32)
+  if (process.platform !== 'win32') expect(statSync(file).mode & 0o777).toBe(0o600)
+  // Not a state file: stop/status pick the newest *.json and must never read it.
+  expect(readdirSync(stateDir).filter((f) => f.endsWith('.json'))).toEqual([])
+  expect(latestSessionState()).toBeUndefined()
+})
+
+test('after stop, nobody else can register the session, and the owner shares it again', async () => {
+  const first = await start('ses_ownerStop1')
+  await first.stop()
+  expect(loadSessionState('ses_ownerStop1')).toBeUndefined()
+
+  // Someone holding the old link (no key: it never left this machine).
+  await expect(new RelayClient(relayUrl).createSession('ses_ownerStop1', '/elsewhere', 'squat')).rejects.toThrow(/409/)
+
+  const again = await start('ses_ownerStop1')
+  expect(again.access_code).toBeTruthy()
+  expect(again.access_code).not.toBe(first.access_code)
+  expect((await new RelayClient(relayUrl).getSession('ses_ownerStop1')).status).toBe(200)
+})
+
+test('a registration of this install whose state file is gone is taken back by the next start', async () => {
+  // A bridge that died without a word, and the state holding its token went
+  // with it: only this install's key still ties the id to this machine.
+  const earlier = await new RelayClient(relayUrl).createSession('ses_ownerLost1', root, 'lost', ownerKey(relayUrl, 'ses_ownerLost1'))
+  expect(loadSessionState('ses_ownerLost1')).toBeUndefined()
+
+  const handle = await start('ses_ownerLost1')
+  expect(handle.access_code).not.toBe(earlier.access_code)
+  expect(await new RelayClient(relayUrl).deleteSession('ses_ownerLost1', earlier.bridge_token)).toBe(404)
+})
+
+test('a share replaced by a later start of the same install ends without removing the new share state', async () => {
+  const replaced = await start('ses_ownerLive1')
+  clearSessionState('ses_ownerLive1')
+
+  const current = await start('ses_ownerLive1')
+  expect(await replaced.closed).toMatch(/relay ended the session/)
+  const state = loadSessionState('ses_ownerLive1')
+  expect(state?.access_code).toBe(current.access_code)
+  expect(state?.pid).toBe(process.pid)
+})
+
+test('the key a bridge sent to another relay does not take over, or reserve, its share on this one', async () => {
+  // Every relay a bridge registers with reads the owner_key in the clear: a
+  // self-hosted one (OPENCODE_REMOTE_CONTROL_RELAY), or a mistyped address.
+  // This one keeps what it was sent and fails the start.
+  const sent: Array<{ session_id?: unknown; owner_key?: unknown }> = []
+  const other = createServer((req, res) => {
+    let body = ''
+    req.on('data', (chunk) => (body += chunk))
+    req.on('end', () => {
+      if (req.method === 'POST' && req.url === '/api/sessions') sent.push(JSON.parse(body))
+      json(res, 503, { error: 'unavailable' })
+    })
+  })
+  await new Promise<void>((resolve) => other.listen(0, '127.0.0.1', resolve))
+  try {
+    const otherUrl = `http://127.0.0.1:${(other.address() as AddressInfo).port}`
+    await expect(start('ses_ownerTwoRelays1', otherUrl)).rejects.toThrow(/503/)
+    expect(sent).toHaveLength(1)
+    const leaked = sent[0]!.owner_key
+    expect(typeof leaked).toBe('string')
+
+    // The same install shares the conversation on this relay. Whoever ran the
+    // other one replays the key here: a matching key replaces a live share,
+    // revoking its code and viewers, and hands out fresh credentials.
+    const live = await start('ses_ownerTwoRelays1')
+    const takeover = new RelayClient(relayUrl).createSession('ses_ownerTwoRelays1', '/elsewhere', 'takeover', leaked as string)
+    await expect(takeover).rejects.toThrow(/409/)
+    expect((await new RelayClient(relayUrl).getSession('ses_ownerTwoRelays1')).body?.bridge_connected).toBe(true)
+    expect(loadSessionState('ses_ownerTwoRelays1')?.access_code).toBe(live.access_code)
+
+    // Nor is the id reserved for it once the share has ended.
+    await live.stop()
+    const claim = new RelayClient(relayUrl).createSession('ses_ownerTwoRelays1', '/elsewhere', 'claim', leaked as string)
+    await expect(claim).rejects.toThrow(/409/)
+  } finally {
+    other.closeAllConnections()
+    await new Promise((resolve) => other.close(resolve))
+  }
+})
+
+/**
+ * The relay keeps an ended share's id for the install that shared it, and the
+ * bridge explained every 409 the same way: "already registered ... by a share
+ * this machine has no record of — end it with /remote-control/stop where it
+ * was started". For a reserved id there is nothing to stop anywhere; the owner
+ * started the conversation from another install (another machine or HOME, a
+ * lost owner.key) and needed to hear that only the install that shared it can,
+ * for 30 days.
+ */
+test('a session another install shared and stopped is refused as reserved, not as a share to stop', async () => {
+  const first = await start('ses_ownerOtherInstall1')
+  await first.stop()
+
+  const home = process.env.HOME
+  process.env.HOME = path.join(root, 'other-home')
+  mkdirSync(process.env.HOME)
+  try {
+    const refused = start('ses_ownerOtherInstall1')
+    await expect(refused).rejects.toThrow(
+      /session ses_ownerOtherInstall1 is reserved on the relay \(409\) for the install that shared it last.*30 days/,
+    )
+    await expect(refused).rejects.not.toThrow(/already registered|\/remote-control\/stop/)
+  } finally {
+    process.env.HOME = home
+  }
+  // The install that shared it still can.
+  expect((await start('ses_ownerOtherInstall1')).access_code).toBeTruthy()
+})
+
+test('a start that picks a session this machine is sharing is refused, not a takeover of that share', async () => {
+  const live = await start(PICKED)
+  await expect(start()).rejects.toThrow(/already shared from this machine/)
+  expect(loadSessionState(PICKED)?.access_code).toBe(live.access_code)
+  expect((await new RelayClient(relayUrl).getSession(PICKED)).body?.bridge_connected).toBe(true)
+})
