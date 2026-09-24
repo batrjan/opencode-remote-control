@@ -1,0 +1,142 @@
+name: ci
+
+# The suite (relay + bridge) and the bundle-freshness check.
+#
+# `workflow_call` is the point of this file: deploy.yml calls it as its first
+# job and gates on it. Deploying used to start from `push: main` alone, so the
+# ~180 tests in this repo guarded nothing — a red main still shipped to
+# production. Running the SAME workflow for PRs and as the deploy gate means
+# the check a reviewer sees green is literally the check the deploy waits on.
+#
+# A push to main therefore runs this twice (once directly, once through
+# deploy.yml). That is deliberate: the standalone run keeps a plain green/red
+# badge on main even when deploy.yml is skipped or disabled, and the suite is
+# seconds of runner time.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    # The suites run in well under a minute each. A bound at all is the point:
+    # deploy.yml gates on this workflow, so a job wedged here holds the
+    # deploy-relay concurrency group for GitHub's 360-minute default.
+    timeout-minutes: 15
+    strategy:
+      # Report both packages on a red run; knowing only "relay failed" hides
+      # whether the bridge is fine.
+      fail-fast: false
+      matrix:
+        include:
+          - package: relay
+            # relay/test/docker.test.ts shells out to a real `docker build`.
+            # It self-skips where docker is missing (test.runIf), but a GitHub
+            # runner HAS docker, so in CI it would always run — pulling
+            # node:22-slim from Docker Hub (unauthenticated, rate-limited) and
+            # running npm ci inside the image on every PR. Worse, it builds
+            # with the Dockerfile's default UI_SOURCE=prebuilt against a clean
+            # checkout, where relay/public holds only index.html + join.html
+            # (relay/.gitignore drops the ~84MB of built assets) — so it would
+            # spend minutes proving a UI-less image builds, which is not the
+            # image deploy.yml ships (--build-arg UI_SOURCE=source). Excluded
+            # here; it still runs locally for anyone with docker.
+            #
+            # A CLI --exclude is APPENDED to vitest's built-in exclude list
+            # (verified on the pinned vitest 2.1.9), so node_modules and dist
+            # stay excluded without restating them.
+            test_args: --exclude 'test/docker.test.ts'
+          - package: bridge
+            test_args: ''
+    defaults:
+      run:
+        working-directory: ${{ matrix.package }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ matrix.package }}/package-lock.json
+
+      - run: npm ci
+
+      # NEITHER suite is self-contained: they test the two halves against each
+      # other across the package boundary. Four bridge files (keepalive,
+      # lifecycle, stop-teardown, reconnect-after-restart) start a REAL relay
+      # via ../../relay/src/server, and several relay files drive a REAL bridge
+      # via ../../bridge/src/relay. Each therefore needs the other package's
+      # dependencies resolvable. Anyone running this locally has both installed
+      # already, which is exactly why it stayed invisible until CI ran on a
+      # clean checkout and vitest reported "Failed to load url express".
+      # Installed for both jobs rather than only the one that happens to need
+      # it today: a new cross-package import should not turn into a confusing
+      # module-resolution failure in the other matrix leg.
+      - name: Install the other package's dependencies (cross-package tests)
+        run: npm ci
+        working-directory: ${{ matrix.package == 'relay' && 'bridge' || 'relay' }}
+
+      - name: Tests
+        run: npm test -- ${{ matrix.test_args }}
+
+      # tsc --noEmit, not `npm run build`: vitest type-checks nothing, so a
+      # type error in src/ passes the suite and only surfaces when the relay
+      # image is built on the production host. (The relay suite does include
+      # test/typecheck.test.ts, which checks src/ and test/ together via
+      # tsconfig.test.json; this step stays the src/ check for both packages.)
+      - name: Typecheck
+        run: npx tsc -p tsconfig.json --noEmit
+
+  bundle:
+    name: bridge bundle matches bridge/src
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bridge/package-lock.json
+
+      - run: npm ci
+        working-directory: bridge
+
+      # plugin/bridge/remote-control-bridge.cjs is committed and is what users
+      # actually execute (the plugin spawns it directly), so a bridge/src change
+      # that was never re-bundled ships as the old behaviour, silently. Rebuild
+      # it and fail if the committed bytes differ.
+      #
+      # Byte comparison is safe because the build is pinned: esbuild is an exact
+      # version in bridge/package.json, npm ci fixes ws/commander from the
+      # lockfile, and build-bridge-bundle.mjs pins esbuild's working directory
+      # so its per-module path comments do not depend on where the repo sits.
+      - name: Rebuild the committed bundle
+        run: npm run bundle
+        working-directory: bridge
+
+      # --stat, not a plain diff: the bundle is one 260KB machine-generated
+      # file and printing its diff would bury the error message.
+      - name: Fail if the committed bundle is stale
+        run: |
+          if ! git diff --stat --exit-code -- plugin/bridge/remote-control-bridge.cjs; then
+            echo "::error file=plugin/bridge/remote-control-bridge.cjs::Stale bundle. Run 'npm run bundle' in bridge/ and commit the result."
+            exit 1
+          fi
+
+      # So a mismatch is one download away from being fixed, rather than
+      # requiring the contributor to reproduce the build environment.
+      - name: Upload the freshly built bundle
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: remote-control-bridge-cjs
+          path: plugin/bridge/remote-control-bridge.cjs

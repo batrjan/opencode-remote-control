@@ -1,0 +1,104 @@
+# Relay service for opencode-remote-control.
+#
+# Server layout (nginx runs on the host, not in Docker):
+#   - this file + .env live in /opt/opencode-remote-control on the server
+#   - nginx (host) proxies https://opencode.b4tr.net -> 127.0.0.1:8080
+#   - certbot (host) uses webroot /var/www/certbot for ACME challenges
+#
+# .env (never committed, see .env.example; the deploy workflow ships this
+# file and generates RELAY_STATE_KEY on first run):
+#   RELAY_STATE_KEY=<64 hex chars, `openssl rand -hex 32`>      (generated)
+#   RELAY_API_KEY=<legacy; the public session API ignores it>   (optional)
+#   PORT=8080                                                   (optional)
+#   RELAY_IMAGE=relay-local:amd64                               (optional)
+#   RELAY_TRUST_PROXY=loopback, uniquelocal                     (optional)
+#   RELAY_MAX_SESSIONS=2000                                     (optional)
+services:
+  relay:
+    # The deploy workflow builds this image on the host (see the deploy section of
+    # DEPLOY.md); set RELAY_IMAGE to roll back to a relay-local:rollback-* tag.
+    image: ${RELAY_IMAGE:-relay-local:amd64}
+    restart: unless-stopped
+    # Localhost-only: all external traffic enters through host nginx.
+    ports:
+      - "127.0.0.1:${PORT:-8080}:${PORT:-8080}"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: "${PORT:-8080}"
+      # Persist the session set so a redeploy does not end every live share:
+      # the store is in-memory, and losing it invalidates viewer cookies and
+      # bridge tokens while the bridges are still running.
+      RELAY_STATE_FILE: "${RELAY_STATE_FILE:-/data/state.json}"
+      # Encrypts the state file at rest. The key lives in .env on the HOST, not
+      # in the state volume, so a volume copy/backup is useless without it. With
+      # a key, join codes survive a restart too; without one the file is
+      # plaintext and codes are not persisted (install.sh / the deploy generate
+      # the key automatically).
+      RELAY_STATE_KEY: "${RELAY_STATE_KEY:-}"
+      # Which proxy hop to believe for X-Forwarded-For. The registration caps
+      # key on the CLIENT address (activation is not limited per address);
+      # inside Docker the peer is the bridge gateway (172.x), not loopback, so
+      # a bare 'loopback' collapsed every client into one address and made the
+      # registration caps global. The port is published on 127.0.0.1 only, so
+      # the private-range peer can only be the host's own nginx.
+      RELAY_TRUST_PROXY: "${RELAY_TRUST_PROXY:-loopback, uniquelocal}"
+    volumes:
+      - relay-state:/data
+    # What a foothold inside the process gets beyond running the relay. None of
+    # these is a way in; each is something an attacker who is already inside no
+    # longer has. The image runs as `node` and binds 8080, so nothing here needs
+    # a capability, a writable image layer or a second process.
+    #
+    # read_only freezes everything except the two paths below: /data (the state
+    # file and its temp file, which persist.ts writes next to it) and /tmp,
+    # which has to exist and be writable or Node fails in places that only show
+    # up under load.
+    #
+    # The size is not decoration. A tmpfs with no size= takes the kernel default
+    # of half the host's RAM (32 GiB on this host), and it is charged to the
+    # HOST's memory, not to the container — which has no mem_limit on purpose
+    # (see DEPLOY.md). Under read_only this is the one writable path outside the
+    # state volume, so anything that reached it could spend the host's memory.
+    # 64 MiB is far more than the relay uses: nothing in relay/src writes to /tmp
+    # or os.tmpdir() at all, and the state file and its temp file live in /data.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      # setuid binaries in the image cannot raise privileges from here.
+      - no-new-privileges:true
+    # One Node process plus its threads; far above that, far below a fork bomb.
+    pids_limit: 256
+    # Deliberately no mem_limit: V8 caps its own heap (and Node 22 reads the
+    # cgroup limit when there is one), so a ceiling below that one does not
+    # contain a leak — it turns it into an OOM kill of the single process that
+    # holds EVERY live share. The reasoning is written out in DEPLOY.md.
+
+    # Every wrong access code writes an [activate] line, so an attacker sets
+    # the log's growth rate. Without rotation that is the host's disk — and
+    # docker's default json-file driver has no limit at all.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # Mirrors the Dockerfile HEALTHCHECK (image already has one; kept
+    # explicit so `docker compose ps` health is guaranteed even for images
+    # built without it).
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  relay-state:

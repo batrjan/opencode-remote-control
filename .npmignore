@@ -1,0 +1,19 @@
+# Ship only what the TUI plugin needs: the plugin entry + the prebuilt bridge.
+.opencode
+bridge/src
+bridge/test
+bridge/node_modules
+bridge/tsconfig.json
+bridge/package.json
+bridge/package-lock.json
+**/node_modules
+relay
+docs
+.github
+nginx
+.superpowers
+install.sh
+DEPLOY.md
+skill
+*.md
+!README.md

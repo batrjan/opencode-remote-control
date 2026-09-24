@@ -1,0 +1,196 @@
+import express from 'express'
+import type { Store } from '../store.js'
+import type { BridgeClient } from '../ws/bridge.js'
+
+/**
+ * Session-management API used by the bridge client (spawned by the OpenCode
+ * skill), hence "skill router". Mounted at /api/sessions.
+ *
+ * PUBLIC by design (works out of the box, no shared key):
+ * - POST   /api/sessions        — public registration, rate-limited per IP;
+ *                                 an optional `owner_key` reserves the id for
+ *                                 the install that registered it and lets that
+ *                                 install replace its own registration (see
+ *                                 Store.createSession)
+ * - GET    /api/sessions/:id    — non-secret status view (bridge status cmd)
+ * - DELETE /api/sessions/:id    — requires the session's OWN bridge_token in
+ *                                 the `x-bridge-token` header, so only the
+ *                                 session owner (the bridge that registered
+ *                                 it) can kill it — never another user.
+ *
+ * The optional BridgeClient disconnects the session's bridge on DELETE.
+ */
+/**
+ * Upper bounds for public registration fields (bytes of UTF-16 units).
+ * MAX_SESSION_ID is exported because activation enforces it too: no session
+ * can exist with a longer id, so activate refuses one before recording it.
+ */
+export const MAX_SESSION_ID = 128
+const MAX_DIRECTORY = 4096
+const MAX_TITLE = 1024
+/**
+ * Bounds for owner_key (see Store.createSession). The bridge sends a
+ * base64url HMAC-SHA256, 43 characters. The floor is what makes it a proof: a
+ * wrong key costs the caller nothing but a 409, so a short one would only turn
+ * the reservation into a guessing game.
+ */
+const MIN_OWNER_KEY = 32
+const MAX_OWNER_KEY = 256
+/**
+ * Upper bound for `access_code`, the code a bridge presents to CONTINUE the
+ * share the relay already holds for its id rather than replace it (see
+ * Store.createSession). Bounded, not shaped: the code's length and alphabet are
+ * the relay's policy (config.codeAlphabet), and a code minted under an earlier
+ * policy must still be able to resume its share. Nothing is authorized by its
+ * shape anyway — the relay compares it against the salted hash it minted.
+ */
+const MAX_ACCESS_CODE = 64
+
+/**
+ * A real opencode session id — the shape every viewer/proxy route already pins
+ * ':id' to (server.ts SHARE_PAGE_ID_RE, adapter.ts SESSION_ID_RE). Registration
+ * used to check only typeof/length, so an id like "//evil.example" was accepted
+ * and became the viewer_url "///evil.example" — an open redirect on / and /join
+ * for anyone viewing that share — while other malformed ids leaked into state.
+ * Pinning it here rejects those before anything is recorded; the bridge only
+ * ever registers a genuine ses_ id, so no legitimate registration is affected.
+ */
+const SESSION_ID_RE = /^ses_[A-Za-z0-9_]+$/
+
+export function skillRouter(store: Store, bridge?: BridgeClient) {
+  const router = express.Router()
+
+  router.post('/', (req, res) => {
+    const body = req.body ?? {}
+    const { session_id, directory, title, owner_key, access_code } = body
+    if (typeof session_id !== 'string' || session_id.length === 0) {
+      return res.status(400).json({ error: 'session_id is required' })
+    }
+    // Bound the shape, not just the length: a session_id becomes the viewer_url
+    // (`/${session_id}`) and is echoed into the persisted state, so anything
+    // that is not a real opencode session id is an open-redirect / injection
+    // vector, never a legitimate registration.
+    if (!SESSION_ID_RE.test(session_id)) {
+      return res.status(400).json({ error: 'session_id is malformed' })
+    }
+    if (typeof directory !== 'string' || directory.length === 0) {
+      return res.status(400).json({ error: 'directory is required' })
+    }
+    // Registration is public: bound what one request may lodge in memory and
+    // in the persisted state file. Real ids/paths/titles are far shorter.
+    if (session_id.length > MAX_SESSION_ID || directory.length > MAX_DIRECTORY) {
+      return res.status(400).json({ error: 'field too long' })
+    }
+    if (typeof title === 'string' && title.length > MAX_TITLE) {
+      return res.status(400).json({ error: 'field too long' })
+    }
+    // Refused rather than ignored when malformed: registering without the key
+    // the caller meant to send would leave its id unreserved without a word.
+    if (owner_key !== undefined) {
+      if (typeof owner_key !== 'string' || owner_key.length < MIN_OWNER_KEY) {
+        return res.status(400).json({ error: `owner_key must be a string of at least ${MIN_OWNER_KEY} characters` })
+      }
+      if (owner_key.length > MAX_OWNER_KEY) return res.status(400).json({ error: 'field too long' })
+    }
+    // Refused rather than ignored, for the same reason as owner_key and a
+    // sharper one: a resume that quietly became a replacement would take the
+    // share's viewers and its live code with it, without a word to anyone.
+    if (access_code !== undefined) {
+      if (typeof access_code !== 'string' || access_code.length === 0) {
+        return res.status(400).json({ error: 'access_code must be a non-empty string' })
+      }
+      if (access_code.length > MAX_ACCESS_CODE) return res.status(400).json({ error: 'field too long' })
+    }
+    const ip = req.ip ?? 'unknown'
+    try {
+      store.checkRegistrationLimit(ip, session_id, owner_key, (id) => bridge?.isConnected(id) ?? false)
+    } catch (err) {
+      // Not the caller's doing, so not a 429: the relay holds all the sessions
+      // it will (config maxSessions). Logged, because the operator is the one
+      // who can tell an attack from a relay that has simply grown busy.
+      if (err instanceof Error && err.message === 'relay full') {
+        console.warn(`[sessions] registration refused: relay holds ${store.sessionCount()} sessions (RELAY_MAX_SESSIONS)`)
+        return res.status(503).json({ error: 'relay full' })
+      }
+      return res.status(429).json({ error: 'rate limited' })
+    }
+    try {
+      // `resumed` is bookkeeping for this handler, not part of the answer: the
+      // caller can already tell (the code it presented is the code it got
+      // back), and the response shape stays what every bridge already reads.
+      const { replaced, resumed, ...result } = store.createSession(
+        session_id,
+        directory,
+        typeof title === 'string' ? title : '',
+        ip,
+        owner_key,
+        access_code,
+      )
+      // Consume the registration slot only now that a session really exists:
+      // checking used to increment, so a request that ended in 409 below (a
+      // duplicate id — a bridge retrying its own registration, typically) burned
+      // an hour of the caller's quota while creating nothing.
+      store.commitRegistration(ip)
+      // The owner took back its own registration (its bridge died without a
+      // word). The old socket, if the relay still holds one, authenticated with
+      // a token that no longer exists: drop it and fail its requests, as DELETE
+      // does, before the new bridge dials in. A resume mints a new bridge_token
+      // too, so its old socket goes the same way — what it keeps is the code
+      // and the viewers, never the dead bridge's credential.
+      if (replaced) bridge?.disconnect(session_id)
+      return res.status(201).json(result)
+    } catch (err) {
+      if (err instanceof Error && err.message === 'session exists') {
+        return res.status(409).json({ error: 'session exists' })
+      }
+      // The same status, so every bridge — including ones that read nothing
+      // but the status — handles it as before; the error says there is no
+      // live share to stop (see Store.createSession).
+      if (err instanceof Error && err.message === 'session reserved') {
+        return res.status(409).json({ error: 'session reserved' })
+      }
+      throw err
+    }
+  })
+
+  /**
+   * Presence view. A session id is not a secret (it is in the share URL), so
+   * this endpoint is public — but the session's `directory` (an absolute host
+   * path) and `title` are private, and were disclosed to anyone holding the id.
+   * They are returned ONLY to the bridge that owns the session (its
+   * bridge_token), which is what `bridge status` presents; everyone else gets
+   * pure presence.
+   */
+  router.get('/:id', (req, res) => {
+    const session = store.getSession(req.params.id)
+    if (!session) return res.status(404).json({ error: 'session not found' })
+    const owner = store.verifyBridgeToken(session.id, req.get('x-bridge-token') ?? '')
+    return res.json({
+      session_id: session.id,
+      status: session.status,
+      created_at: session.created_at,
+      last_seen: session.last_seen,
+      viewer_count: session.viewers.size,
+      bridge_connected: bridge?.isConnected(session.id) ?? false,
+      ...(owner ? { directory: session.directory, title: session.title } : {}),
+    })
+  })
+
+  router.delete('/:id', (req, res) => {
+    const token = req.get('x-bridge-token') ?? ''
+    if (!token || !store.verifyBridgeToken(req.params.id, token)) {
+      // Same shape as "not found" — do not reveal whether the session exists.
+      return res.status(404).json({ error: 'session not found' })
+    }
+    if (!store.deleteSession(req.params.id)) {
+      return res.status(404).json({ error: 'session not found' })
+    }
+    // Disconnect the session's bridge and fail its pending proxy requests;
+    // otherwise the socket would linger (and could serve a future session
+    // that reuses the id).
+    bridge?.disconnect(req.params.id)
+    return res.status(204).end()
+  })
+
+  return router
+}
